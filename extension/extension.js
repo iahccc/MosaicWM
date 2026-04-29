@@ -9,6 +9,7 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
+import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 
 import { WindowingManager } from './windowing.js';
 import * as constants from './constants.js';
@@ -28,9 +29,9 @@ import { TimeoutRegistry, afterAnimations } from './timing.js';
 import { WindowHandler } from './windowHandler.js';
 import { DragHandler } from './dragHandler.js';
 import { ResizeHandler } from './resizeHandler.js';
-import { MiniatureManager, applyMiniatureActorState } from './miniature.js';
+import { MiniatureManager } from './miniature.js';
 import * as WindowState from './windowState.js';
-import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS } from './windowState.js';
+import { IS_MINIATURE } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
 
 // Module-level accessor for TilingManager (used by overviewLayout.js for on-demand cache)
@@ -141,33 +142,6 @@ export default class WindowMosaicExtension extends Extension {
         // This prevents race conditions where tiling starts while animation is still running
         afterAnimations(this.animationsManager, () => {
             Logger.log(`Workspace animation complete - ready for operations on workspace ${newIndex}`);
-            // Re-apply miniature transforms after workspace switch.
-            // Mutter may have moved actors to default positions while offscreen.
-            const reapplyMiniatures = () => {
-                const windows = newWorkspace.list_windows();
-                for (const w of windows) {
-                    if (WindowState.get(w, IS_MINIATURE)) {
-                        const actor = w.get_compositor_private();
-                        if (actor) {
-                            const sc = WindowState.get(w, MINIATURE_SCALE) ?? 1;
-                            const extL = WindowState.get(w, MINIATURE_EXT_LEFT) ?? 0;
-                            const extT = WindowState.get(w, MINIATURE_EXT_TOP) ?? 0;
-                            const target = WindowState.get(w, MINIATURE_TARGET_POS);
-                            if (target) {
-                                applyMiniatureActorState(actor, sc, extL, extT, target.x, target.y);
-                                const [ax, ay] = actor.get_position();
-                                Logger.log(`[MINIATURE] ws-switch re-apply ${w.get_id()}: actor=(${ax},${ay}) target=(${target.x},${target.y})`);
-                            }
-                        }
-                    }
-                }
-            };
-            // Apply once after animation, then again after Mutter settles
-            reapplyMiniatures();
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                reapplyMiniatures();
-                return GLib.SOURCE_REMOVE;
-            });
         }, this._timeoutRegistry);
     };
 
@@ -299,6 +273,40 @@ export default class WindowMosaicExtension extends Extension {
 
         // Override Overview layout to preserve mosaic positions
         this._injectionManager = new InjectionManager();
+
+        // Monkey-patch workspace switch animation to skip when miniatures are present.
+        // The default GNOME animation creates Clutter.Clone of the actor at its frame-rect
+        // position, ignoring our set_scale/set_translation transforms. This causes miniatures
+        // to appear at full size during the transition ("desminiaturizes on leave, reminiaturizes
+        // on return"). By skipping the animation, the transition is instant and correct.
+        const wsAnimProto = WorkspaceAnimation.WorkspaceAnimationController.prototype;
+        this._injectionManager.overrideMethod(wsAnimProto, 'animateSwitch', originalMethod => {
+            return function (_from, _to, _direction, onComplete) {
+                // Check if source or target workspace has miniatures
+                const wm = global.workspace_manager;
+                const fromWs = wm.get_workspace_by_index(_from);
+                const toWs = wm.get_workspace_by_index(_to);
+                let hasMiniatures = false;
+                for (const w of fromWs?.list_windows() ?? []) {
+                    if (WindowState.get(w, IS_MINIATURE)) { hasMiniatures = true; break; }
+                }
+                if (!hasMiniatures) {
+                    for (const w of toWs?.list_windows() ?? []) {
+                        if (WindowState.get(w, IS_MINIATURE)) { hasMiniatures = true; break; }
+                    }
+                }
+
+                if (hasMiniatures) {
+                    // Skip the GNOME animation — miniatures would appear wrong
+                    Logger.log(`[WORKSPACE SWITCH] Skipping animation (miniatures present)`);
+                    onComplete();
+                } else {
+                    // No miniatures — use the default GNOME animation
+                    originalMethod.call(this, _from, _to, _direction, onComplete);
+                }
+            };
+        });
+
         const layoutProto = Workspace.WorkspaceLayout.prototype;
         this._injectionManager.overrideMethod(layoutProto, '_createBestLayout', originalMethod => {
             const extension = this;

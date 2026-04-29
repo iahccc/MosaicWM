@@ -3,6 +3,7 @@
 
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
+import Clutter from 'gi://Clutter';
 
 import * as Logger from './logger.js';
 import * as WindowState from './windowState.js';
@@ -40,6 +41,49 @@ export function applyMiniatureActorState(actor, scale, extLeft, extTop, targetX,
     actor.set_translation(tx, ty, 0);
 }
 
+/**
+ * Custom Clutter.Effect that enforces miniature transforms before every paint.
+ *
+ * Mutter may reset actor transforms internally (workspace switch animation,
+ * sync_window_geometry, etc.) without emitting GObject signals. This effect
+ * runs as part of the paint pipeline, guaranteeing correct transforms are
+ * applied before the actor is rendered — every frame, no race conditions.
+ */
+const MiniatureEnforceEffect = GObject.registerClass({
+    GTypeName: 'MosaicMiniatureEnforceEffect',
+}, class MiniatureEnforceEffect extends Clutter.Effect {
+    _init(window) {
+        super._init();
+        this._window = window;
+    }
+
+    vfunc_paint(...args) {
+        const actor = this.get_actor();
+        if (!actor || !WindowState.get(this._window, IS_MINIATURE)) {
+            // Not a miniature anymore — just paint normally
+            super.vfunc_paint(...args);
+            return;
+        }
+
+        const sc = WindowState.get(this._window, MINIATURE_SCALE);
+        const extL = WindowState.get(this._window, MINIATURE_EXT_LEFT) ?? 0;
+        const extT = WindowState.get(this._window, MINIATURE_EXT_TOP) ?? 0;
+        const tgt = WindowState.get(this._window, MINIATURE_TARGET_POS);
+
+        if (sc && tgt) {
+            // Re-enforce scale and translation before this paint
+            actor.set_pivot_point(0, 0);
+            actor.set_scale(sc, sc);
+            const [ax, ay] = actor.get_position();
+            const tx = tgt.x - ax - extL * sc;
+            const ty = tgt.y - ay - extT * sc;
+            actor.set_translation(tx, ty, 0);
+        }
+
+        super.vfunc_paint(...args);
+    }
+});
+
 export const MiniatureManager = GObject.registerClass({
     GTypeName: 'MosaicMiniatureManager',
     Signals: {
@@ -69,29 +113,12 @@ export const MiniatureManager = GObject.registerClass({
 
         Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
 
-        // Do NOT use move_frame — Mutter may reject the position because the
-        // frame rect (original size) extends beyond the monitor.
-        // Instead, rely purely on actor transforms to position the miniature.
-
         // Apply scale + translation from CURRENT actor position to target
         applyMiniatureActorState(windowActor, scale, extLeft, extTop, targetX, targetY);
 
-        // Verify actual visual position after Mutter settles
-        const _winId = window.get_id();
-        const _verifyTarget = { x: targetX, y: targetY };
-        const _verifyScale = scale;
-        const _verifyExtL = extLeft;
-        const _verifyExtT = extTop;
-        const _verifyActor = windowActor;
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
-            const frame = window.get_frame_rect();
-            const [ax, ay] = _verifyActor.get_position();
-            const tx = _verifyActor.get_translation();
-            const visualLeft = ax + tx[0] + _verifyExtL * _verifyScale;
-            const visualTop = ay + tx[1] + _verifyExtT * _verifyScale;
-            Logger.log(`[MINIATURE] VERIFY ${_winId}: frame=(${frame.x},${frame.y}) actor=(${ax},${ay}) translation=(${tx[0]?.toFixed(2)},${tx[1]?.toFixed(2)}) visualFrame=(${visualLeft.toFixed(1)},${visualTop.toFixed(1)}) expected=(${_verifyTarget.x},${_verifyTarget.y}) diff=(${(visualLeft - _verifyTarget.x).toFixed(1)},${(visualTop - _verifyTarget.y).toFixed(1)})`);
-            return GLib.SOURCE_REMOVE;
-        });
+        // Add the enforce effect — re-applies transforms before every paint
+        const enforceEffect = new MiniatureEnforceEffect(window);
+        windowActor.add_effect(enforceEffect);
 
         // Store state including extents
         WindowState.set(window, IS_MINIATURE, true);
@@ -111,32 +138,6 @@ export const MiniatureManager = GObject.registerClass({
         });
         WindowState.set(window, 'miniatureJustMiniaturizedTimeoutId', timeoutId);
 
-        // Re-apply scale+translation whenever actor is re-shown (workspace return safety net)
-        const showSignalId = windowActor.connect('show', () => {
-            const savedScale = WindowState.get(window, MINIATURE_SCALE);
-            const savedExtLeft = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-            const savedExtTop = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-            const savedTarget = WindowState.get(window, MINIATURE_TARGET_POS);
-            if (!savedScale) return;
-            const [ax, ay] = windowActor.get_position();
-            Logger.log(`[MINIATURE] show signal ${window.get_id()}: actor=(${ax},${ay}) target=${savedTarget ? `(${savedTarget.x},${savedTarget.y})` : 'none'} scale=${savedScale.toFixed(4)}`);
-            if (savedTarget) {
-                // Apply immediately
-                applyMiniatureActorState(windowActor, savedScale, savedExtLeft, savedExtTop, savedTarget.x, savedTarget.y);
-                // Re-apply after Mutter finishes processing (idle callback)
-                GLib.idle_add(GLib.PRIORITY_HIGH, () => {
-                    if (!WindowState.get(window, IS_MINIATURE)) return GLib.SOURCE_REMOVE;
-                    const [ax2, ay2] = windowActor.get_position();
-                    Logger.log(`[MINIATURE] show idle ${window.get_id()}: actor=(${ax2},${ay2}) re-applying`);
-                    applyMiniatureActorState(windowActor, savedScale, savedExtLeft, savedExtTop, savedTarget.x, savedTarget.y);
-                    return GLib.SOURCE_REMOVE;
-                });
-            } else {
-                Logger.log(`[MINIATURE] show signal: no target pos for ${window.get_id()}, skipping re-apply`);
-            }
-        });
-        WindowState.set(window, 'miniatureShowSignalId', showSignalId);
-
         this._miniatureWindows.add(window.get_id());
         this.emit('miniature-created', window);
 
@@ -152,6 +153,7 @@ export const MiniatureManager = GObject.registerClass({
         const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
         Logger.log(`[MINIATURE] restoreMiniature START ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): frame=(${frame.x},${frame.y} ${frame.width}x${frame.height}) actor=(${ax},${ay}) scale=${sc.toFixed(4)}`);
 
+        // Remove IS_MINIATURE FIRST so enforce effect stops re-applying
         WindowState.remove(window, IS_MINIATURE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
@@ -160,14 +162,19 @@ export const MiniatureManager = GObject.registerClass({
         WindowState.remove(window, MINIATURE_EXT_TOP);
 
         if (windowActor) {
+            // Remove the enforce effect
+            const effects = windowActor.get_effects();
+            for (const effect of effects) {
+                if (effect instanceof MiniatureEnforceEffect) {
+                    windowActor.remove_effect(effect);
+                    break;
+                }
+            }
+
             windowActor.remove_all_transitions();
             windowActor.set_scale(1.0, 1.0);
             windowActor.set_translation(0, 0, 0);
-
-            const showSignalId = WindowState.get(window, 'miniatureShowSignalId');
-            if (showSignalId) windowActor.disconnect(showSignalId);
         }
-        WindowState.remove(window, 'miniatureShowSignalId');
 
         const timeoutId = WindowState.get(window, 'miniatureJustMiniaturizedTimeoutId');
         if (timeoutId) GLib.source_remove(timeoutId);
@@ -184,6 +191,7 @@ export const MiniatureManager = GObject.registerClass({
     destroyMiniature(window) {
         const windowActor = window.get_compositor_private();
 
+        // Remove IS_MINIATURE first so enforce effect stops
         WindowState.remove(window, IS_MINIATURE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
@@ -192,10 +200,14 @@ export const MiniatureManager = GObject.registerClass({
         WindowState.remove(window, MINIATURE_EXT_TOP);
 
         if (windowActor) {
-            const showSignalId = WindowState.get(window, 'miniatureShowSignalId');
-            if (showSignalId) windowActor.disconnect(showSignalId);
+            const effects = windowActor.get_effects();
+            for (const effect of effects) {
+                if (effect instanceof MiniatureEnforceEffect) {
+                    windowActor.remove_effect(effect);
+                    break;
+                }
+            }
         }
-        WindowState.remove(window, 'miniatureShowSignalId');
 
         const timeoutId = WindowState.get(window, 'miniatureJustMiniaturizedTimeoutId');
         if (timeoutId) GLib.source_remove(timeoutId);
