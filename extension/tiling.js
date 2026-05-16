@@ -15,6 +15,8 @@ import {
     MINIATURE_TARGET_POS,
     MINIATURE_EXT_LEFT,
     MINIATURE_EXT_TOP,
+    MINIATURE_OVERLAY,
+    ANIMATING_MINIATURE,
 } from './windowState.js';
 import { getMiniatureSize, applyMiniatureActorState } from './miniature.js';
 
@@ -1246,8 +1248,13 @@ export const TilingManager = GObject.registerClass({
                                 const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                                 const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
                                 if (actor) {
-                                    applyMiniatureActorState(actor, sc, extL, extT, tx, ty);
-                                    WindowState.set(window, MINIATURE_TARGET_POS, { x: tx, y: ty });
+                                    if (WindowState.get(window, ANIMATING_MINIATURE)) {
+                                        WindowState.set(window, MINIATURE_TARGET_POS, { x: tx, y: ty });
+                                    } else {
+                                        applyMiniatureActorState(actor, sc, extL, extT, tx, ty);
+                                        WindowState.set(window, MINIATURE_TARGET_POS, { x: tx, y: ty });
+                                    }
+                                    WindowState.get(window, MINIATURE_OVERLAY)?.updatePosition();
                                 }
                                 Logger.log(`[MINIATURE] animateTile H ${window.get_id()}: target=(${tx},${ty}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${windowDesc.width}x${windowDesc.height}`);
                             } else if (windowDesc.id === resizingWindowId) {
@@ -1288,8 +1295,13 @@ export const TilingManager = GObject.registerClass({
                                 const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                                 const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
                                 if (actor) {
-                                    applyMiniatureActorState(actor, sc, extL, extT, targetX, targetY);
-                                    WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+                                    if (WindowState.get(window, ANIMATING_MINIATURE)) {
+                                        WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+                                    } else {
+                                        applyMiniatureActorState(actor, sc, extL, extT, targetX, targetY);
+                                        WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+                                    }
+                                    WindowState.get(window, MINIATURE_OVERLAY)?.updatePosition();
                                 }
                                 Logger.log(`[MINIATURE] animateTile V ${window.get_id()}: target=(${targetX},${targetY}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${windowDesc.width}x${windowDesc.height}`);
                             } else if (windowDesc.id === resizingWindowId) {
@@ -1694,7 +1706,7 @@ export const TilingManager = GObject.registerClass({
 
         for (const w of windows) {
             const realWindow = workspaceWindows.find(win => win.get_id() === w.id);
-            if (realWindow) {
+            if (realWindow && !WindowState.get(realWindow, IS_MINIATURE)) {
                 const restoredSize = WindowState.get(realWindow, 'targetRestoredSize');
                 const smartResizeSize = WindowState.get(realWindow, 'targetSmartResizeSize');
                 const isConstrained = WindowState.get(realWindow, 'isConstrainedByMosaic');
@@ -2485,8 +2497,13 @@ class WindowDescriptor {
                         const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                         const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                         const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                        applyMiniatureActorState(windowActor, sc, extL, extT, x, y);
-                        WindowState.set(window, MINIATURE_TARGET_POS, { x, y });
+                        if (WindowState.get(window, ANIMATING_MINIATURE)) {
+                            WindowState.set(window, MINIATURE_TARGET_POS, { x, y });
+                        } else {
+                            applyMiniatureActorState(windowActor, sc, extL, extT, x, y);
+                            WindowState.set(window, MINIATURE_TARGET_POS, { x, y });
+                        }
+                        WindowState.get(window, MINIATURE_OVERLAY)?.updatePosition();
                         Logger.log(`[MINIATURE] draw ${window.get_id()}: target=(${x},${y}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${this.width}x${this.height}`);
                     }
                 } else {
