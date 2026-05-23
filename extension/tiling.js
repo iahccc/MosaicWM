@@ -2365,8 +2365,14 @@ export const TilingManager = GObject.registerClass({
 
                     if (allResizable.length === 0) break;
 
-                    // Check if remaining windows now fit naturally
-                    if (!this._tile(buildSimulated(1.0), workArea, true).overflow) break;
+                    // Check if remaining windows now fit naturally.
+                    // Lock lo at 1.0 so Step 4 applies preferred sizes — without
+                    // this, lo would stay at the pre-mini scale and the freed
+                    // space wouldn't be reclaimed by the non-mini siblings.
+                    if (!this._tile(buildSimulated(1.0), workArea, true).overflow) {
+                        lo = 1.0;
+                        break;
+                    }
 
                     // Binary search on remaining windows
                     lo = 0.0;
@@ -2382,13 +2388,29 @@ export const TilingManager = GObject.registerClass({
             // Step 4: Apply final sizes (factor lo = largest that fits)
             const finalSizes = buildSimulated(lo);
             const pendingWindows = [];
+            const grownWindows = [];
             for (const sim of finalSizes) {
                 const d = windowData.get(sim.id);
                 if (!d.isResizable) continue;
-                if (sim.width >= d.current.width && sim.height >= d.current.height) continue;
 
                 const w = d.window;
                 const frame = w.get_frame_rect();
+
+                // sim ≥ preferred means the algorithm decided this window can sit at
+                // (or above) its preferred size. If the actual frame is smaller — left
+                // over from a previous smart-resize that we now have space to undo —
+                // grow it back so siblings reclaim the freed space.
+                if (sim.width >= d.current.width && sim.height >= d.current.height) {
+                    if (frame.width < d.current.width - 2 || frame.height < d.current.height - 2) {
+                        WindowState.set(w, 'isConstrainedByMosaic', false);
+                        WindowState.set(w, 'targetSmartResizeSize', null);
+                        WindowState.set(w, 'targetRestoredSize', { width: d.current.width, height: d.current.height });
+                        w.move_resize_frame(false, frame.x, frame.y, d.current.width, d.current.height);
+                        grownWindows.push(w);
+                        Logger.log(`[SMART RESIZE] ${sim.id}: grow back ${frame.width}×${frame.height} → ${d.current.width}×${d.current.height}`);
+                    }
+                    continue;
+                }
 
                 if (!WindowState.has(w, 'preferredSize'))
                     WindowState.set(w, 'preferredSize', { width: d.current.width, height: d.current.height });
@@ -2405,6 +2427,17 @@ export const TilingManager = GObject.registerClass({
 
                 w.move_resize_frame(false, frame.x, frame.y, sim.width, sim.height);
                 Logger.log(`[SMART RESIZE] ${sim.id}: ${d.current.width}×${d.current.height} → ${sim.width}×${sim.height}`);
+            }
+
+            // Clear targetRestoredSize bridge after Wayland frame settles. Until
+            // then WindowDescriptor reads this value instead of the stale frame.
+            if (grownWindows.length > 0 && this._extension?._timeoutRegistry) {
+                this._extension._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                    for (const gw of grownWindows) {
+                        WindowState.remove(gw, 'targetRestoredSize');
+                    }
+                    return false;
+                }, 'tryFitWithResize_growSettle');
             }
 
             // Build final tile_info with current sizes for subsequent draw phase
