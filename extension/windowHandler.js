@@ -872,11 +872,7 @@ export const WindowHandler = GObject.registerClass({
             const monitor = window.get_monitor();
             const workspace = window.get_workspace();
 
-            if( monitor !== null &&
-                window.wm_class !== null &&
-                isWindowAlive(window) &&
-                workspace.list_windows().length !== 0 &&
-                !window.is_hidden())
+            if (this.tilingManager.checkValidity(monitor, workspace, window, true))
             {
                 if(this.windowingManager.isExcluded(window)) {
                     Logger.log('Window excluded from tiling');

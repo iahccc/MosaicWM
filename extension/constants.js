@@ -15,6 +15,12 @@ export const DRAG_LAYOUT_TIME_BUDGET_MS = 8;
 export const KEYBOARD_RECOMPOSE_MIN_DISPLACEMENT_PX = 20;
 
 export const WINDOW_VALIDITY_CHECK_INTERVAL_MS = 10;
+// Some toolkits (notably WeChat mini/app windows) can map a perfectly usable
+// NORMAL window before WM_CLASS is available. If WM_CLASS stays null, allow a
+// conservative fallback only after the window's size has remained stable.
+export const CLASSLESS_WINDOW_SETTLE_MS = 120;
+export const CLASSLESS_WINDOW_MIN_WIDTH = 100;
+export const CLASSLESS_WINDOW_MIN_HEIGHT = 100;
 
 export const TileZone = Object.freeze({
     NONE: 0,

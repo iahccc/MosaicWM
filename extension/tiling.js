@@ -684,13 +684,85 @@ export const TilingManager = GObject.registerClass({
         array[index2] = tmp;
     }
 
+    _hasWindowClass(window) {
+        return Boolean(
+            window.wm_class ??
+            window.get_wm_class?.() ??
+            window.get_wm_class_instance?.()
+        );
+    }
+
+    _isStableClasslessWindow(window, monitor, workspace, actor) {
+        const frame = window.get_frame_rect();
+        const windowType = window.get_window_type?.() ?? window.window_type;
+        const title = window.get_title?.() ?? '';
+
+        const looksLikeNormalWindow =
+            windowType === Meta.WindowType.NORMAL &&
+            monitor !== null &&
+            workspace &&
+            actor &&
+            actor.mapped !== false &&
+            workspace.list_windows().length !== 0 &&
+            frame.width >= constants.CLASSLESS_WINDOW_MIN_WIDTH &&
+            frame.height >= constants.CLASSLESS_WINDOW_MIN_HEIGHT &&
+            title.length > 0 &&
+            !window.minimized &&
+            !window.is_hidden() &&
+            !window.is_skip_taskbar?.() &&
+            !window.is_attached_dialog?.() &&
+            !window.get_transient_for?.();
+
+        if (!looksLikeNormalWindow) {
+            WindowState.remove(window, 'classlessValidityCandidate');
+            return false;
+        }
+
+        const now = Date.now();
+        const candidate = WindowState.get(window, 'classlessValidityCandidate');
+        const sizeChanged = !candidate ||
+            candidate.width !== frame.width ||
+            candidate.height !== frame.height;
+
+        if (sizeChanged) {
+            WindowState.set(window, 'classlessValidityCandidate', {
+                width: frame.width,
+                height: frame.height,
+                timestamp: now,
+                accepted: false,
+            });
+            return false;
+        }
+
+        if (candidate.accepted)
+            return true;
+
+        if (now - candidate.timestamp < constants.CLASSLESS_WINDOW_SETTLE_MS)
+            return false;
+
+        WindowState.set(window, 'classlessValidityCandidate', {
+            ...candidate,
+            accepted: true,
+        });
+        Logger.log(`checkValidity: accepting classless stable window ${window.get_id()} (${frame.width}x${frame.height})`);
+        return true;
+    }
+
     checkValidity(monitor, workspace, window, strict) {
+        const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
+        const hasClass = this._hasWindowClass(window);
+        const classReady = hasClass ||
+            this._isStableClasslessWindow(window, monitor, workspace, actor);
+
         if (monitor !== null &&
-            window.wm_class !== null &&
-            isWindowAlive(window) &&
+            workspace &&
+            classReady &&
+            actor &&
             workspace.list_windows().length !== 0 &&
             (strict ? !window.is_hidden() : !window.minimized)
         ) {
+            if (hasClass)
+                WindowState.remove(window, 'classlessValidityCandidate');
             return true;
         } else {
             return false;
@@ -3509,4 +3581,3 @@ class Mask {
         }
     }
 }
-
