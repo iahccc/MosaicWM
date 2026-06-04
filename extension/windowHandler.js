@@ -479,6 +479,7 @@ export const WindowHandler = GObject.registerClass({
         const windowWorkspace = window.get_workspace();
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
+        this._ext.removeWindowFromFocusHistory(windowId);
 
         this.disconnectWindowSignals(window);
 

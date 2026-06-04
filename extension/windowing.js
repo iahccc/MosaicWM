@@ -390,6 +390,57 @@ export const WindowingManager = GObject.registerClass({
         return true;
     }
 
+    isNavigable(meta_window) {
+        return this.getNavigationIneligibilityReason(meta_window) === null;
+    }
+
+    getNavigationIneligibilityReason(meta_window) {
+        if (!meta_window) {
+            return 'missing-window';
+        }
+
+        if (!isWindowAlive(meta_window)) {
+            return 'dead-window';
+        }
+
+        if (meta_window.minimized) {
+            return 'minimized';
+        }
+
+        if (meta_window.is_on_all_workspaces()) {
+            return 'sticky';
+        }
+
+        const workspace = meta_window.get_workspace?.();
+        if (!workspace) {
+            return 'missing-workspace';
+        }
+
+        const monitor = meta_window.get_monitor?.();
+        if (monitor === null || monitor === undefined || monitor < 0) {
+            return 'missing-monitor';
+        }
+
+        const frame = meta_window.get_frame_rect?.();
+        if (!frame || frame.width <= 0 || frame.height <= 0) {
+            return 'missing-geometry';
+        }
+
+        if (meta_window.is_attached_dialog()) {
+            return 'attached-dialog';
+        }
+
+        if (meta_window.get_transient_for() !== null) {
+            return 'transient';
+        }
+
+        if (meta_window.is_skip_taskbar?.()) {
+            return 'skip-taskbar';
+        }
+
+        return null;
+    }
+
     isMaximizedOrFullscreen(window) {
         return window.is_maximized() || window.is_fullscreen();
     }
