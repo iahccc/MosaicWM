@@ -1,6 +1,32 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
   <schema id="org.gnome.shell.extensions.mosaic-wm" path="/org/gnome/shell/extensions/mosaic-wm/">
+    <key name="super-hold-threshold-ms" type="u">
+      <range min="1" max="5000"/>
+      <default>500</default>
+      <summary>Super hold threshold in milliseconds</summary>
+      <description>Releasing Super after holding it for this long does not toggle the overview. Short taps keep the normal overview shortcut.</description>
+    </key>
+    <key name="focus-left" type="as">
+      <default>['&lt;Super&gt;h']</default>
+      <summary>Focus window to the left</summary>
+      <description>Move focus to the closest managed window on the left</description>
+    </key>
+    <key name="focus-down" type="as">
+      <default>['&lt;Super&gt;j']</default>
+      <summary>Focus window below</summary>
+      <description>Move focus to the closest managed window below</description>
+    </key>
+    <key name="focus-up" type="as">
+      <default>['&lt;Super&gt;k']</default>
+      <summary>Focus window above</summary>
+      <description>Move focus to the closest managed window above</description>
+    </key>
+    <key name="focus-right" type="as">
+      <default>['&lt;Super&gt;l']</default>
+      <summary>Focus window to the right</summary>
+      <description>Move focus to the closest managed window on the right</description>
+    </key>
     <key name="tile-left" type="as">
       <default>['&lt;Super&gt;Left']</default>
       <summary>Tile window to left</summary>

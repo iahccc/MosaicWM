@@ -35,6 +35,7 @@ import { WindowHandler } from './windowHandler.js';
 import { DragHandler } from './dragHandler.js';
 import { ResizeHandler } from './resizeHandler.js';
 import { MiniatureManager } from './miniature.js';
+import { KeyboardNavigatorManager } from './keyboardNavigator.js';
 import * as WindowState from './windowState.js';
 import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS, MINIATURE_OVERLAY } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
@@ -70,6 +71,7 @@ export default class WindowMosaicExtension extends Extension {
         this.resizeHandler = null;
 
         this.miniatureManager    = null;
+        this.keyboardNavigator = null;
         this._lastFocusedWindowId  = null;
         this._focusWindowChangedId = 0;
         this._miniatureRestoredId  = 0;
@@ -285,7 +287,9 @@ export default class WindowMosaicExtension extends Extension {
         this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this.miniatureManager.setAnimationsManager(this.animationsManager);
         this.edgeTilingManager.setMiniatureManager(this.miniatureManager);
+        this.keyboardNavigator = new KeyboardNavigatorManager(this);
         this._lastFocusedWindowId = null;
+        this.keyboardNavigator.enable();
 
         this._miniatureRestoredId = this.miniatureManager.connect('miniature-restored',
             (_, window) => this._onMiniatureRestored(window));
@@ -722,7 +726,8 @@ export default class WindowMosaicExtension extends Extension {
         const prevFocusedId = this._lastFocusedWindowId;
         this._lastFocusedWindowId = window.get_id();
 
-        if (!this._focusEligibleForRestore(window)) return;
+        const isMiniature = WindowState.get(window, IS_MINIATURE);
+        if (this._shouldSkipMiniatureFocusRestore(window, isMiniature)) return;
 
         const windowId = window.get_id();
         Logger.log(`[FOCUS] Miniature focused ${windowId} (prev=${prevFocusedId})`);
@@ -735,18 +740,23 @@ export default class WindowMosaicExtension extends Extension {
         // 'miniature-restored' signal fires synchronously → _onMiniatureRestored runs next
     }
 
-    // Only a miniature that the user could sensibly want back qualifies; a maximized,
-    // excluded window, or one mid smart-resize, is left alone.
-    _focusEligibleForRestore(window) {
-        if (!this.windowingManager.isRelated(window)) return false;
-        if (this.windowingManager.isExcluded(window)) return false;
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) return false;
-        if (!WindowState.get(window, IS_MINIATURE)) return false;
+    _shouldSkipMiniatureFocusRestore(window, isMiniature) {
+        if (!this.windowingManager.isNavigable(window) ||
+            this.windowingManager.isExcluded(window) ||
+            this.windowingManager.isMaximizedOrFullscreen(window) || !isMiniature)
+            return true;
+
+        if (this.keyboardNavigator?.isTransitionActive()) {
+            Logger.log(`[FOCUS] Suppressing incidental miniature restore for ${window.get_id()} during navigation session`);
+            return true;
+        }
+
         if (this.tilingManager._isSmartResizingBlocked) {
             Logger.log(`[FOCUS] Skip restore ${window.get_id()}: smartResizingBlocked`);
-            return false;
+            return true;
         }
-        return true;
+
+        return false;
     }
 
     _onMiniatureRestored(window) {
@@ -836,6 +846,19 @@ export default class WindowMosaicExtension extends Extension {
 
     _setupKeybindings() {
         const settings = this.getSettings('org.gnome.shell.extensions.mosaic-wm');
+
+        const focusBindings = [
+            ['focus-left', 'left'],
+            ['focus-down', 'down'],
+            ['focus-up', 'up'],
+            ['focus-right', 'right'],
+        ];
+        for (const [bindingName, direction] of focusBindings) {
+            const action = Main.wm.addKeybinding(bindingName, settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+                () => this.keyboardNavigator?.startOrAdvance(direction));
+            if (action === Meta.KeyBindingAction.NONE)
+                Logger.warn(`[NAV] Failed to register keybinding ${bindingName}`);
+        }
 
         Main.wm.addKeybinding('tile-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
             () => this._onArrowShortcut('left'));
@@ -1001,6 +1024,10 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _removeKeybindings() {
+        Main.wm.removeKeybinding('focus-left');
+        Main.wm.removeKeybinding('focus-down');
+        Main.wm.removeKeybinding('focus-up');
+        Main.wm.removeKeybinding('focus-right');
         Main.wm.removeKeybinding('tile-left');
         Main.wm.removeKeybinding('tile-right');
         Main.wm.removeKeybinding('maximize-window');
@@ -1016,6 +1043,10 @@ export default class WindowMosaicExtension extends Extension {
         if (this.edgeTilingManager) this.edgeTilingManager.destroy();
         if (this.drawingManager) this.drawingManager.destroy();
         if (this.animationsManager) this.animationsManager.destroy();
+        if (this.keyboardNavigator) {
+            this.keyboardNavigator.disable();
+            this.keyboardNavigator = null;
+        }
 
         if (this._mosaicIndicator) {
             this._mosaicIndicator.destroy();
