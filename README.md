@@ -39,6 +39,15 @@ The consistent principle behind both: nothing should require the user to think a
 - Quick Settings toggles for mosaic per workspace and globally, with a top bar indicator
 - Miniatures keep their scale and position across the Overview
 
+Holding Super shows focus corners that follow the window as it moves or resizes.
+Corners stay hidden during a new window's first tiling animation and appear once it finishes.
+A short Super tap toggles the Overview; holding it for 500 ms or longer suppresses
+the Overview on release. The threshold is configurable in milliseconds:
+
+```bash
+gsettings --schemadir ~/.local/share/gnome-shell/extensions/mosaicwm@cleomenezesjr.github.io/schemas set org.gnome.shell.extensions.mosaic-wm super-hold-threshold-ms 500
+```
+
 ## Known limitations
 
 - **Touch drag does not tile.** Mutter does not expose the drag position to extensions, so the extension cannot tell where your finger is. It currently detects touch drags and skips edge tiling rather than guessing wrong. Fixing it properly needs a small addition to Mutter.

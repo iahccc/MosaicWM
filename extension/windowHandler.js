@@ -644,6 +644,7 @@ export const WindowHandler = GObject.registerClass({
         const windowWorkspace = window.get_workspace();
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
+        this._ext.keyboardNavigator?.onWindowDestroyed(windowId);
 
         this.disconnectWindowSignals(window);
 
@@ -660,48 +661,54 @@ export const WindowHandler = GObject.registerClass({
             return;
         }
 
-        if (windowWorkspace) {
-            const workspace = windowWorkspace;
+        if (!windowWorkspace)
+            return;
 
-            // Capture destroyed window size for reverse smart resize. The actor
-            // may already be disposed during signal delivery, and get_frame_rect
-            // on a dead MetaWindow segfaults libmutter.
-            const destroyedFrame = isWindowAlive(window) ? window.get_frame_rect() : null;
-            const freedWidth = destroyedFrame ? destroyedFrame.width : 0;
-            const freedHeight = destroyedFrame ? destroyedFrame.height : 0;
+        this._scheduleDestroyedWindowRetile(window, windowWorkspace, monitor, windowId);
+        this._renavigateEmptyWorkspaceAfterDestroy(windowWorkspace, monitor);
+    }
 
-            this.edgeTilingManager.checkQuarterExpansion(workspace, monitor);
+    _scheduleDestroyedWindowRetile(window, workspace, monitor, windowId) {
+        // Capture destroyed window size for reverse smart resize. The actor
+        // may already be disposed during signal delivery, and get_frame_rect
+        // on a dead MetaWindow segfaults libmutter.
+        const destroyedFrame = isWindowAlive(window) ? window.get_frame_rect() : null;
+        const freedWidth = destroyedFrame?.width ?? 0;
+        const freedHeight = destroyedFrame?.height ?? 0;
 
-            afterWindowClose(() => {
-                afterAnimations(this._ext.animationsManager, () => {
-                    // Both waits run inline when animations are off, so this can still
-                    // execute inside the destroy signal, with the dying window listed.
-                    const retileWorkspace = this._resolveRetileWorkspace(workspace);
-                    const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(retileWorkspace, monitor)
-                        .filter(w => w.get_id() !== windowId &&
-                                     !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
+        this.edgeTilingManager.checkQuarterExpansion(workspace, monitor);
 
-                    this._retileAfterWindowGone(window, remainingWindows, retileWorkspace, monitor, freedWidth, freedHeight, {
-                        requireConstrainedCheck: true,
-                        reverseLogLabel: '[REVERSE-DESTROYED] Window closed',
-                        settleTimeoutName: 'windowHandler_destroyedRestoreSettle',
-                    });
-                }, this._ext._timeoutRegistry);
+        afterWindowClose(() => {
+            afterAnimations(this._ext.animationsManager, () => {
+                // Both waits run inline when animations are off, so this can still
+                // execute inside the destroy signal, with the dying window listed.
+                const retileWorkspace = this._resolveRetileWorkspace(workspace);
+                const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(retileWorkspace, monitor)
+                    .filter(w => w.get_id() !== windowId &&
+                                 !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
+
+                this._retileAfterWindowGone(window, remainingWindows, retileWorkspace, monitor, freedWidth, freedHeight, {
+                    requireConstrainedCheck: true,
+                    reverseLogLabel: '[REVERSE-DESTROYED] Window closed',
+                    settleTimeoutName: 'windowHandler_destroyedRestoreSettle',
+                });
             }, this._ext._timeoutRegistry);
+        }, this._ext._timeoutRegistry);
+    }
 
-            const windows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
-            const managedWindows = windows.filter(w => !this.windowingManager.isExcluded(w));
+    _renavigateEmptyWorkspaceAfterDestroy(workspace, monitor) {
+        const windows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
+        const managedWindows = windows.filter(w => !this.windowingManager.isExcluded(w));
+        if (managedWindows.length !== 0)
+            return;
 
-            if (managedWindows.length === 0) {
-                // Skip if overflow is in progress; window is being moved and will arrive soon
-                if (this._overflowInProgress) {
-                    Logger.log('Workspace is empty but overflow in progress; skipping navigation');
-                    return;
-                }
-
-                this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
-            }
+        // Skip if overflow is in progress; window is being moved and will arrive soon
+        if (this._overflowInProgress) {
+            Logger.log('Workspace is empty but overflow in progress; skipping navigation');
+            return;
         }
+
+        this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
     }
 
     enqueueWindowForEvaluation(window, workspace, monitor) {
