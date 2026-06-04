@@ -7,6 +7,10 @@ import Gio from 'gi://Gio';
 import Clutter from 'gi://Clutter';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
+import Pango from 'gi://Pango';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
@@ -189,6 +193,24 @@ const MiniatureClickOverlay = GObject.registerClass({
         this._iconSuppressReasons = new Set();
         this._iconDelayId = 0;
         this._hoverRestId = 0;
+        this._hovered = false;
+        this._keyboardSelected = false;
+        this._titleLabel = null;
+
+        window.connectObject('notify::title', () => {
+            this._hideTitle();
+            this._syncTitle();
+        }, this);
+        global.workspace_manager.connectObject('active-workspace-changed', () => {
+            this._hovered = false;
+            this._hideTitle();
+        }, this);
+        this.connect('notify::visible', () => {
+            if (!this.visible) {
+                this._hovered = false;
+                this._hideTitle();
+            }
+        });
 
         // Some dialogs/XWayland clients have no app; overlay still works as click target.
         const app = Shell.WindowTracker.get_default().get_window_app(window);
@@ -216,6 +238,7 @@ const MiniatureClickOverlay = GObject.registerClass({
         }
 
         const restore = () => {
+            this._hideTitle();
             Logger.log(`[MINIATURE] Click overlay clicked for ${window.get_id()}`);
             this._miniatureManager.restoreMiniature(window, null);
         };
@@ -235,14 +258,85 @@ const MiniatureClickOverlay = GObject.registerClass({
         // Mutter maps the pointer to a window by walking up from the picked actor to a
         // MetaWindowActor. This overlay is a window_group sibling, so the walk dies here
         // and focus-follows-mouse never sees the miniature. Do the hover focus ourselves.
+        this.connect('enter-event', () => {
+            this._hovered = true;
+            this._syncTitle();
+            return Clutter.EVENT_PROPAGATE;
+        });
         this.connect('motion-event', () => {
+            this._hovered = true;
+            this._syncTitle();
             this._onHover();
             return Clutter.EVENT_PROPAGATE;
         });
         this.connect('leave-event', () => {
+            this._hovered = false;
+            this._syncTitle();
             this._cancelHoverRest();
             return Clutter.EVENT_PROPAGATE;
         });
+    }
+
+    _canShowTitle() {
+        const selected = this._keyboardSelected || (this._hovered && !this._miniatureManager._navigationActive);
+        return !this._destroyed && selected && this.visible && this.reactive &&
+            this._iconSuppressReasons.size === 0 &&
+            WindowState.get(this._window, IS_MINIATURE) &&
+            Math.max(this.width, this.height) <= 128 + 1;
+    }
+
+    _syncTitle() {
+        if (!this._canShowTitle()) {
+            this._hideTitle();
+            return;
+        }
+        if (!this._titleLabel?.visible) {
+            const title = this._window.get_title()?.trim();
+            const monitor = Main.layoutManager.monitors[this._window.get_monitor()];
+            if (!title || !monitor) return;
+            if (!this._titleLabel) {
+                this._titleLabel = new St.Label({style_class: 'dash-label', reactive: false, visible: false});
+                this._titleLabel.clutter_text.set_single_line_mode(true);
+                this._titleLabel.clutter_text.set_ellipsize(Pango.EllipsizeMode.END);
+                Main.layoutManager.addChrome(this._titleLabel);
+            }
+            this._titleLabel.set_text(title);
+            const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+            this._titleLabel.set_width(-1);
+            const [, naturalWidth] = this._titleLabel.get_preferred_width(-1);
+            this._titleLabel.set_width(Math.min(naturalWidth, 360 * scale, monitor.width - 16 * scale));
+            this._titleLabel.show();
+        }
+        this._positionTitle();
+    }
+
+    _positionTitle() {
+        const label = this._titleLabel;
+        const monitor = Main.layoutManager.monitors[this._window.get_monitor()];
+        if (!monitor) {
+            this._hideTitle();
+            return;
+        }
+        const margin = 8 * St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const [x, y] = this.get_transformed_position();
+        const [, height] = label.get_preferred_height(label.width);
+        const left = Math.clamp(x + (this.width - label.width) / 2,
+            monitor.x + margin, monitor.x + monitor.width - label.width - margin);
+        // Prefer above the thumbnail; top-edge thumbnails show the title below instead.
+        const top = y - height - margin >= monitor.y + margin
+            ? y - height - margin : y + this.height + margin;
+        label.set_position(Math.round(left), Math.round(Math.clamp(top,
+            monitor.y + margin, monitor.y + monitor.height - height - margin)));
+    }
+
+    _hideTitle() {
+        this._titleLabel?.hide();
+    }
+
+    setNavigationPreview(active, selected) {
+        this._keyboardSelected = selected;
+        if (active) this._cancelHoverRest();
+        this._syncTitle();
     }
 
     _onHover() {
@@ -265,6 +359,7 @@ const MiniatureClickOverlay = GObject.registerClass({
 
     _restoreOnHover() {
         if (this._destroyed || !WindowState.get(this._window, IS_MINIATURE)) return;
+        if (this._miniatureManager._navigationActive) return;
         // Reordering and edge tiling own the miniature while a grab is up.
         if (global.display.is_grabbed()) return;
         // A window that just shrank under a resting cursor would bounce straight back out.
@@ -286,6 +381,7 @@ const MiniatureClickOverlay = GObject.registerClass({
         if (this._destroyed) return;
         this.set_position(x, y);
         this.set_size(width, height);
+        if (this._hovered || this._keyboardSelected) this._syncTitle();
         if (!this._icon) return;
         const [allocW, allocH] = this.allocation.get_size();
         this._icon.set_translation((width - allocW) / 2, (height - allocH) / 2, 0);
@@ -344,13 +440,17 @@ const MiniatureClickOverlay = GObject.registerClass({
         if (suppressed) this._iconSuppressReasons.add(reason);
         else this._iconSuppressReasons.delete(reason);
 
-        if (this._iconSuppressReasons.size > 0) this.hideIcon();
-        else this.showIcon(0);
+        if (this._iconSuppressReasons.size > 0) {
+            this.hideIcon();
+            this._hovered = false;
+            this._hideTitle();
+        } else this.showIcon(0);
     }
 
     fadeOutAndDestroy(duration) {
         if (this._destroyed) return;
         this.reactive = false;
+        this._hideTitle();
         this._cancelHoverRest();
         this._cancelIconDelay();
         if (!this._icon || this._icon.opacity === 0 || duration <= 0) {
@@ -370,6 +470,8 @@ const MiniatureClickOverlay = GObject.registerClass({
         this._destroyed = true;
         this._cancelHoverRest();
         this._cancelIconDelay();
+        this._titleLabel?.destroy();
+        this._titleLabel = null;
         super.destroy();
     }
 });
@@ -387,6 +489,7 @@ export const MiniatureManager = GObject.registerClass({
         this._timeoutRegistry = null;
         this._animationsManager = null;
         this._overviewActive = false;
+        this._navigationActive = false;
         this._wmPrefs = new Gio.Settings({ schema_id: 'org.gnome.desktop.wm.preferences' });
         this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
     }
@@ -397,6 +500,12 @@ export const MiniatureManager = GObject.registerClass({
 
     waitsForPointerRest() {
         return this._mutterSettings?.get_boolean('focus-change-on-pointer-rest') ?? true;
+    }
+
+    setNavigationPreview(active, selectedWindow = null) {
+        this._navigationActive = active;
+        for (const window of this._miniatureWindows.values())
+            WindowState.get(window, MINIATURE_OVERLAY)?.setNavigationPreview(active, active && window === selectedWindow);
     }
 
     setTimeoutRegistry(registry) {

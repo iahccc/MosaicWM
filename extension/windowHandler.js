@@ -547,6 +547,7 @@ export const WindowHandler = GObject.registerClass({
         const windowWorkspace = window.get_workspace();
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
+        this._ext.keyboardNavigator?.onWindowDestroyed(windowId);
 
         this.disconnectWindowSignals(window);
 

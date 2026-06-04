@@ -39,6 +39,28 @@ The consistent principle behind both: nothing should require the user to think a
 - Quick Settings toggles for mosaic per workspace and globally, with a top bar indicator
 - Miniatures keep their scale and position across the Overview
 
+A short Super tap toggles the Overview. Holding Super alone for 200 ms shows letter
+hints for windows on all monitors of the current workspace. Press a hint to preview
+its window, then release Super to focus it; Escape cancels, and releasing without a
+selection keeps the current focus. A selected 128px miniature shows its title and
+stays small until confirmation.
+
+When available, H, L, K and J prefer the nearest windows to the left, right, above and below the
+window focused when Super was pressed. Other hints prioritize the right-hand letters
+U, I, O, N, M, P and Y, then use left-hand letters. Large workspaces use letter
+sequences; Backspace clears a partial sequence.
+Hints keep keyboard focus on the current window. Existing Super shortcuts remain
+available after hints appear: they cancel the preview and perform their usual action
+on the focused window. All hints, including H/J/K/L, skip occupied shortcuts. If a
+direction letter is unavailable, its window receives another free letter instead.
+Labels stay fixed throughout a selection and appear at each window’s center, above
+the existing application icon on miniatures. Using another shortcut before the delay cancels
+hints for that hold. The delay is configurable in milliseconds:
+
+```bash
+gsettings --schemadir ~/.local/share/gnome-shell/extensions/mosaicwm@cleomenezesjr.github.io/schemas set org.gnome.shell.extensions.mosaic-wm super-hold-threshold-ms 200
+```
+
 ## Known limitations
 
 - **Touch drag does not tile.** Mutter does not expose the drag position to extensions, so the extension cannot tell where your finger is. It currently detects touch drags and skips edge tiling rather than guessing wrong. Fixing it properly needs a small addition to Mutter.

@@ -134,6 +134,7 @@ export const DrawingManager = GObject.registerClass({
             this._companionPreview.destroy();
             this._companionPreview = null;
         }
+
         this._edgeTilingManager = null;
     }
 
