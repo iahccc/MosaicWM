@@ -7,6 +7,9 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import GObject from 'gi://GObject';
 
+const FOCUS_CORNER_SIZE = 18;
+const FOCUS_CORNER_INSET = 0;
+
 export const DrawingManager = GObject.registerClass({
     GTypeName: 'MosaicDrawingManager',
 }, class DrawingManager extends GObject.Object {
@@ -17,6 +20,8 @@ export const DrawingManager = GObject.registerClass({
 
         this._tilePreview = null;
         this._companionPreview = null;
+
+        this._focusCorners = null;
 
         this._edgeTilingManager = null;
     }
@@ -107,8 +112,69 @@ export const DrawingManager = GObject.registerClass({
         this.hideCompanionTilePreview();
     }
 
+    _ensureFocusCorners() {
+        if (this._focusCorners)
+            return;
+
+        const cornerClasses = [
+            'corner-top-left',
+            'corner-top-right',
+            'corner-bottom-left',
+            'corner-bottom-right',
+        ];
+
+        this._focusCorners = cornerClasses.map(styleClass => {
+            const corner = new St.Widget({
+                style_class: 'mosaic-focus-corner',
+                reactive: false,
+                visible: false,
+            });
+            corner.add_style_class_name(styleClass);
+            corner.set_size(FOCUS_CORNER_SIZE, FOCUS_CORNER_SIZE);
+            Main.uiGroup.add_child(corner);
+            return corner;
+        });
+    }
+
+    showFocusCorners(rect) {
+        if (!rect)
+            return;
+
+        this._ensureFocusCorners();
+
+        const maxOffsetX = Math.max(0, rect.width - FOCUS_CORNER_SIZE - FOCUS_CORNER_INSET * 2);
+        const maxOffsetY = Math.max(0, rect.height - FOCUS_CORNER_SIZE - FOCUS_CORNER_INSET * 2);
+        const left = rect.x + FOCUS_CORNER_INSET;
+        const right = rect.x + FOCUS_CORNER_INSET + maxOffsetX;
+        const top = rect.y + FOCUS_CORNER_INSET;
+        const bottom = rect.y + FOCUS_CORNER_INSET + maxOffsetY;
+
+        const positions = [
+            [left, top],
+            [right, top],
+            [left, bottom],
+            [right, bottom],
+        ];
+
+        for (let index = 0; index < this._focusCorners.length; index++) {
+            const corner = this._focusCorners[index];
+            const [x, y] = positions[index];
+            corner.set_position(x, y);
+            corner.show();
+        }
+    }
+
+    hideFocusCorners() {
+        if (!this._focusCorners)
+            return;
+
+        for (const corner of this._focusCorners)
+            corner.hide();
+    }
+
     clearActors() {
         this.removeBoxes();
+        this.hideFocusCorners();
 
         while(this._boxPool.length > 0) {
             const box = this._boxPool.pop();
@@ -129,6 +195,15 @@ export const DrawingManager = GObject.registerClass({
                 Main.uiGroup.remove_child(this._companionPreview);
             this._companionPreview.destroy();
             this._companionPreview = null;
+        }
+
+        if (this._focusCorners) {
+            for (const corner of this._focusCorners) {
+                if (corner.get_parent())
+                    Main.uiGroup.remove_child(corner);
+                corner.destroy();
+            }
+            this._focusCorners = null;
         }
         this._edgeTilingManager = null;
     }

@@ -34,6 +34,7 @@ import { WindowHandler } from './windowHandler.js';
 import { DragHandler } from './dragHandler.js';
 import { ResizeHandler } from './resizeHandler.js';
 import { MiniatureManager } from './miniature.js';
+import { KeyboardNavigatorManager } from './keyboardNavigator.js';
 import * as WindowState from './windowState.js';
 import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS, MINIATURE_OVERLAY } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
@@ -69,10 +70,13 @@ export default class WindowMosaicExtension extends Extension {
         this.resizeHandler = null;
 
         this.miniatureManager    = null;
+        this.keyboardNavigator = null;
         this._miniatureCascadeIds  = null;
         this._lastFocusedWindowId  = null;
         this._focusWindowChangedId = 0;
         this._miniatureRestoredId  = 0;
+        this._focusHistory = new WeakMap();
+        this._pendingWorkspaceHistoryRestore = null;
 
         this._dnd = null;
         this._dndEnterId = 0;
@@ -191,9 +195,20 @@ export default class WindowMosaicExtension extends Extension {
         }
 
         this._currentWorkspaceIndex = newIndex;
+        const isNavigationSessionActive = this.keyboardNavigator?.isSessionActive() ?? false;
+
+        if (isNavigationSessionActive) {
+            this._pendingWorkspaceHistoryRestore = null;
+        } else {
+            const currentFocus = global.display.focus_window;
+            const preferredMonitor = currentFocus?.get_monitor?.() ?? global.display.get_primary_monitor();
+            this._capturePendingWorkspaceHistoryRestore(newWorkspace, preferredMonitor);
+        }
 
         // Tiling while the switch animation runs races it; wait until it finishes.
         afterAnimations(this.animationsManager, () => {
+            if (!isNavigationSessionActive)
+                this._restorePendingWorkspaceHistoryFocus(newWorkspace);
             Logger.log(`Workspace animation complete - ready for operations on workspace ${newIndex}`);
         }, this._timeoutRegistry);
     };
@@ -284,8 +299,11 @@ export default class WindowMosaicExtension extends Extension {
         this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this.miniatureManager.setAnimationsManager(this.animationsManager);
         this.edgeTilingManager.setMiniatureManager(this.miniatureManager);
+        this.keyboardNavigator = new KeyboardNavigatorManager(this);
         this._miniatureCascadeIds = new Set();
         this._lastFocusedWindowId = null;
+        this._focusHistory = new WeakMap();
+        this.keyboardNavigator.enable();
 
         this._miniatureRestoredId = this.miniatureManager.connect('miniature-restored',
             (_, window) => this._onMiniatureRestored(window));
@@ -710,6 +728,153 @@ export default class WindowMosaicExtension extends Extension {
             mw.get_transient_for() !== null;
     }
 
+    _rememberFocusedWindow(window) {
+        const workspace = window?.get_workspace();
+        const monitor = window?.get_monitor();
+        if (!workspace || monitor === null || monitor === undefined || monitor < 0)
+            return;
+
+        let monitorHistory = this._focusHistory.get(workspace);
+        if (!monitorHistory) {
+            monitorHistory = new Map();
+            this._focusHistory.set(workspace, monitorHistory);
+        }
+
+        monitorHistory.set(monitor, window.get_id());
+    }
+
+    rememberNavigableFocusedWindow(window) {
+        if (!window || !this.windowingManager?.isNavigable(window))
+            return false;
+
+        this._rememberFocusedWindow(window);
+        return true;
+    }
+
+    getLastFocusedWindowForWorkspaceMonitor(workspace, monitor) {
+        const monitorHistory = this._focusHistory.get(workspace);
+        const windowId = monitorHistory?.get(monitor);
+        if (!windowId)
+            return null;
+
+        const window = global.display.find_window_by_id?.(windowId)
+            ?? global.display.list_all_windows().find(w => w.get_id() === windowId);
+
+        if (!window)
+            return null;
+        if (window.get_workspace() !== workspace || window.get_monitor() !== monitor)
+            return null;
+        if (!this.windowingManager?.isNavigable(window))
+            return null;
+
+        return window;
+    }
+
+    _capturePendingWorkspaceHistoryRestore(workspace, monitor) {
+        this._pendingWorkspaceHistoryRestore = null;
+
+        if (!workspace)
+            return;
+
+        if (this.keyboardNavigator?.hasPendingWorkspaceActivationFor?.(workspace))
+            return;
+
+        if (monitor === null || monitor === undefined || monitor < 0)
+            return;
+
+        const historyWindow = this.getLastFocusedWindowForWorkspaceMonitor(workspace, monitor);
+        if (!historyWindow)
+            return;
+
+        this._pendingWorkspaceHistoryRestore = {
+            workspace,
+            monitor,
+            windowId: historyWindow.get_id(),
+        };
+    }
+
+    _restorePendingWorkspaceHistoryFocus(workspace) {
+        const pendingRestore = this._pendingWorkspaceHistoryRestore;
+        if (!pendingRestore || pendingRestore.workspace !== workspace)
+            return false;
+        if (this._workspaceManager.get_active_workspace() !== workspace)
+            return false;
+
+        const historyWindow = this._getPendingWorkspaceHistoryWindow();
+        if (!historyWindow)
+            return false;
+
+        const focusedWindow = global.display.focus_window;
+        if (focusedWindow?.get_id?.() === historyWindow.get_id()) {
+            this._pendingWorkspaceHistoryRestore = null;
+            return true;
+        }
+
+        Logger.log(`[FOCUS] Restoring workspace history focus to ${historyWindow.get_id()} on WS-${workspace.index()} monitor ${pendingRestore.monitor}`);
+        historyWindow.activate(global.get_current_time());
+        return true;
+    }
+
+    _getPendingWorkspaceHistoryWindow() {
+        const pendingRestore = this._pendingWorkspaceHistoryRestore;
+        if (!pendingRestore)
+            return null;
+
+        const historyWindow = global.display.find_window_by_id?.(pendingRestore.windowId)
+            ?? global.display.list_all_windows().find(w => w.get_id() === pendingRestore.windowId);
+        if (!historyWindow)
+            return null;
+        if (historyWindow.get_workspace() !== pendingRestore.workspace || historyWindow.get_monitor() !== pendingRestore.monitor)
+            return null;
+        if (!this.windowingManager?.isNavigable(historyWindow))
+            return null;
+
+        return historyWindow;
+    }
+
+    _maybeEnforcePendingWorkspaceHistoryFocus(window) {
+        const pendingRestore = this._pendingWorkspaceHistoryRestore;
+        if (!pendingRestore || !window)
+            return false;
+
+        if (window.get_workspace?.() !== pendingRestore.workspace || window.get_monitor?.() !== pendingRestore.monitor)
+            return false;
+
+        const historyWindow = this._getPendingWorkspaceHistoryWindow();
+        if (!historyWindow) {
+            this._pendingWorkspaceHistoryRestore = null;
+            return false;
+        }
+
+        if (window.get_id?.() === historyWindow.get_id()) {
+            this._pendingWorkspaceHistoryRestore = null;
+            return false;
+        }
+
+        Logger.log(`[FOCUS] Reasserting workspace history focus to ${historyWindow.get_id()} on WS-${pendingRestore.workspace.index()} monitor ${pendingRestore.monitor}`);
+        historyWindow.activate(global.get_current_time());
+        return true;
+    }
+
+    removeWindowFromFocusHistory(windowId) {
+        const workspaceManager = global.workspace_manager;
+        const workspaceCount = workspaceManager?.get_n_workspaces?.() ?? 0;
+
+        for (let index = 0; index < workspaceCount; index++) {
+            const workspace = workspaceManager.get_workspace_by_index(index);
+            const monitorHistory = workspace ? this._focusHistory.get(workspace) : null;
+            if (!monitorHistory)
+                continue;
+
+            for (const [monitor, focusedWindowId] of monitorHistory.entries()) {
+                if (focusedWindowId === windowId)
+                    monitorHistory.delete(monitor);
+            }
+        }
+
+        this.keyboardNavigator?.onWindowDestroyed(windowId);
+    }
+
     _onFocusWindowChanged() {
         const window = global.display.focus_window;
         if (!window) return;
@@ -717,7 +882,34 @@ export default class WindowMosaicExtension extends Extension {
         const prevFocusedId = this._lastFocusedWindowId;
         this._lastFocusedWindowId = window.get_id();
 
-        if (!this._focusEligibleForRestore(window)) return;
+        const isMiniature = WindowState.get(window, IS_MINIATURE);
+        const isNavigationSessionActive = this.keyboardNavigator?.isSessionActive() ?? false;
+        if (isNavigationSessionActive) {
+            if (isMiniature) {
+                Logger.log(`[FOCUS] Delaying miniature restore for ${window.get_id()} during navigation session`);
+                this.keyboardNavigator.handleFocusedMiniature(window);
+            } else {
+                this.keyboardNavigator.handleFocusedMiniature(null);
+            }
+        }
+
+        if (!this.windowingManager.isNavigable(window)) return;
+        if (!isNavigationSessionActive && this._maybeEnforcePendingWorkspaceHistoryFocus(window))
+            return;
+        if (!isNavigationSessionActive)
+            this._rememberFocusedWindow(window);
+
+        if (isNavigationSessionActive && isMiniature)
+            return;
+        if (!isMiniature) return;
+        if (WindowState.get(window, 'justMiniaturized')) {
+            Logger.log(`[FOCUS] Skip restore ${window.get_id()}: justMiniaturized`);
+            return;
+        }
+        if (this.tilingManager._isSmartResizingBlocked) {
+            Logger.log(`[FOCUS] Skip restore ${window.get_id()}: smartResizingBlocked`);
+            return;
+        }
 
         const windowId = window.get_id();
         Logger.log(`[FOCUS] Miniature focused ${windowId} (prev=${prevFocusedId}) cascade=${this._miniatureCascadeIds?.has(windowId)}`);
@@ -735,24 +927,6 @@ export default class WindowMosaicExtension extends Extension {
 
         this.miniatureManager.restoreMiniature(window, null);
         // 'miniature-restored' signal fires synchronously → _onMiniatureRestored runs next
-    }
-
-    // Only a miniature that the user could sensibly want back qualifies; a maximized,
-    // excluded, or just-miniaturized window, or one mid smart-resize, is left alone.
-    _focusEligibleForRestore(window) {
-        if (!this.windowingManager.isRelated(window)) return false;
-        if (this.windowingManager.isExcluded(window)) return false;
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) return false;
-        if (!WindowState.get(window, IS_MINIATURE)) return false;
-        if (WindowState.get(window, 'justMiniaturized')) {
-            Logger.log(`[FOCUS] Skip restore ${window.get_id()}: justMiniaturized`);
-            return false;
-        }
-        if (this.tilingManager._isSmartResizingBlocked) {
-            Logger.log(`[FOCUS] Skip restore ${window.get_id()}: smartResizingBlocked`);
-            return false;
-        }
-        return true;
     }
 
     // Returns true to let the restore proceed (deliberate re-focus), false when it was an
@@ -884,6 +1058,19 @@ export default class WindowMosaicExtension extends Extension {
 
     _setupKeybindings() {
         const settings = this.getSettings('org.gnome.shell.extensions.mosaic-wm');
+
+        const focusBindings = [
+            ['focus-left', 'left'],
+            ['focus-down', 'down'],
+            ['focus-up', 'up'],
+            ['focus-right', 'right'],
+        ];
+        for (const [bindingName, direction] of focusBindings) {
+            const action = Main.wm.addKeybinding(bindingName, settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+                () => this.keyboardNavigator?.startOrAdvance(direction));
+            if (action === Meta.KeyBindingAction.NONE)
+                Logger.warn(`[NAV] Failed to register keybinding ${bindingName}`);
+        }
 
         Main.wm.addKeybinding('tile-left', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
             () => this._onArrowShortcut('left'));
@@ -1040,6 +1227,10 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _removeKeybindings() {
+        Main.wm.removeKeybinding('focus-left');
+        Main.wm.removeKeybinding('focus-down');
+        Main.wm.removeKeybinding('focus-up');
+        Main.wm.removeKeybinding('focus-right');
         Main.wm.removeKeybinding('tile-left');
         Main.wm.removeKeybinding('tile-right');
         Main.wm.removeKeybinding('maximize-window');
@@ -1055,6 +1246,10 @@ export default class WindowMosaicExtension extends Extension {
         if (this.edgeTilingManager) this.edgeTilingManager.destroy();
         if (this.drawingManager) this.drawingManager.destroy();
         if (this.animationsManager) this.animationsManager.destroy();
+        if (this.keyboardNavigator) {
+            this.keyboardNavigator.disable();
+            this.keyboardNavigator = null;
+        }
 
         if (this._mosaicIndicator) {
             this._mosaicIndicator.destroy();
@@ -1098,6 +1293,7 @@ export default class WindowMosaicExtension extends Extension {
 
         this._miniatureCascadeIds = null;
         this._lastFocusedWindowId = null;
+        this._focusHistory = new WeakMap();
     }
 
     _disconnectSignals() {
