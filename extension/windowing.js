@@ -406,6 +406,80 @@ export const WindowingManager = GObject.registerClass({
         return !stickyByMonitorPolicy;
     }
 
+    isNavigable(meta_window) {
+        return this.getNavigationIneligibilityReason(meta_window) === null;
+    }
+
+    getNavigationIneligibilityReason(meta_window) {
+        return this._getNavigationStateIneligibilityReason(meta_window)
+            ?? this._getNavigationPlacementIneligibilityReason(meta_window)
+            ?? this._getNavigationRoleIneligibilityReason(meta_window);
+    }
+
+    _getNavigationStateIneligibilityReason(meta_window) {
+        if (!meta_window) {
+            return 'missing-window';
+        }
+
+        if (!isWindowAlive(meta_window)) {
+            return 'dead-window';
+        }
+
+        if (meta_window.minimized) {
+            return 'minimized';
+        }
+
+        if (meta_window.is_on_all_workspaces()) {
+            return 'sticky';
+        }
+
+        return null;
+    }
+
+    _getNavigationPlacementIneligibilityReason(meta_window) {
+        return this._getNavigationWorkspaceIneligibilityReason(meta_window)
+            ?? this._getNavigationGeometryIneligibilityReason(meta_window);
+    }
+
+    _getNavigationWorkspaceIneligibilityReason(meta_window) {
+        const workspace = meta_window.get_workspace?.();
+        if (!workspace) {
+            return 'missing-workspace';
+        }
+
+        const monitor = meta_window.get_monitor?.();
+        if (monitor === null || monitor === undefined || monitor < 0) {
+            return 'missing-monitor';
+        }
+
+        return null;
+    }
+
+    _getNavigationGeometryIneligibilityReason(meta_window) {
+        const frame = meta_window.get_frame_rect?.();
+        if (!frame || frame.width <= 0 || frame.height <= 0) {
+            return 'missing-geometry';
+        }
+
+        return null;
+    }
+
+    _getNavigationRoleIneligibilityReason(meta_window) {
+        if (meta_window.is_attached_dialog()) {
+            return 'attached-dialog';
+        }
+
+        if (meta_window.get_transient_for() !== null) {
+            return 'transient';
+        }
+
+        if (meta_window.is_skip_taskbar?.()) {
+            return 'skip-taskbar';
+        }
+
+        return null;
+    }
+
     isMaximizedOrFullscreen(window) {
         return window.is_maximized() || window.is_fullscreen() || this._looksNativelyFullscreen(window);
     }
