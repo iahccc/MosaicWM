@@ -370,7 +370,13 @@ export const WindowingManager = GObject.registerClass({
         if (wmClass && BLACKLISTED_WM_CLASSES.includes(wmClass)) {
             return true;
         }
-        
+
+        // 1×1 XWayland utility windows (clipboard helpers) must not enter the layout.
+        const frame = meta_window.get_frame_rect();
+        if (frame.width <= 1 && frame.height <= 1) {
+            return true;
+        }
+
         return false;
     }
 
