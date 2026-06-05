@@ -15,6 +15,7 @@ import { TileZone } from './constants.js';
 import * as WindowState from './windowState.js';
 import { IS_MINIATURE } from './windowState.js';
 import { ComputedLayouts } from './tiling.js';
+import { isWindowAlive } from './liveness.js';
 import { afterWorkspaceSwitch, afterAnimations, afterWindowClose } from './timing.js';
 
 export const WindowHandler = GObject.registerClass({
@@ -254,7 +255,7 @@ export const WindowHandler = GObject.registerClass({
                 pendingMaximizeCheck = true;
                 this._timeoutRegistry.addIdle(() => {
                     pendingMaximizeCheck = false;
-                    if (!win.get_compositor_private()) return GLib.SOURCE_REMOVE;
+                    if (!isWindowAlive(win)) return GLib.SOURCE_REMOVE;
 
                     if (this.windowingManager.isMaximizedOrFullscreen(win)) {
                         // Skip if this is a window that opened maximized — already handled by onWindowCreated
@@ -662,7 +663,7 @@ export const WindowHandler = GObject.registerClass({
             let { window, workspace, monitor } = this._evaluationQueue.shift();
             WindowState.remove(window, 'pendingInQueue');
 
-            if (!window || !window.get_compositor_private()) {
+            if (!isWindowAlive(window)) {
                 Logger.log('Evaluation queue: window destroyed before evaluation, skipping');
                 continue;
             }
@@ -838,9 +839,10 @@ export const WindowHandler = GObject.registerClass({
             .filter(w => w.get_id() !== window.get_id() && !this.edgeTilingManager.isEdgeTiled(w)
                 && !WindowState.get(w, 'pendingInQueue'));
 
+        // Include IS_MINIATURE windows so tryFitWithResize can account for the space they occupy.
+        // They are treated as non-resizable fixed participants inside tryFitWithResize.
         const existingWindows = allExistingWindows.filter(w =>
-            !this.windowingManager.isMaximizedOrFullscreen(w) &&
-            !WindowState.get(w, IS_MINIATURE)
+            !this.windowingManager.isMaximizedOrFullscreen(w)
         );
 
         if (existingWindows.length > 0) {
@@ -890,7 +892,7 @@ export const WindowHandler = GObject.registerClass({
 
             if( monitor !== null &&
                 window.wm_class !== null &&
-                window.get_compositor_private() &&
+                isWindowAlive(window) &&
                 workspace.list_windows().length !== 0 &&
                 !window.is_hidden())
             {
@@ -1020,7 +1022,7 @@ export const WindowHandler = GObject.registerClass({
             // Safety timeout
             timeoutId = this._timeoutRegistry.add(400, () => {
                 // Pre-flight check: If the actor was disposed while waiting, abort safely.
-                if (!window.get_compositor_private()) {
+                if (!isWindowAlive(window)) {
                     Logger.log('window map timeout - window already disposed, aborting process');
                     return GLib.SOURCE_REMOVE;
                 }
@@ -1033,7 +1035,7 @@ export const WindowHandler = GObject.registerClass({
             // Fallback for non-actor windows (rare in Shell)
             this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
                 // Abort if window is gone (destroyed or unmanaged)
-                if (!window.get_compositor_private() || !window.get_workspace()) {
+                if (!isWindowAlive(window) || !window.get_workspace()) {
                     Logger.log('onWindowCreated fallback: window gone - aborting');
                     return GLib.SOURCE_REMOVE;
                 }
@@ -1060,7 +1062,7 @@ export const WindowHandler = GObject.registerClass({
 
         this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
             // Abort if window is gone (destroyed or unmanaged)
-            if (!window.get_compositor_private() || !window.get_workspace()) {
+            if (!isWindowAlive(window) || !window.get_workspace()) {
                 Logger.log(`window-added: window ${window.get_id()} gone - aborting`);
                 return GLib.SOURCE_REMOVE;
             }
@@ -1142,7 +1144,7 @@ export const WindowHandler = GObject.registerClass({
         const removedMonitor = window.get_monitor();
 
         const actor = window.get_compositor_private();
-        if (!actor) {
+        if (!actor || actor.is_destroyed()) {
             this._ext.tilingManager.clearPreferredSize(window);
         } else {
             Logger.log('_windowRemoved: Window still exists (DnD move) - keeping preferred size');

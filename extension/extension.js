@@ -20,6 +20,7 @@ import { SettingsOverrider } from './settingsOverrider.js';
 import { EdgeTilingManager } from './edgeTiling.js';
 import { TileZone } from './constants.js';
 import { TilingManager } from './tiling.js';
+import { isWindowAlive } from './liveness.js';
 import { ReorderingManager } from './reordering.js';
 import { SwappingManager } from './swapping.js';
 import { DrawingManager } from './drawing.js';
@@ -529,7 +530,7 @@ export default class WindowMosaicExtension extends Extension {
 
         const existingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
             .filter(w =>
-                w.get_compositor_private() &&
+                isWindowAlive(w) &&
                 w.get_id() !== window.get_id() &&
                 !this.edgeTilingManager.isEdgeTiled(w) &&
                 !WindowState.get(w, 'pendingInQueue') &&

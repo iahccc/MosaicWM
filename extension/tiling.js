@@ -21,6 +21,7 @@ import {
     PRE_MINIATURE_CENTER,
 } from './windowState.js';
 import { getMiniatureSize, applyMiniatureActorState, animateMiniatureToTarget } from './miniature.js';
+import { isWindowAlive } from './liveness.js';
 
 const PROXIMITY_WEIGHT = 0.05;
 
@@ -364,7 +365,7 @@ export const TilingManager = GObject.registerClass({
 
                 if (WindowState.get(window, IS_MINIATURE)) {
                     const actor = window.get_compositor_private();
-                    if (actor) {
+                    if (actor && !actor.is_destroyed()) {
                         const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                         const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                         const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
@@ -385,7 +386,7 @@ export const TilingManager = GObject.registerClass({
                     WindowState.set(window, 'isConstrainedByMosaic', true);
                     window.move_resize_frame(false, pos.x, pos.y, pos.width, pos.height);
                     const actor = window.get_compositor_private();
-                    if (actor) {
+                    if (actor && !actor.is_destroyed()) {
                         actor.set_translation(currentRect.x - pos.x, currentRect.y - pos.y, 0);
                         actor.ease({
                             translation_x: 0,
@@ -494,7 +495,7 @@ export const TilingManager = GObject.registerClass({
     checkValidity(monitor, workspace, window, strict) {
         if (monitor !== null &&
             window.wm_class !== null &&
-            window.get_compositor_private() &&
+            isWindowAlive(window) &&
             workspace.list_windows().length !== 0 &&
             (strict ? !window.is_hidden() : !window.minimized)
         ) {
@@ -1294,7 +1295,7 @@ export const TilingManager = GObject.registerClass({
                                 const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                                 const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                                 const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                                if (actor) {
+                                if (actor && !actor.is_destroyed()) {
                                     animateMiniatureToTarget(actor, window, sc, extL, extT, tx, ty,
                                         constants.ANIMATION_DURATION_MS);
                                     WindowState.get(window, MINIATURE_OVERLAY)?.animateToPosition(constants.ANIMATION_DURATION_MS);
@@ -1344,7 +1345,7 @@ export const TilingManager = GObject.registerClass({
                                 const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                                 const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                                 const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                                if (actor) {
+                                if (actor && !actor.is_destroyed()) {
                                     animateMiniatureToTarget(actor, window, sc, extL, extT, targetX, targetY,
                                         constants.ANIMATION_DURATION_MS);
                                     WindowState.get(window, MINIATURE_OVERLAY)?.animateToPosition(constants.ANIMATION_DURATION_MS);
@@ -2261,7 +2262,7 @@ export const TilingManager = GObject.registerClass({
                 if (allWindows.some(aw => aw.get_id() === w.get_id())) continue;
 
                 // Skip destroyed windows — get_frame_rect on a disposed MetaWindow segfaults libmutter.
-                if (!w || !w.get_compositor_private()) {
+                if (!isWindowAlive(w)) {
                     Logger.log(`[SMART RESIZE] Skipping destroyed window ${w?.get_id?.() ?? '?'}`);
                     continue;
                 }
@@ -2275,10 +2276,15 @@ export const TilingManager = GObject.registerClass({
                     continue;
                 }
 
-                // Skip already-miniaturized windows — their slot is reserved and shouldn't be re-evaluated
+                // Already-miniaturized: include as non-resizable fixed participants so the simulation
+                // accounts for the space they occupy. Timestamp kept for recently-restored debounce.
                 if (WindowState.get(w, IS_MINIATURE)) {
-                    Logger.log(`[SMART RESIZE] Skipping already miniature window ${w.get_id()} — IS_MINIATURE=true`);
-                    this._recentMiniatureWindows[w.get_id()] = Date.now();
+                    const ms = getMiniatureSize(w);
+                    if (ms) {
+                        allWindows.push(w);
+                        windowData.set(w.get_id(), { window: w, current: ms, min: ms, isResizable: false });
+                        this._recentMiniatureWindows[w.get_id()] = Date.now();
+                    }
                     continue;
                 }
 
@@ -2336,10 +2342,44 @@ export const TilingManager = GObject.registerClass({
                 return { success: true, tileInfo: null, pendingWindows: [] };
             }
 
-            // Step 2: Minimum fit check — if doesn't fit at minimums, overflow is inevitable
+            // Step 2: Minimum fit check — if doesn't fit at minimums, try miniaturization
             if (this._tile(buildSimulated(0.0), workArea, true).overflow) {
                 Logger.log('[SMART RESIZE] Overflow inevitable — even at minimums, windows don\'t fit');
-                return { success: false, tileInfo: null, pendingWindows: [] };
+
+                const ext0 = global.MosaicExtension;
+                if (ext0?.miniatureManager) {
+                    const focusedId0   = (focusedWindowOverride ?? global.display.focus_window)?.get_id();
+                    const newWindowId0 = newWindow.get_id();
+
+                    for (const w of allWindows) {
+                        const d = windowData.get(w.get_id());
+                        if (!d || d.pendingMiniature) continue;
+                        if (w.get_id() === focusedId0 || w.get_id() === newWindowId0) continue;
+                        if (WindowState.get(w, IS_MINIATURE)) continue;
+                        if (this._windowingManager.isMaximizedOrFullscreen(w)) continue;
+
+                        const nonMiniCount = allWindows.filter(aw =>
+                            !WindowState.get(aw, IS_MINIATURE) && !windowData.get(aw.get_id())?.pendingMiniature
+                        ).length;
+                        if (nonMiniCount <= 1) break;
+
+                        // Use preferred size (not smart-resized frame) so the miniature restores to the natural size.
+                        const frame   = w.get_frame_rect();
+                        const preSize = { x: frame.x, y: frame.y, width: d.current.width, height: d.current.height };
+                        const scale   = 256 / Math.max(preSize.width, preSize.height);
+                        d.pendingMiniature = true;
+                        d.miniSize         = { width: Math.round(preSize.width * scale), height: Math.round(preSize.height * scale) };
+                        d.pendingPreSize   = preSize;
+                        Logger.log(`[SMART RESIZE] ${w.get_id()}: miniaturizing to make room (${d.miniSize.width}x${d.miniSize.height})`);
+
+                        if (!this._tile(buildSimulated(0.0), workArea, true).overflow) break;
+                    }
+                }
+
+                if (this._tile(buildSimulated(0.0), workArea, true).overflow) {
+                    Logger.log('[SMART RESIZE] Still overflow after miniaturization — applying overflow logic');
+                    return { success: false, tileInfo: null, pendingWindows: [] };
+                }
             }
 
             // Step 3: Binary search for optimal scale factor
@@ -2379,6 +2419,7 @@ export const TilingManager = GObject.registerClass({
                     const candidates = buildSimulated(lo).filter(sim => {
                         const d = windowData.get(sim.id);
                         if (!d) return false;
+                        if (d.pendingMiniature) return false;
                         if (sim.id === focusedId || sim.id === newWindowId) return false;
                         if (WindowState.get(d.window, IS_MINIATURE)) return false;
                         if (this._windowingManager.isMaximizedOrFullscreen(d.window)) return false;
@@ -2392,26 +2433,24 @@ export const TilingManager = GObject.registerClass({
                     const candidateSim  = candidates[0];
                     const candidateData = windowData.get(candidateSim.id);
 
-                    // Guard 1: never miniaturize the last non-miniature window
-                    const nonMiniatureCount = allWindows.filter(w => !WindowState.get(w, IS_MINIATURE)).length;
+                    // Guard 1: never miniaturize the last visible (non-miniature, non-pending) window
+                    const nonMiniatureCount = allWindows.filter(w =>
+                        !WindowState.get(w, IS_MINIATURE) && !windowData.get(w.get_id())?.pendingMiniature
+                    ).length;
                     if (nonMiniatureCount <= 1) {
                         Logger.log(`[MINIATURE] Guard 1: refusing to miniaturize last non-miniature window ${candidateSim.id}`);
                         break;
                     }
 
-                    // Instead of creating miniature immediately (which causes position glitches),
-                    // mark the window as "pending miniature" so buildSimulated uses miniature size
-                    // in layout calculations. The actual miniature creation happens AFTER the
-                    // layout is computed and windows are in final positions.
                     candidateData.pendingMiniature = true;
-                    candidateData.miniatureTargetSlot = null; // Will be set when layout is computed
+                    candidateData.miniatureTargetSlot = null;
                     Logger.log(`[MINIATURE] Marking ${candidateSim.id} as PENDING miniature (will be created after layout)`);
 
-                    // Update windowData to reflect miniature size for subsequent tile calculations
-                    // Compute miniature size directly — IS_MINIATURE isn't set yet (miniature doesn't exist)
-                    const preSize = candidateData.window.get_frame_rect();
-                    const scale = 256 / Math.max(preSize.width, preSize.height);
-                    const miniSize = { width: Math.round(preSize.width * scale), height: Math.round(preSize.height * scale) };
+                    // Use preferred size so the miniature restores to the window's natural size.
+                    const frame4a   = candidateData.window.get_frame_rect();
+                    const preSize   = { x: frame4a.x, y: frame4a.y, width: candidateData.current.width, height: candidateData.current.height };
+                    const scale     = 256 / Math.max(preSize.width, preSize.height);
+                    const miniSize  = { width: Math.round(preSize.width * scale), height: Math.round(preSize.height * scale) };
                     candidateData.miniSize = miniSize;
                     candidateData.pendingPreSize = preSize;
                     Logger.log(`[MINIATURE] ${candidateSim.id} PENDING at ${preSize.width}x${preSize.height} → miniSize: ${miniSize.width}x${miniSize.height} scale: ${scale}`);
@@ -2720,7 +2759,7 @@ class WindowDescriptor {
                         WindowState.set(window, 'isConstrainedByMosaic', true);
                         window.move_resize_frame(false, x, y, this.width, this.height);
                         const windowActor = window.get_compositor_private();
-                        if (windowActor) {
+                        if (windowActor && !windowActor.is_destroyed()) {
                             const translateX = currentRect.x - x;
                             const translateY = currentRect.y - y;
                             windowActor.set_translation(translateX, translateY, 0);
@@ -2739,7 +2778,7 @@ class WindowDescriptor {
                 if (isMiniature) {
                     // Do NOT move_frame for miniatures (Mutter may reject)
                     const windowActor = window.get_compositor_private();
-                    if (windowActor) {
+                    if (windowActor && !windowActor.is_destroyed()) {
                         const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                         const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                         const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;

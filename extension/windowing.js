@@ -11,6 +11,7 @@ import { afterWorkspaceSwitch } from './timing.js';
 
 import { TileZone } from './constants.js';
 import * as WindowState from './windowState.js';
+import { isWindowAlive } from './liveness.js';
 
 const BLACKLISTED_WM_CLASSES = [
     'org.gnome.Screenshot',
@@ -304,7 +305,7 @@ export const WindowingManager = GObject.registerClass({
                             // Check position after tiling
                             this._timeoutRegistry.addIdle(() => {
                                 try {
-                                    if (!window || !window.get_compositor_private()) {
+                                    if (!isWindowAlive(window)) {
                                         return;
                                     }
                                     const finalFrame = window.get_frame_rect();
@@ -364,12 +365,7 @@ export const WindowingManager = GObject.registerClass({
         if (meta_window.is_above()) {
             return true;
         }
-        
-        // Sticky / on all workspaces ("sempre na area de trabalho visivel")
-        if (meta_window.is_on_all_workspaces()) {
-            return true;
-        }
-        
+
         const wmClass = meta_window.get_wm_class();
         if (wmClass && BLACKLISTED_WM_CLASSES.includes(wmClass)) {
             return true;
