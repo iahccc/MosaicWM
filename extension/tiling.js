@@ -16,6 +16,7 @@ import {
     MINIATURE_TARGET_POS,
     MINIATURE_EXT_LEFT,
     MINIATURE_EXT_TOP,
+
     MINIATURE_OVERLAY,
     ANIMATING_MINIATURE,
     PRE_MINIATURE_CENTER,
@@ -820,8 +821,8 @@ export const TilingManager = GObject.registerClass({
             levels.push(level);
         }
         
-        // Calculate horizontal centering
-        const startX = (work_area.width - totalWidth) / 2 + work_area.x;
+        // Calculate horizontal centering — clamp so no column starts left of work area
+        const startX = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
         const levelCount = levels.length;
         const centerColIndex = (levelCount - 1) / 2; // e.g., 0.5 for 2 cols, 1 for 3 cols
         
@@ -848,8 +849,8 @@ export const TilingManager = GObject.registerClass({
             }
             totalColHeight += (level.windows.length - 1) * spacing;
             
-            let yPos = (work_area.height - totalColHeight) / 2 + work_area.y;
-            
+            let yPos = Math.max(work_area.y, (work_area.height - totalColHeight) / 2 + work_area.y);
+
             for (const win of level.windows) {
                 // Apply horizontal alignment within column
                 if (alignMode === 'left') {
@@ -891,7 +892,7 @@ export const TilingManager = GObject.registerClass({
         if (totalHeight > work_area.height && windows.length === 2) {
             // Create 2 columns side by side
             const totalWidth = windows[0].width + spacing + windows[1].width;
-            const startX = (work_area.width - totalWidth) / 2 + work_area.x;
+            const startX = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
             
             const levels = [];
             let xPos = startX;
@@ -902,7 +903,7 @@ export const TilingManager = GObject.registerClass({
                 level.width = w.width;
                 level.height = w.height;
                 level.x = xPos;
-                level.y = (work_area.height - w.height) / 2 + work_area.y;
+                level.y = Math.max(work_area.y, (work_area.height - w.height) / 2 + work_area.y);
                 
                 w.targetX = level.x;
                 w.targetY = level.y;
@@ -931,8 +932,8 @@ export const TilingManager = GObject.registerClass({
 
         level.width = maxWidth;
         level.height = totalHeight;
-        level.x = (work_area.width - maxWidth) / 2 + work_area.x;
-        level.y = (work_area.height - totalHeight) / 2 + work_area.y;
+        level.x = Math.max(work_area.x, (work_area.width - maxWidth) / 2 + work_area.x);
+        level.y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
 
         // Set target positions for each window
         let yPos = level.y;
@@ -988,7 +989,7 @@ export const TilingManager = GObject.registerClass({
                 level.height = Math.max(level.height, w.height);
             }
             
-            level.x = (work_area.width - level.width) / 2 + work_area.x;
+            level.x = Math.max(work_area.x, (work_area.width - level.width) / 2 + work_area.x);
             if (totalHeight + level.height + spacing > work_area.height && r > 0) {
                 overflow = true;
             }
@@ -999,8 +1000,8 @@ export const TilingManager = GObject.registerClass({
             levels.push(level);
         }
         
-        const y = (work_area.height - totalHeight) / 2 + work_area.y;
-        
+        const y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
+
         // Set targetX/targetY for each window in each level
         let levelY = y;
         for (const level of levels) {
@@ -1039,9 +1040,9 @@ export const TilingManager = GObject.registerClass({
 
         level.width = totalWidth;
         level.height = maxHeight;
-        level.x = (work_area.width - totalWidth) / 2 + work_area.x;
-        
-        const y = (work_area.height - maxHeight) / 2 + work_area.y;
+        level.x = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
+
+        const y = Math.max(work_area.y, (work_area.height - maxHeight) / 2 + work_area.y);
         level.y = y;
 
         let xPos = level.x;
@@ -1288,13 +1289,13 @@ export const TilingManager = GObject.registerClass({
                         const window = meta_windows.find(w => w.get_id() === windowDesc.id);
                         if (window) {
                             if (WindowState.get(window, IS_MINIATURE)) {
-                                const tx = x;
-                                const ty = y + y_offset;
                                 // Do NOT move_frame for miniatures (Mutter may reject)
                                 const actor = window.get_compositor_private();
                                 const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
                                 const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
                                 const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+                                const tx = x;
+                                const ty = y + y_offset;
                                 if (actor && !actor.is_destroyed()) {
                                     animateMiniatureToTarget(actor, window, sc, extL, extT, tx, ty,
                                         constants.ANIMATION_DURATION_MS);
@@ -1354,7 +1355,7 @@ export const TilingManager = GObject.registerClass({
                                 const miniSlot = { x: targetX, y: targetY, width: windowDesc.width, height: windowDesc.height };
                                 ComputedLayouts.set(window, miniSlot);
                                 if (slotsOut) slotsOut.set(window.get_id(), miniSlot);
-                                Logger.log(`[MINIATURE] animateTile V ${window.get_id()}: target=(${targetX},${targetY}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} slotSize=${windowDesc.width}x${windowDesc.height} VISUAL_EXPECTED=${Math.round(windowDesc.width * sc)}x${Math.round(windowDesc.height * sc)}`);
+                                Logger.log(`[MINIATURE] animateTile V ${window.get_id()}: target=(${targetX},${targetY}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} slotSize=${windowDesc.width}x${windowDesc.height}`);
                             } else if (windowDesc.id === resizingWindowId) {
                                 window.move_frame(false, targetX, targetY);
                             } else if (pendingMiniIds.has(window.get_id())) {
@@ -1698,7 +1699,64 @@ export const TilingManager = GObject.registerClass({
                 tile_info = this._tile(_windows, tileArea);
             }
         }
-        
+
+        // Overflow without a reference window: attempt to miniaturize one window to restore fit.
+        // Handles re-tiles after window close or miniature restore where the layout is still too large.
+        if (overflow && !reference_meta_window && !this.isDragging && this._extension?.miniatureManager) {
+            const focusedId = global.display.focus_window?.get_id();
+
+            const overflowCandidates = meta_windows
+                .filter(w =>
+                    !WindowState.get(w, IS_MINIATURE) &&
+                    w.get_id() !== focusedId &&
+                    !this._windowingManager.isMaximizedOrFullscreen(w)
+                )
+                .sort((a, b) => (WindowState.get(a, 'addedTime') ?? 0) - (WindowState.get(b, 'addedTime') ?? 0));
+
+            let overflowResolved = false;
+            for (const candidate of overflowCandidates) {
+                const frame = candidate.get_frame_rect();
+                const pref = WindowState.get(candidate, 'preferredSize') ?? WindowState.get(candidate, 'openingSize');
+                const preW = pref ? pref.width : frame.width;
+                const preH = pref ? pref.height : frame.height;
+                const scale = 256 / Math.max(preW, preH);
+                const miniW = Math.round(preW * scale);
+                const miniH = Math.round(preH * scale);
+
+                const simSizes = meta_windows.map(w => {
+                    if (w.get_id() === candidate.get_id())
+                        return { id: w.get_id(), width: miniW, height: miniH };
+                    if (WindowState.get(w, IS_MINIATURE)) {
+                        const ms = getMiniatureSize(w);
+                        const f = w.get_frame_rect();
+                        return ms ? { id: w.get_id(), width: ms.width, height: ms.height }
+                                  : { id: w.get_id(), width: f.width, height: f.height };
+                    }
+                    const f = w.get_frame_rect();
+                    return { id: w.get_id(), width: f.width, height: f.height };
+                });
+
+                if (!this._tile(simSizes, tileArea, true).overflow) {
+                    Logger.log(`[OVERFLOW] No-ref overflow resolved: miniaturizing ${candidate.get_id()} (${miniW}x${miniH})`);
+                    if (!this._pendingMiniatureWindows) this._pendingMiniatureWindows = [];
+                    this._pendingMiniatureWindows.push({
+                        window: candidate,
+                        preSize: { x: frame.x, y: frame.y, width: preW, height: preH },
+                    });
+                    const desc = windows.find(w => w.id === candidate.get_id());
+                    if (desc) { desc.width = miniW; desc.height = miniH; }
+                    this.invalidateLayoutCache();
+                    tile_info = this._tile(windows, tileArea);
+                    overflow = tile_info.overflow;
+                    overflowResolved = true;
+                    break;
+                }
+            }
+
+            if (!overflowResolved)
+                Logger.log('[OVERFLOW] No-ref overflow: no single miniaturization resolves it — clamped positions applied');
+        }
+
         Logger.log(`Drawing tiles - isDragging: ${this.isDragging}, using tileArea: x=${tileArea.x}, y=${tileArea.y}`);
         
         // ANIMATIONS
@@ -2686,7 +2744,6 @@ export const TilingManager = GObject.registerClass({
         this._windowingManager = null;
     }
 });
-
 
 function _transitionFromMiniature(window, _slot, ext) {
     if (!ext?.miniatureManager) return false;
