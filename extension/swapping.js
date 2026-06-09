@@ -55,7 +55,7 @@ export const SwappingManager = GObject.registerClass({
         return this._findHorizontalNeighborFromTiling(window, zone, direction, workspace, monitor);
     }
 
-    _findVerticalQuarterNeighbor(zone, direction, workspace, monitor) {
+    _findVerticalQuarterNeighbor(zone, _direction, workspace, monitor) {
         const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
         
         const verticalPairs = {
@@ -98,7 +98,7 @@ export const SwappingManager = GObject.registerClass({
         }
     }
 
-    _findOppositeSideNeighbor(window, sourceZone, targetSide, workspace, monitor) {
+    _findOppositeSideNeighbor(_window, sourceZone, targetSide, workspace, monitor) {
         const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
         const isQuarter = this._edgeTilingManager.isQuarterZone(sourceZone);
         
@@ -410,7 +410,7 @@ export const SwappingManager = GObject.registerClass({
         return true;
     }
 
-    _expandQuarterToFull(window, currentZone, targetZone, workspace, monitor) {
+    _expandQuarterToFull(window, _currentZone, targetZone, workspace, monitor) {
         if (!this._edgeTilingManager) return false;
         
         Logger.log(`Expanding quarter tile ${window.get_id()} to ${targetZone}`);
