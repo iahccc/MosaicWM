@@ -189,6 +189,7 @@ export default class WindowMosaicExtension extends Extension {
     enable() {
         Logger.info('Starting Mosaic layout manager.');
 
+        this._disabledWorkspaceStates = new WeakMap();
         this._timeoutRegistry = new TimeoutRegistry();
         this._workspaceManager = global.workspace_manager;
 
