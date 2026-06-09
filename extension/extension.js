@@ -557,7 +557,6 @@ export default class WindowMosaicExtension extends Extension {
                 w.get_id() !== window.get_id() &&
                 !this.edgeTilingManager.isEdgeTiled(w) &&
                 !WindowState.get(w, 'pendingInQueue') &&
-                !WindowState.get(w, IS_MINIATURE) &&
                 !this.windowingManager.isMaximizedOrFullscreen(w)
             );
 
@@ -569,6 +568,7 @@ export default class WindowMosaicExtension extends Extension {
 
         if (resizeResult?.success) {
             this.tilingManager._isSmartResizingBlocked = true;
+            this.tilingManager._restoringWindowId = window.get_id();
             try {
                 // Pass pending miniatures to tileWorkspaceWindows via instance state;
                 // it'll skip animateReTiling for them and create miniatures itself.
@@ -576,6 +576,7 @@ export default class WindowMosaicExtension extends Extension {
                 this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
             } finally {
                 this.tilingManager._isSmartResizingBlocked = false;
+                this.tilingManager._restoringWindowId = null;
             }
         } else {
             this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);

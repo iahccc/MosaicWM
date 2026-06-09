@@ -64,7 +64,9 @@ export const TilingManager = GObject.registerClass({
         
         // Flag to block overflow decisions during smart resize
         this._isSmartResizingBlocked = false;
-        
+        // Window ID being restored from miniature; shields it from the overflow handler
+        this._restoringWindowId = null;
+
         // Layout cache to avoid redundant O(n!) permutation calculations
         this._lastLayoutHash = null;
         this._cachedTileResult = null;
@@ -1758,6 +1760,7 @@ export const TilingManager = GObject.registerClass({
                 .filter(w =>
                     !WindowState.get(w, IS_MINIATURE) &&
                     w.get_id() !== focusedId &&
+                    w.get_id() !== (this._restoringWindowId ?? null) &&
                     !this._windowingManager.isMaximizedOrFullscreen(w)
                 )
                 .sort((a, b) => (WindowState.get(a, 'addedTime') ?? 0) - (WindowState.get(b, 'addedTime') ?? 0));
