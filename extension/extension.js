@@ -549,7 +549,7 @@ export default class WindowMosaicExtension extends Extension {
         if (!workspace) return;
         if (!this.isMosaicEnabledForWorkspace(workspace)) return;
         const monitor = window.get_monitor();
-        const workArea = workspace.get_work_area_for_monitor(monitor);
+        const workArea = this.tilingManager.getUsableWorkArea(workspace, monitor);
 
         const existingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
             .filter(w =>
