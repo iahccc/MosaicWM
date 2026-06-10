@@ -1704,6 +1704,7 @@ export const TilingManager = GObject.registerClass({
                         const resizeResult = this.tryFitWithResize(reference_meta_window, realExisting, workArea);
                         if (!resizeResult?.success) {
                             Logger.log('Smart resize could not fit sacred window');
+                            this._positionSnapshot = null;
                             return { overflow: true, layout: null };
                         }
                         // Use the tile_info from tryFitWithResize (computed with miniature sizes)
