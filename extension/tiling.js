@@ -627,6 +627,27 @@ export const TilingManager = GObject.registerClass({
         // Weighted score (compactness is most important)
         let score = compactness * 50 + centralization * 30 + sizeEfficiency * 20;
 
+        // Position stability: prefer permutations where windows stay close to current positions
+        if (this._positionSnapshot) {
+            let totalDisp = 0;
+            let count = 0;
+            for (const level of tileResult.levels) {
+                for (const w of level.windows) {
+                    const snap = this._positionSnapshot.get(w.id);
+                    if (!snap) continue;
+                    const px = (w.targetX ?? level.x) + w.width / 2;
+                    const py = (w.targetY ?? level.y) + w.height / 2;
+                    totalDisp += Math.hypot(px - snap.cx, py - snap.cy);
+                    count++;
+                }
+            }
+            if (count > 0) {
+                const maxDiag = Math.hypot(workArea.width, workArea.height);
+                const normalized = totalDisp / (count * maxDiag);
+                score += (1 - normalized) * POSITION_STABILITY_WEIGHT;
+            }
+        }
+
         return score;
     }
 
