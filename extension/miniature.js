@@ -282,50 +282,102 @@ export const MiniatureManager = GObject.registerClass({
         windowActor.add_effect(enforceEffect);
 
         if (animate) {
-            // Mark as animating so enforce effect doesn't interfere
+            const prevKind = WindowState.get(window, MINIATURE_ANIM_KIND);
+
             WindowState.set(window, ANIMATING_MINIATURE, true);
-            WindowState.set(window, MINIATURE_ANIM_KIND, 'create');
 
-            // Pivot at the exact frame anchor so scale tracks adjacent edges; tx/ty absorb residual when clamped past [0,1].
             const [actorW, actorH] = windowActor.get_size();
-            const dw = actorW * (1 - scale);
-            const dh = actorH * (1 - scale);
-            const px = dw > 0 ? Math.max(0, Math.min(1, (targetX - actorBefore_x - extLeft * scale) / dw)) : 0;
-            const py = dh > 0 ? Math.max(0, Math.min(1, (targetY - actorBefore_y - extTop * scale) / dh)) : 0;
-            const tx = targetX - actorBefore_x - px * dw - extLeft * scale;
-            const ty = targetY - actorBefore_y - py * dh - extTop * scale;
 
-            windowActor.remove_all_transitions();
-            windowActor.set_pivot_point(px, py);
-            windowActor.set_translation(0, 0, 0);
+            if (prevKind === 'restore') {
+                // Interrupted restore — read current visual frame origin before canceling
+                const [cpx, cpy] = windowActor.get_pivot_point();
+                const cs = windowActor.scale_x;
+                const ctx = windowActor.translation_x;
+                const cty = windowActor.translation_y;
+                const visualX = actorBefore_x + cpx * actorW * (1 - cs) + ctx + extLeft * cs;
+                const visualY = actorBefore_y + cpy * actorH * (1 - cs) + cty + extTop * cs;
+                const startTx = visualX - actorBefore_x - extLeft * cs;
+                const startTy = visualY - actorBefore_y - extTop * cs;
+                const endTx = targetX - actorBefore_x - extLeft * scale;
+                const endTy = targetY - actorBefore_y - extTop * scale;
+                const animDuration = Math.max(1, Math.round(250 * (cs - scale) / Math.max(0.001, 1.0 - scale)));
 
-            windowActor.ease({
-                scale_x: scale,
-                scale_y: scale,
-                translation_x: tx,
-                translation_y: ty,
-                duration: 250,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                onStopped: () => {
-                    WindowState.remove(window, ANIMATING_MINIATURE);
-                    WindowState.remove(window, MINIATURE_ANIM_KIND);
-                    // Reset pivot for enforce effect (uses pivot 0,0)
-                    windowActor.set_pivot_point(0, 0);
-                    if (WindowState.get(window, IS_MINIATURE)) {
-                        // Re-apply with the LATEST target (layout may have recomputed)
-                        const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
-                        const finalSc = WindowState.get(window, MINIATURE_SCALE);
-                        const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-                        const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                        if (finalTgt && finalSc) {
-                            applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
+                windowActor.remove_all_transitions();
+                // restore's onStopped fired: IS_MINIATURE=true → no snap; MINIATURE_ANIM_KIND removed.
+                WindowState.set(window, MINIATURE_ANIM_KIND, 'create');
+
+                windowActor.set_pivot_point(0, 0);
+                windowActor.set_scale(cs, cs);
+                windowActor.set_translation(startTx, startTy, 0);
+
+                windowActor.ease({
+                    scale_x: scale,
+                    scale_y: scale,
+                    translation_x: endTx,
+                    translation_y: endTy,
+                    duration: animDuration,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onStopped: () => {
+                        WindowState.remove(window, ANIMATING_MINIATURE);
+                        WindowState.remove(window, MINIATURE_ANIM_KIND);
+                        windowActor.set_pivot_point(0, 0);
+                        if (WindowState.get(window, IS_MINIATURE)) {
+                            const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
+                            const finalSc = WindowState.get(window, MINIATURE_SCALE);
+                            const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+                            const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+                            if (finalTgt && finalSc) {
+                                applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
+                            }
+                            const [finalAx, finalAy] = windowActor.get_position();
+                            const [finalW, finalH] = windowActor.get_size();
+                            Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
                         }
-                        const [finalAx, finalAy] = windowActor.get_position();
-                        const [finalW, finalH] = windowActor.get_size();
-                        Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
-                    }
-                },
-            });
+                    },
+                });
+            } else {
+                WindowState.set(window, MINIATURE_ANIM_KIND, 'create');
+
+                // Pivot at the exact frame anchor so scale tracks adjacent edges; tx/ty absorb residual when clamped past [0,1].
+                const dw = actorW * (1 - scale);
+                const dh = actorH * (1 - scale);
+                const px = dw > 0 ? Math.max(0, Math.min(1, (targetX - actorBefore_x - extLeft * scale) / dw)) : 0;
+                const py = dh > 0 ? Math.max(0, Math.min(1, (targetY - actorBefore_y - extTop * scale) / dh)) : 0;
+                const tx = targetX - actorBefore_x - px * dw - extLeft * scale;
+                const ty = targetY - actorBefore_y - py * dh - extTop * scale;
+
+                windowActor.remove_all_transitions();
+                windowActor.set_pivot_point(px, py);
+                windowActor.set_translation(0, 0, 0);
+
+                windowActor.ease({
+                    scale_x: scale,
+                    scale_y: scale,
+                    translation_x: tx,
+                    translation_y: ty,
+                    duration: 250,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onStopped: () => {
+                        WindowState.remove(window, ANIMATING_MINIATURE);
+                        WindowState.remove(window, MINIATURE_ANIM_KIND);
+                        // Reset pivot for enforce effect (uses pivot 0,0)
+                        windowActor.set_pivot_point(0, 0);
+                        if (WindowState.get(window, IS_MINIATURE)) {
+                            // Re-apply with the LATEST target (layout may have recomputed)
+                            const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
+                            const finalSc = WindowState.get(window, MINIATURE_SCALE);
+                            const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+                            const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+                            if (finalTgt && finalSc) {
+                                applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
+                            }
+                            const [finalAx, finalAy] = windowActor.get_position();
+                            const [finalW, finalH] = windowActor.get_size();
+                            Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
+                        }
+                    },
+                });
+            }
         } else {
             // Instant: apply transforms synchronously so the overview's frozen
             // slot (already set to mini) matches the actor state from the first frame.
@@ -436,9 +488,11 @@ export const MiniatureManager = GObject.registerClass({
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onStopped: () => {
                     WindowState.remove(window, MINIATURE_ANIM_KIND);
-                    windowActor.set_pivot_point(0, 0);
-                    windowActor.set_scale(1.0, 1.0);
-                    windowActor.set_translation(0, 0, 0);
+                    if (!WindowState.get(window, IS_MINIATURE)) {
+                        windowActor.set_pivot_point(0, 0);
+                        windowActor.set_scale(1.0, 1.0);
+                        windowActor.set_translation(0, 0, 0);
+                    }
                     const [finalAx, finalAy] = windowActor.get_position();
                     const [finalW, finalH] = windowActor.get_size();
                     Logger.log(`[MINIATURE] restoreMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH})`);
