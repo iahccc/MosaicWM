@@ -311,17 +311,19 @@ export const MiniatureManager = GObject.registerClass({
                     WindowState.remove(window, MINIATURE_ANIM_KIND);
                     // Reset pivot for enforce effect (uses pivot 0,0)
                     windowActor.set_pivot_point(0, 0);
-                    // Re-apply with the LATEST target (layout may have recomputed)
-                    const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
-                    const finalSc = WindowState.get(window, MINIATURE_SCALE);
-                    const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-                    const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                    if (finalTgt && finalSc) {
-                        applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
+                    if (WindowState.get(window, IS_MINIATURE)) {
+                        // Re-apply with the LATEST target (layout may have recomputed)
+                        const finalTgt = WindowState.get(window, MINIATURE_TARGET_POS);
+                        const finalSc = WindowState.get(window, MINIATURE_SCALE);
+                        const finalExtL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+                        const finalExtT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+                        if (finalTgt && finalSc) {
+                            applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
+                        }
+                        const [finalAx, finalAy] = windowActor.get_position();
+                        const [finalW, finalH] = windowActor.get_size();
+                        Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
                     }
-                    const [finalAx, finalAy] = windowActor.get_position();
-                    const [finalW, finalH] = windowActor.get_size();
-                    Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
                 },
             });
         } else {
@@ -383,20 +385,44 @@ export const MiniatureManager = GObject.registerClass({
                 }
             }
 
-            // Symmetric to createMiniature: startTx/startTy seed the mini visual at miniTgt; animating both to 0 lands at ax+extL = frame.x.
+            const kind = WindowState.get(window, MINIATURE_ANIM_KIND);
             const [ax, ay] = windowActor.get_position();
             const [actorW, actorH] = windowActor.get_size();
-            const miniTgt = tgt ?? { x: frame.x, y: frame.y };
-            const dw = actorW * (1 - sc);
-            const dh = actorH * (1 - sc);
-            const px = dw > 0 ? Math.max(0, Math.min(1, (miniTgt.x - ax - extL * sc) / dw)) : 0;
-            const py = dh > 0 ? Math.max(0, Math.min(1, (miniTgt.y - ay - extT * sc) / dh)) : 0;
-            const startTx = dw > 0 ? miniTgt.x - ax - px * dw - extL * sc : 0;
-            const startTy = dh > 0 ? miniTgt.y - ay - py * dh - extT * sc : 0;
+
+            let startPivotX, startPivotY, startScale, startTx, startTy, duration;
+
+            if (kind === 'create') {
+                // Interrupted miniaturize — read current visual frame origin before canceling
+                const [cpx, cpy] = windowActor.get_pivot_point();
+                const cs = windowActor.scale_x;
+                const ctx = windowActor.translation_x;
+                const cty = windowActor.translation_y;
+                const visualX = ax + cpx * actorW * (1 - cs) + ctx + extL * cs;
+                const visualY = ay + cpy * actorH * (1 - cs) + cty + extT * cs;
+                startPivotX = 0;
+                startPivotY = 0;
+                startScale = cs;
+                startTx = visualX - ax - extL * cs;
+                startTy = visualY - ay - extT * cs;
+                duration = Math.max(1, Math.round(250 * (1.0 - cs) / Math.max(0.001, 1.0 - sc)));
+            } else {
+                const miniTgt = tgt ?? { x: frame.x, y: frame.y };
+                const dw = actorW * (1 - sc);
+                const dh = actorH * (1 - sc);
+                startPivotX = dw > 0 ? Math.max(0, Math.min(1, (miniTgt.x - ax - extL * sc) / dw)) : 0;
+                startPivotY = dh > 0 ? Math.max(0, Math.min(1, (miniTgt.y - ay - extT * sc) / dh)) : 0;
+                startScale = sc;
+                startTx = dw > 0 ? miniTgt.x - ax - startPivotX * dw - extL * sc : 0;
+                startTy = dh > 0 ? miniTgt.y - ay - startPivotY * dh - extT * sc : 0;
+                duration = 250;
+            }
 
             windowActor.remove_all_transitions();
-            windowActor.set_pivot_point(px, py);
-            windowActor.set_scale(sc, sc);
+            // Set AFTER remove_all_transitions: create's onStopped (if fired) removes MINIATURE_ANIM_KIND.
+            WindowState.set(window, MINIATURE_ANIM_KIND, 'restore');
+
+            windowActor.set_pivot_point(startPivotX, startPivotY);
+            windowActor.set_scale(startScale, startScale);
             windowActor.set_translation(startTx, startTy, 0);
 
             if (activate) window.activate(global.get_current_time());
@@ -406,9 +432,10 @@ export const MiniatureManager = GObject.registerClass({
                 scale_y: 1.0,
                 translation_x: 0,
                 translation_y: 0,
-                duration: 250,
+                duration,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onStopped: () => {
+                    WindowState.remove(window, MINIATURE_ANIM_KIND);
                     windowActor.set_pivot_point(0, 0);
                     windowActor.set_scale(1.0, 1.0);
                     windowActor.set_translation(0, 0, 0);
