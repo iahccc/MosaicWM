@@ -26,7 +26,6 @@ export const DragHandler = GObject.registerClass({
         this._dragMonitorId = null;
         this._currentZone = TileZone.NONE;
         this._dragPositionChangedId = 0;
-        this._dragEventFilterId = 0;
         this._isPositionProcessing = false;
         this._dragOverflowWindow = null;
         this._currentGrabOp = null;
@@ -74,7 +73,7 @@ export const DragHandler = GObject.registerClass({
         this._edgeTileGhostWindows = [];
     }
 
-    _grabOpBeginHandler = (display, window, grabpo) => {
+    _grabOpBeginHandler = (_display, window, grabpo) => {
         this._currentGrabOp = grabpo;
         const isResizeOp = isResizeGrabOp(grabpo);
         if (isResizeOp) {
@@ -161,8 +160,11 @@ export const DragHandler = GObject.registerClass({
             this._dragPositionChangedId = this._draggedWindow.connect('position-changed', this._onDragPositionChanged.bind(this));
         }
 
-        // For keyboard/menu move: set up position tracking for reordering (no edge tiling)
-        if (grabpo === Meta.GrabOp.KEYBOARD_MOVING && !this.windowingManager.isExcluded(window)) {
+        // For keyboard/menu move: set up position tracking for reordering (no edge tiling).
+        // KEYBOARD_MOVING also matches isMoveGrabOp, so guard against the block
+        // above having already connected (a second connect would leak the first id).
+        if (grabpo === Meta.GrabOp.KEYBOARD_MOVING && !this._dragPositionChangedId &&
+            !this.windowingManager.isExcluded(window)) {
             this._draggedWindow = window;
             this._dragPositionChangedId = this._draggedWindow.connect('position-changed', this._onDragPositionChanged.bind(this));
         }
@@ -176,7 +178,7 @@ export const DragHandler = GObject.registerClass({
         }
     };
     
-    _grabOpEndHandler = (display, window, grabpo) => {
+    _grabOpEndHandler = (_display, window, grabpo) => {
         this._currentGrabOp = null;
         
         // Handle drag overflow - window that was marked as not fitting
@@ -210,10 +212,6 @@ export const DragHandler = GObject.registerClass({
                     Logger.log(`Failed to disconnect signal on drag end (overflow): ${e.message}`);
                 }
                 this._dragPositionChangedId = 0;
-            }
-            if (this._dragEventFilterId) {
-                Clutter.Event.remove_filter(this._dragEventFilterId);
-                this._dragEventFilterId = 0;
             }
             return;
         }
@@ -319,66 +317,6 @@ export const DragHandler = GObject.registerClass({
         this.drawingManager.hideTilePreview();
     };
 
-    _onDragGlobalButtonRelease(event) {
-        if (event.type() !== Clutter.EventType.BUTTON_RELEASE) {
-            return Clutter.EVENT_PROPAGATE;
-        }
-
-        // Cleanup filter immediately to avoid duplicate events
-        if (this._dragEventFilterId) {
-            Clutter.Event.remove_filter(this._dragEventFilterId);
-            this._dragEventFilterId = 0;
-        }
-
-        if (!this._draggedWindow) {
-            return Clutter.EVENT_PROPAGATE;
-        }
-
-        Logger.log('Global button release detected - cleaning up drag');
-        
-        if (this._currentZone !== TileZone.NONE) {
-            const workspace = this._draggedWindow.get_workspace();
-            const monitor = global.display.get_current_monitor();
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            
-            Logger.log(`Applying zone ${this._currentZone} on button release`);
-            this.edgeTilingManager.applyTile(this._draggedWindow, this._currentZone, workArea);
-        }
-        
-        this.drawingManager.hideTilePreview();
-        this.tilingManager.clearDragRemainingSpace();
-        this.edgeTilingManager.setEdgeTilingActive(false, null);
-        
-        // Clear ghost windows
-        this.clearGhostWindows();
-        
-        // Restore opacity if window was marked as overflow
-        if (this._dragOverflowWindow) {
-            const overflowActor = this._dragOverflowWindow.get_compositor_private();
-            if (overflowActor) overflowActor.opacity = 255;
-            this.tilingManager.clearExcludedWindow();
-            this._dragOverflowWindow = null;
-        }
-        
-        const draggedWindow = this._draggedWindow;
-        this._draggedWindow = null;
-        this._currentZone = TileZone.NONE;
-        
-        this.reorderingManager.stopDrag(draggedWindow, false, true);
-
-        // Disconnect position signal if still active
-        if (this._dragPositionChangedId && draggedWindow) {
-            try {
-                draggedWindow.disconnect(this._dragPositionChangedId);
-            } catch (e) {
-                Logger.log(`Failed to disconnect drag signal: ${e.message}`);
-            }
-            this._dragPositionChangedId = 0;
-        }
-        
-        return Clutter.EVENT_PROPAGATE;
-    }
-
     _onDragPositionChanged() {
         if (!this._draggedWindow) return;
 
@@ -479,12 +417,7 @@ export const DragHandler = GObject.registerClass({
             }
             this._dragPositionChangedId = 0;
         }
-        
-        if (this._dragEventFilterId) {
-            Clutter.Event.remove_filter(this._dragEventFilterId);
-            this._dragEventFilterId = 0;
-        }
-        
+
         this.clearGhostWindows();
         this._skipNextTiling = null;
         this._draggedWindow = null;

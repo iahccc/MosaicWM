@@ -13,7 +13,6 @@ export const ReorderingManager = GObject.registerClass({
     _init() {
         super._init();
         this.dragStart = false;
-        this._positionChangedId = 0;
         this._dragLayouts = null;
         this._chosenLayout = null;
         this._lastTileState = null;
@@ -23,7 +22,6 @@ export const ReorderingManager = GObject.registerClass({
         this._animationsManager = null;
         this._windowingManager = null;
 
-        this._boundPositionHandler = null;
         this._dragContext = null;
     }
 
@@ -51,9 +49,6 @@ export const ReorderingManager = GObject.registerClass({
 
     setPaused(paused) {
         this._paused = paused;
-        if (paused && this._tilingManager) {
-            this._tilingManager.clearTmpReorder();
-        }
     }
 
     _onPositionChanged() {
@@ -83,7 +78,6 @@ export const ReorderingManager = GObject.registerClass({
         }
 
         if (isOverEdgeZone) {
-            this._tilingManager.clearTmpReorder();
             this._lastTileState = 'edge-zone';
             return;
         }
@@ -157,12 +151,20 @@ export const ReorderingManager = GObject.registerClass({
 
         this._tilingManager.createMask(meta_window);
         this._tilingManager.clearTmpSwap();
-        this._tilingManager.clearTmpReorder();
 
         this._tilingManager.enableDragMode(remainingSpace);
 
         this.dragStart = true;
-        const descriptorsCopy = JSON.parse(JSON.stringify(descriptors));
+        // Plain-data copy: the layout search only needs geometry and ids, and
+        // descriptors carry a metaWindow GObject that must not be serialized.
+        const descriptorsCopy = descriptors.map(d => ({
+            id: d.id,
+            index: d.index,
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: d.height,
+        }));
 
         this._dragContext = {
             meta_window,
@@ -205,7 +207,6 @@ export const ReorderingManager = GObject.registerClass({
 
         this._tilingManager.disableDragMode();
         this._tilingManager.destroyMasks();
-        this._tilingManager.clearTmpReorder();
 
         if (!skip_tiling) {
             this._tilingManager.tileWorkspaceWindows(workspace, null, meta_window.get_monitor());
@@ -215,20 +216,13 @@ export const ReorderingManager = GObject.registerClass({
     }
 
     destroy() {
-        if (this._positionChangedId && this._dragContext?.meta_window) {
-            const actor = this._dragContext.meta_window.get_compositor_private();
-            if (actor) {
-                this._dragContext.meta_window.disconnect(this._positionChangedId);
-            }
-            this._positionChangedId = 0;
-        }
         this.dragStart = false;
         this._dragLayouts = null;
         this._chosenLayout = null;
-        this._boundPositionHandler = null;
         this._dragContext = null;
         this._tilingManager = null;
         this._edgeTilingManager = null;
         this._animationsManager = null;
+        this._windowingManager = null;
     }
 });
