@@ -7,6 +7,7 @@ import Clutter from 'gi://Clutter';
 import Meta from 'gi://Meta';
 
 import * as Logger from './logger.js';
+import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
 import {
     IS_MINIATURE,
@@ -249,6 +250,11 @@ export const MiniatureManager = GObject.registerClass({
     _init() {
         super._init();
         this._miniatureWindows = new Set();
+        this._timeoutRegistry = null;
+    }
+
+    setTimeoutRegistry(registry) {
+        this._timeoutRegistry = registry;
     }
 
     createMiniature(window, computedSlot, forcedPreSize = null, { animate = true } = {}) {
@@ -256,17 +262,18 @@ export const MiniatureManager = GObject.registerClass({
         if (!windowActor) return false;
 
         const preSize = forcedPreSize || window.get_frame_rect();
-        const scale = 256 / Math.max(preSize.width, preSize.height);
+        const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(preSize.width, preSize.height);
         Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: preSize=${preSize.width}x${preSize.height} scale=${scale} forced=${!!forcedPreSize}`);
 
         const targetX = computedSlot.x;
         const targetY = computedSlot.y;
 
-        // Compute shadow extents BEFORE any move (frame and actor are in sync)
+        // Use current frame rect for extLeft/extTop — preSize.x/y is stale if an intermediate tile call moved the window.
         const [actorBefore_x, actorBefore_y] = windowActor.get_position();
-        const extLeft = preSize.x - actorBefore_x;
-        const extTop = preSize.y - actorBefore_y;
-        Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
+        const currentFrame = window.get_frame_rect();
+        const extLeft = currentFrame.x - actorBefore_x;
+        const extTop = currentFrame.y - actorBefore_y;
+        Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) currentFrame=(${currentFrame.x},${currentFrame.y}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
 
         // Store state BEFORE animation - enforce effect and workspace animation
         // patch need to read these during the animation
@@ -300,7 +307,7 @@ export const MiniatureManager = GObject.registerClass({
                 const startTy = visualY - actorBefore_y - extTop * cs;
                 const endTx = targetX - actorBefore_x - extLeft * scale;
                 const endTy = targetY - actorBefore_y - extTop * scale;
-                const animDuration = Math.max(1, Math.round(250 * (cs - scale) / Math.max(0.001, 1.0 - scale)));
+                const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * (cs - scale) / Math.max(0.001, 1.0 - scale)));
 
                 // Set kind before remove_all_transitions so that restore's onStopped — which
                 // fires synchronously — sees 'create' and skips its conditional removal.
@@ -357,7 +364,7 @@ export const MiniatureManager = GObject.registerClass({
                     scale_y: scale,
                     translation_x: tx,
                     translation_y: ty,
-                    duration: 250,
+                    duration: constants.MINIATURE_ANIM_MS,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                     onStopped: () => {
                         WindowState.remove(window, ANIMATING_MINIATURE);
@@ -388,13 +395,16 @@ export const MiniatureManager = GObject.registerClass({
 
         Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: miniSize=${Math.round(preSize.width * scale)}x${Math.round(preSize.height * scale)}`);
 
-        // Prevent focus handler from immediately restoring (expires in 500 ms)
-        WindowState.set(window, 'justMiniaturized', true);
-        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
-            WindowState.remove(window, 'justMiniaturized');
-            return GLib.SOURCE_REMOVE;
-        });
-        WindowState.set(window, 'miniatureJustMiniaturizedTimeoutId', timeoutId);
+        // Only set the focus-restore guard when a registry can expire it — a stuck flag blocks restore forever.
+        if (this._timeoutRegistry) {
+            WindowState.set(window, 'justMiniaturized', true);
+            const timeoutId = this._timeoutRegistry.add(constants.MINIATURE_FOCUS_GUARD_MS, () => {
+                WindowState.remove(window, 'justMiniaturized');
+                WindowState.remove(window, 'miniatureJustMiniaturizedTimeoutId');
+                return GLib.SOURCE_REMOVE;
+            }, 'miniature_focusGuard');
+            WindowState.set(window, 'miniatureJustMiniaturizedTimeoutId', timeoutId);
+        }
 
         this._miniatureWindows.add(window.get_id());
         this.emit('miniature-created', window);
@@ -458,7 +468,7 @@ export const MiniatureManager = GObject.registerClass({
                 startScale = cs;
                 startTx = visualX - ax - extL * cs;
                 startTy = visualY - ay - extT * cs;
-                duration = Math.max(1, Math.round(250 * (1.0 - cs) / Math.max(0.001, 1.0 - sc)));
+                duration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * (1.0 - cs) / Math.max(0.001, 1.0 - sc)));
             } else {
                 const miniTgt = tgt ?? { x: frame.x, y: frame.y };
                 const dw = actorW * (1 - sc);
@@ -468,7 +478,7 @@ export const MiniatureManager = GObject.registerClass({
                 startScale = sc;
                 startTx = dw > 0 ? miniTgt.x - ax - startPivotX * dw - extL * sc : 0;
                 startTy = dh > 0 ? miniTgt.y - ay - startPivotY * dh - extT * sc : 0;
-                duration = 250;
+                duration = constants.MINIATURE_ANIM_MS;
             }
 
             // Set kind after remove_all_transitions: create's onStopped fires synchronously during
@@ -517,7 +527,7 @@ export const MiniatureManager = GObject.registerClass({
         WindowState.remove(window, 'targetSmartResizeSize');
 
         const timeoutId = WindowState.get(window, 'miniatureJustMiniaturizedTimeoutId');
-        if (timeoutId) GLib.source_remove(timeoutId);
+        if (timeoutId) this._timeoutRegistry?.remove(timeoutId);
         WindowState.remove(window, 'miniatureJustMiniaturizedTimeoutId');
         WindowState.remove(window, 'justMiniaturized');
 
@@ -539,6 +549,13 @@ export const MiniatureManager = GObject.registerClass({
         WindowState.remove(window, MINIATURE_EXT_LEFT);
         WindowState.remove(window, MINIATURE_EXT_TOP);
 
+        // Destroy the click overlay — an orphaned reactive actor would capture clicks on a dead window.
+        const overlay = WindowState.get(window, MINIATURE_OVERLAY);
+        if (overlay) {
+            overlay.destroy();
+            WindowState.remove(window, MINIATURE_OVERLAY);
+        }
+
         if (windowActor) {
             const effects = windowActor.get_effects();
             for (const effect of effects) {
@@ -550,7 +567,7 @@ export const MiniatureManager = GObject.registerClass({
         }
 
         const timeoutId = WindowState.get(window, 'miniatureJustMiniaturizedTimeoutId');
-        if (timeoutId) GLib.source_remove(timeoutId);
+        if (timeoutId) this._timeoutRegistry?.remove(timeoutId);
         WindowState.remove(window, 'miniatureJustMiniaturizedTimeoutId');
         WindowState.remove(window, 'justMiniaturized');
 
@@ -577,25 +594,30 @@ export const MiniatureManager = GObject.registerClass({
     }
 
     destroy() {
-        for (const id of this._miniatureWindows) {
-            const window = global.display.find_window_by_id?.(id);
-            if (window) this.destroyMiniature(window);
+        if (this._miniatureWindows.size > 0) {
+            const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+            for (const window of windows) {
+                if (this._miniatureWindows.has(window.get_id()))
+                    this.destroyMiniature(window);
+            }
         }
         this._miniatureWindows.clear();
+        this._timeoutRegistry = null;
     }
+
     getMiniatureSize(window) {
-        if (!WindowState.get(window, IS_MINIATURE)) return null;
-        const preSize = WindowState.get(window, PRE_MINIATURE_SIZE);
-        const scale = WindowState.get(window, MINIATURE_SCALE);
-        if (!preSize || !scale) return null;
-        return {
-            width: Math.round(preSize.width * scale),
-            height: Math.round(preSize.height * scale),
-        };
+        return getMiniatureSize(window);
     }
 });
 
-// Module-level helper — used by tiling.js without importing the full manager.
+// Module-level helper so tiling.js can read miniature display size without a manager reference.
 export function getMiniatureSize(window) {
-    return global.MosaicExtension?.miniatureManager?.getMiniatureSize(window) ?? null;
+    if (!WindowState.get(window, IS_MINIATURE)) return null;
+    const preSize = WindowState.get(window, PRE_MINIATURE_SIZE);
+    const scale = WindowState.get(window, MINIATURE_SCALE);
+    if (!preSize || !scale) return null;
+    return {
+        width: Math.round(preSize.width * scale),
+        height: Math.round(preSize.height * scale),
+    };
 }

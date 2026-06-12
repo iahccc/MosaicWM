@@ -124,7 +124,7 @@ export const ResizeHandler = GObject.registerClass({
                     afterAnimations(this.animationsManager, () => {
                         const monitor = window.get_monitor();
                         if (monitor !== null) {
-                            this.tilingManager.tileWorkspaceWindows(oldWorkspace, false, monitor, false);
+                            this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, false);
                         }
                     }, this._timeoutRegistry);
                 }
@@ -180,7 +180,7 @@ export const ResizeHandler = GObject.registerClass({
                                 monitor: monitor,
                                 preMaxSize: preMaxSize
                             });
-                            this.tilingManager.tileWorkspaceWindows(workspace, false, monitor, false);
+                            this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
                         }
                     });
                 }
@@ -433,7 +433,7 @@ export const ResizeHandler = GObject.registerClass({
                     return;
                 }
                 
-                if (workspace._smartResizingInProgress || WindowState.get(window, 'isSmartResizing') || this.tilingManager._isSmartResizingBlocked) {
+                if (WindowState.get(window, 'isSmartResizing') || this.tilingManager._isSmartResizingBlocked) {
                     this._sizeChanged = false;
                     return;
                 }
@@ -464,7 +464,7 @@ export const ResizeHandler = GObject.registerClass({
                         const oldWorkspace = workspace;
                         this.windowingManager.moveOversizedWindow(window).then(newWorkspace => {
                             if (newWorkspace) {
-                                this.tilingManager.tileWorkspaceWindows(oldWorkspace, false, monitor, false);
+                                this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, false);
                             }
                         });
                         this._resizeOverflowWindow = null;
@@ -549,13 +549,20 @@ export const ResizeHandler = GObject.registerClass({
         const existingWindows = targetWorkspace.list_windows().filter(w => !this.windowingManager.isExcluded(w));
         let canFit = this.tilingManager.canFitWindow(window, targetWorkspace, monitor, true, preMaxSize);
         let resizeNeeded = false;
-        
+        let pendingMiniatures = [];
+
         if (!canFit) {
             Logger.log(`handleUnmaximizeUndo: Window ${windowId} doesn't fit normally - attempting Smart Resize fit`);
-            // Pass preMaxSize as overrideSize to tryFitWithResize
-            const fitResult = this.tilingManager.tryFitWithResize(window, existingWindows, targetWorkspace.get_work_area_for_monitor(monitor), preMaxSize);
+            // Pass window as focused override: preMaxSize is its ceiling, so it won't be miniaturized.
+            const fitResult = this.tilingManager.tryFitWithResize(window, existingWindows, targetWorkspace.get_work_area_for_monitor(monitor), window);
             canFit = fitResult?.success ?? false;
             resizeNeeded = canFit;
+            // Pending minis MUST reach the tile pass — skipping leaves siblings at miniature size with no real miniature.
+            if (canFit) {
+                pendingMiniatures = fitResult.pendingWindows ?? [];
+                // Set early: intermediate tile calls treat these as pending-mini; afterWorkspaceSwitch re-sets before final pass.
+                this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
+            }
         }
         
         if (!canFit) {
@@ -587,7 +594,13 @@ export const ResizeHandler = GObject.registerClass({
             this.windowingManager.showWorkspaceSwitcher(targetWorkspace, monitor);
             
             afterWorkspaceSwitch(() => {
-                this.tilingManager.tileWorkspaceWindows(targetWorkspace, window, monitor, true);
+                this.tilingManager._isSmartResizingBlocked = true;
+                try {
+                    this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
+                    this.tilingManager.tileWorkspaceWindows(targetWorkspace, window, monitor, true);
+                } finally {
+                    this.tilingManager._isSmartResizingBlocked = false;
+                }
                 if (oldWorkspace.index() >= 0 && oldWorkspace.index() < workspaceManager.get_n_workspaces()) {
                     this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, true);
                 }
