@@ -35,13 +35,6 @@ import * as WindowState from './windowState.js';
 import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
 
-// Module-level accessor for TilingManager (used by overviewLayout.js for on-demand cache)
-let _tilingManagerInstance = null;
-
-export function getTilingManager() {
-    return _tilingManagerInstance;
-}
-
 export default class WindowMosaicExtension extends Extension {
     constructor(metadata) {
         super(metadata);
@@ -146,10 +139,6 @@ export default class WindowMosaicExtension extends Extension {
     // SIGNAL HANDLERS - Workspace Changes
     // =========================================================================
 
-    _switchWorkspaceHandler = (_, win) => {
-        this._tileWindowWorkspace(win.meta_window);
-    };
-
     _workspaceSwitchedHandler = () => {
         const newWorkspace = this._workspaceManager.get_active_workspace();
         const newIndex = newWorkspace.index();
@@ -186,6 +175,12 @@ export default class WindowMosaicExtension extends Extension {
         this._workspaceEventIds.push([workspace, eventIds]);
     };
 
+    // Drop bookkeeping for destroyed workspaces — their signals die with the
+    // object, and disconnecting them on disable() would target a dead GObject.
+    _workspaceRemovedSignal = () => {
+        this._workspaceEventIds = this._workspaceEventIds.filter(([workspace]) => workspace.index() >= 0);
+    };
+
     enable() {
         Logger.info('Starting Mosaic layout manager.');
 
@@ -193,23 +188,16 @@ export default class WindowMosaicExtension extends Extension {
         this._timeoutRegistry = new TimeoutRegistry();
         this._workspaceManager = global.workspace_manager;
 
-        // Initialize mutter settings + failsafe: Ensure attach-modal-dialogs is enabled
-        // (in case extension crashed during Overview with setting disabled)
+        // SettingsOverrider already handles a stale override from a previous
+        // crash (it restores the schema default when the current value equals
+        // the override) — forcing the value here would clobber a user who
+        // legitimately disabled attach-modal-dialogs.
         this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
-        try {
-            if (!this._mutterSettings.get_boolean('attach-modal-dialogs')) {
-                this._mutterSettings.set_boolean('attach-modal-dialogs', true);
-                Logger.log('Failsafe: Restored attach-modal-dialogs setting');
-            }
-        } catch (_e) {
-            // Ignore - setting may not exist
-        }
 
         // Create managers
         this.edgeTilingManager = new EdgeTilingManager();
         this.tilingManager = new TilingManager();
         this.tilingManager.setExtension(this);
-        _tilingManagerInstance = this.tilingManager; // Expose for overviewLayout.js
         this.reorderingManager = new ReorderingManager();
         this.swappingManager = new SwappingManager();
         this.drawingManager = new DrawingManager();
@@ -243,6 +231,8 @@ export default class WindowMosaicExtension extends Extension {
 
         this.edgeTilingManager.setAnimationsManager(this.animationsManager);
         this.edgeTilingManager.setTimeoutRegistry(this._timeoutRegistry);
+        this.edgeTilingManager.setTilingManager(this.tilingManager);
+        this.edgeTilingManager.setWindowingManager(this.windowingManager);
         this.animationsManager.setTimeoutRegistry(this._timeoutRegistry);
 
         // Create handler classes (receive extension reference)
@@ -251,11 +241,9 @@ export default class WindowMosaicExtension extends Extension {
         this.resizeHandler = new ResizeHandler(this);
 
         this.miniatureManager = new MiniatureManager();
+        this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this._miniatureCascadeIds = new Set();
         this._lastFocusedWindowId = null;
-
-        // Expose on global for module-level helpers in tiling.js
-        global.MosaicExtension = this;
 
         this._miniatureRestoredId = this.miniatureManager.connect('miniature-restored',
             (_, window) => this._onMiniatureRestored(window));
@@ -459,6 +447,7 @@ export default class WindowMosaicExtension extends Extension {
         this._workspaceManEventIds.push(global.workspace_manager.connect('active-workspace-changed', this._workspaceSwitchedHandler));
         this._workspaceManEventIds.push(global.workspace_manager.connect('workspaces-reordered', this._workspacesReorderedHandler));
         this._workspaceManEventIds.push(global.workspace_manager.connect('workspace-added', this._workspaceAddSignal));
+        this._workspaceManEventIds.push(global.workspace_manager.connect('workspace-removed', this._workspaceRemovedSignal));
 
         const nWorkspaces = this._workspaceManager.get_n_workspaces();
         for(let i = 0; i < nWorkspaces; i++) {
@@ -638,6 +627,11 @@ export default class WindowMosaicExtension extends Extension {
         }
 
         const workspace = window.get_workspace();
+        if (!this.isMosaicEnabledForWorkspace(workspace)) {
+            Logger.log('Mosaic disabled for workspace - ignoring tile shortcut');
+            return;
+        }
+
         const monitor = window.get_monitor();
         const workArea = workspace.get_work_area_for_monitor(monitor);
 
@@ -741,8 +735,6 @@ export default class WindowMosaicExtension extends Extension {
         this._miniatureCascadeIds = null;
         this._lastFocusedWindowId = null;
 
-        delete global.MosaicExtension;
-
         if (this._tileTimeout && this._timeoutRegistry) {
             this._timeoutRegistry.remove(this._tileTimeout);
             this._tileTimeout = null;
@@ -775,6 +767,15 @@ export default class WindowMosaicExtension extends Extension {
         this._workspaceManEventIds = [];
         this._workspaceEventIds = [];
 
+        // Clean up handler classes BEFORE nulling shared refs — their destroy()
+        // reaches the timeout registry through the extension reference.
+        if (this.resizeHandler) this.resizeHandler.destroy();
+        if (this.dragHandler) this.dragHandler.destroy();
+        if (this.windowHandler?.destroy) this.windowHandler.destroy();
+        this.windowHandler = null;
+        this.dragHandler = null;
+        this.resizeHandler = null;
+
         // Clean up managers (if they had cleanup methods)
         if (this.tilingManager) this.tilingManager.destroy();
         if (this.reorderingManager) this.reorderingManager.destroy();
@@ -793,13 +794,5 @@ export default class WindowMosaicExtension extends Extension {
         this._settingsOverrider = null;
         this._injectionManager = null;
         this._workspaceManager = null;
-
-        // Clean up handler classes
-        if (this.resizeHandler) this.resizeHandler.destroy();
-        if (this.dragHandler) this.dragHandler.destroy();
-        if (this.windowHandler?.destroy) this.windowHandler.destroy();
-        this.windowHandler = null;
-        this.dragHandler = null;
-        this.resizeHandler = null;
     }
 }
