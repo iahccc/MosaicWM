@@ -9,7 +9,7 @@ import * as Logger from './logger.js';
 import { TileZone } from './constants.js';
 import { isResizeGrabOp, isMoveGrabOp } from './grabOps.js';
 import * as constants from './constants.js';
-import { afterAnimations } from './timing.js';
+import { afterAnimations, getSlowDownFactor } from './timing.js';
 import * as WindowState from './windowState.js';
 import { MINIATURE_ANIM_KIND } from './windowState.js';
 
@@ -386,7 +386,7 @@ export const DragHandler = GObject.registerClass({
                             scale_y: scale,
                             translation_x: endTx,
                             translation_y: endTy,
-                            duration: constants.ANIMATION_DURATION_MS,
+                            duration: Math.ceil(constants.ANIMATION_DURATION_MS * getSlowDownFactor()),
                             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                         });
                         this._previewMiniaturizedWindows.push(win);

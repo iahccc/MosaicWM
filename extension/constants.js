@@ -19,7 +19,7 @@ export const TileZone = Object.freeze({
 
 export const STARTUP_TILE_DELAY_MS = 300;
 
-export const ANIMATION_DURATION_MS = 350;
+export const ANIMATION_DURATION_MS = 250;
 
 // Minimum dimensions for tiling
 export const MIN_WINDOW_WIDTH = 400;

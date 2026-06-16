@@ -9,6 +9,7 @@ import Meta from 'gi://Meta';
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
+import { getSlowDownFactor } from './timing.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -307,7 +308,7 @@ export const MiniatureManager = GObject.registerClass({
                 const startTy = visualY - actorBefore_y - extTop * cs;
                 const endTx = targetX - actorBefore_x - extLeft * scale;
                 const endTy = targetY - actorBefore_y - extTop * scale;
-                const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * (cs - scale) / Math.max(0.001, 1.0 - scale)));
+                const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (cs - scale) / Math.max(0.001, 1.0 - scale)));
 
                 // Set kind before remove_all_transitions so that restore's onStopped — which
                 // fires synchronously — sees 'create' and skips its conditional removal.
@@ -364,7 +365,7 @@ export const MiniatureManager = GObject.registerClass({
                     scale_y: scale,
                     translation_x: tx,
                     translation_y: ty,
-                    duration: constants.MINIATURE_ANIM_MS,
+                    duration: Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor()),
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                     onStopped: () => {
                         WindowState.remove(window, ANIMATING_MINIATURE);
@@ -468,7 +469,7 @@ export const MiniatureManager = GObject.registerClass({
                 startScale = cs;
                 startTx = visualX - ax - extL * cs;
                 startTy = visualY - ay - extT * cs;
-                duration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * (1.0 - cs) / Math.max(0.001, 1.0 - sc)));
+                duration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (1.0 - cs) / Math.max(0.001, 1.0 - sc)));
             } else {
                 const miniTgt = tgt ?? { x: frame.x, y: frame.y };
                 const dw = actorW * (1 - sc);
@@ -478,7 +479,7 @@ export const MiniatureManager = GObject.registerClass({
                 startScale = sc;
                 startTx = dw > 0 ? miniTgt.x - ax - startPivotX * dw - extL * sc : 0;
                 startTy = dh > 0 ? miniTgt.y - ay - startPivotY * dh - extT * sc : 0;
-                duration = constants.MINIATURE_ANIM_MS;
+                duration = Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor());
             }
 
             // Set kind after remove_all_transitions: create's onStopped fires synchronously during

@@ -7,6 +7,7 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
+import { getAnimationsEnabled, getSlowDownFactor } from './timing.js';
 
 import GObject from 'gi://GObject';
 
@@ -67,6 +68,7 @@ export const AnimationsManager = GObject.registerClass({
     }
 
     shouldAnimateWindow(window, draggedWindow = null) {
+        if (!getAnimationsEnabled()) return false;
         // During active resize, position all sibling windows instantly (real-time retile)
         if (this._resizingWindowId !== null) {
             return false;
@@ -122,7 +124,8 @@ export const AnimationsManager = GObject.registerClass({
         }
         
         this._animatingWindows.add(window.get_id());
-        
+
+        const effectiveDuration = Math.ceil(duration * getSlowDownFactor());
         const currentRect = startRect || window.get_frame_rect();
         
         // Choose animation mode based on context
@@ -154,7 +157,7 @@ export const AnimationsManager = GObject.registerClass({
             windowActor.ease({
                 translation_x: 0,
                 translation_y: 0,
-                duration: duration,
+                duration: effectiveDuration,
                 mode: animationMode,
                 onComplete: () => {
                     if (windowActor && !windowActor.is_destroyed())
@@ -177,7 +180,7 @@ export const AnimationsManager = GObject.registerClass({
         windowActor.ease({
             translation_x: 0,
             translation_y: 0,
-            duration: duration,
+            duration: effectiveDuration,
             mode: animationMode,
             onStopped: (isFinished) => {
                 if (windowActor && !windowActor.is_destroyed())

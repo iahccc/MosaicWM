@@ -10,11 +10,11 @@ import * as constants from './constants.js';
 
 const FALLBACK_ANIMATION_MS = 250;
 
-function getAnimationsEnabled() {
+export function getAnimationsEnabled() {
     return St.Settings.get().enable_animations;
 }
 
-function getSlowDownFactor() {
+export function getSlowDownFactor() {
     return St.Settings.get().slow_down_factor ?? 1.0;
 }
 

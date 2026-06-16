@@ -21,6 +21,7 @@ import {
 } from './windowState.js';
 import { getMiniatureSize, applyMiniatureActorState, animateMiniatureToTarget } from './miniature.js';
 import { isWindowAlive } from './liveness.js';
+import { getSlowDownFactor } from './timing.js';
 
 const POSITION_STABILITY_WEIGHT = 40;
 
@@ -449,7 +450,7 @@ export const TilingManager = GObject.registerClass({
                             translation_x: 0,
                             translation_y: 0,
                             opacity: 255,
-                            duration: constants.ANIMATION_DURATION_MS,
+                            duration: Math.ceil(constants.ANIMATION_DURATION_MS * getSlowDownFactor()),
                             mode: Clutter.AnimationMode.EASE_OUT_QUAD
                         });
                     }
@@ -2948,7 +2949,7 @@ class WindowDescriptor {
                                 translation_x: 0,
                                 translation_y: 0,
                                 opacity: 255,
-                                duration: constants.ANIMATION_DURATION_MS,
+                                duration: Math.ceil(constants.ANIMATION_DURATION_MS * getSlowDownFactor()),
                                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                             });
                         } else {
@@ -2965,7 +2966,7 @@ class WindowDescriptor {
                                         translation_x: 0,
                                         translation_y: 0,
                                         opacity: 255,
-                                        duration: constants.ANIMATION_DURATION_MS,
+                                        duration: Math.ceil(constants.ANIMATION_DURATION_MS * getSlowDownFactor()),
                                         mode: Clutter.AnimationMode.EASE_OUT_QUAD
                                     });
                                 }
