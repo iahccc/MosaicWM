@@ -493,13 +493,23 @@ export const WindowHandler = GObject.registerClass({
                     .filter(w => w.get_id() !== windowId && !this.windowingManager.isExcluded(w));
 
                 const workArea = this.edgeTilingManager.calculateRemainingSpace(workspace, monitor);
+                let restored = false;
                 if (workArea) {
-                    this.tilingManager.tryRestoreWindowSizes(remainingWindows, workArea, freedWidth, freedHeight, workspace, monitor);
+                    restored = this.tilingManager.tryRestoreWindowSizes(remainingWindows, workArea, freedWidth, freedHeight, workspace, monitor);
                 } else {
                     Logger.log('WindowHandler: Skipped restore - invalid workArea');
                 }
 
                 this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+
+                if (restored) {
+                    this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                        for (const w of remainingWindows) {
+                            WindowState.remove(w, 'isReverseSmartResizing');
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    }, 'windowHandler_excludeRestoreSettle');
+                }
                 return GLib.SOURCE_REMOVE;
             }, 'windowHandler_excludeRetile');
         } else {
@@ -550,6 +560,31 @@ export const WindowHandler = GObject.registerClass({
         }
     }
 
+    // Auto-restore the oldest miniature when a sibling's removal frees up space.
+    // Shared by the close path (onWindowDestroyed) and the cross-workspace-move
+    // path (onWindowRemoved); only restores if the layout still fits naturally.
+    _tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
+        if (!this._ext.miniatureManager) return false;
+
+        const miniatureWindows = remainingWindows
+            .filter(w => WindowState.get(w, IS_MINIATURE))
+            .sort((a, b) => a.get_id() - b.get_id());
+
+        if (miniatureWindows.length === 0) return false;
+
+        const candidate = miniatureWindows[0];
+        const workArea = this._ext.tilingManager.getUsableWorkArea(workspace, monitor);
+        if (!this._ext.tilingManager.canRestoreMiniature(candidate, remainingWindows, workArea)) {
+            Logger.log(`_tryAutoRestoreMiniature: keeping mini ${candidate.get_id()} - would overflow if restored`);
+            return false;
+        }
+
+        this._ext._miniatureCascadeIds?.delete(candidate.get_id());
+        this._ext.miniatureManager.restoreMiniature(candidate, null, { activate: false });
+        this._ext._onMiniatureRestored(candidate);
+        return true;
+    }
+
     // Executes when a window is physically destroyed
     onWindowDestroyed(window) {
         const monitor = window.get_monitor();
@@ -587,10 +622,15 @@ export const WindowHandler = GObject.registerClass({
 
             afterWindowClose(() => {
                 afterAnimations(this._ext.animationsManager, () => {
-                    // Try to restore/reverse smart resize constrained windows with freed space.
-                    // Miniatures are excluded — they keep their fixed slot.
                     const remainingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
                         .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
+
+                    // Auto-restore a miniature first - if it absorbed the freed space,
+                    // skip the size-restore pass below (its own retile will follow).
+                    if (this._tryAutoRestoreMiniature(remainingWindows, workspace, monitor)) return;
+
+                    // Try to restore/reverse smart resize constrained windows with freed space.
+                    // Miniatures are excluded, they keep their fixed slot.
                     const restorableWindows = remainingWindows.filter(w => !WindowState.get(w, IS_MINIATURE));
 
                     // Check if ANY restorable window was smart-resized (constrained)
@@ -600,13 +640,23 @@ export const WindowHandler = GObject.registerClass({
                         return hasTarget || isConstrained;
                     });
 
+                    let restored = false;
                     if (hasConstrainedWindows && (freedWidth > 0 || freedHeight > 0)) {
-                        Logger.log(`[SMART RESIZE] Window closed - attempting reverse smart resize with freed ${freedWidth}x${freedHeight}`);
+                        Logger.log(`[REVERSE-DESTROYED] Window closed - attempting reverse smart resize with freed ${freedWidth}x${freedHeight}`);
                         const workArea = this._ext.tilingManager.getUsableWorkArea(workspace, monitor);
-                        this._ext.tilingManager.tryRestoreWindowSizes(restorableWindows, workArea, freedWidth, freedHeight, workspace, monitor);
+                        restored = this._ext.tilingManager.tryRestoreWindowSizes(restorableWindows, workArea, freedWidth, freedHeight, workspace, monitor);
                     }
 
                     this._ext.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+
+                    if (restored) {
+                        this._ext._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                            for (const w of restorableWindows) {
+                                WindowState.remove(w, 'isReverseSmartResizing');
+                            }
+                            return GLib.SOURCE_REMOVE;
+                        }, 'windowHandler_destroyedRestoreSettle');
+                    }
                 }, this._ext._timeoutRegistry);
             }, this._ext._timeoutRegistry);
 
@@ -822,7 +872,15 @@ export const WindowHandler = GObject.registerClass({
                 const availableExtra = wa.width - usedWidth - (monitorWindows.length + 1) * constants.WINDOW_SPACING;
                 if (availableExtra > constants.ANIMATION_DIFF_THRESHOLD) {
                     Logger.log(`DnD arrival: Extra space ${availableExtra}px - trying expansion`);
-                    this.tilingManager.tryRestoreWindowSizes(monitorWindows, wa, availableExtra, wa.height, workspace, monitor);
+                    const restored = this.tilingManager.tryRestoreWindowSizes(monitorWindows, wa, availableExtra, wa.height, workspace, monitor);
+                    if (restored) {
+                        this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                            for (const w of monitorWindows) {
+                                WindowState.remove(w, 'isReverseSmartResizing');
+                            }
+                            return GLib.SOURCE_REMOVE;
+                        }, 'windowHandler_dndRestoreSettle');
+                    }
                 }
             }
         }
@@ -1209,25 +1267,9 @@ export const WindowHandler = GObject.registerClass({
                 WindowState.set(w, 'isSmartResizing', false);
             }
 
-            // Auto-restore oldest miniature when space is freed (not an overflow move)
-            // Only restore if remaining layout would still fit naturally after restore —
-            // otherwise the miniaturization decided by the open path would be undone wrongly.
-            if (this._ext.miniatureManager) {
-                const miniatureWindows = remainingWindows
-                    .filter(w => WindowState.get(w, IS_MINIATURE))
-                    .sort((a, b) => a.get_id() - b.get_id());
-
-                if (miniatureWindows.length > 0 && !wasMovedByOverflow) {
-                    const candidate = miniatureWindows[0];
-                    const workArea = this._ext.tilingManager.getUsableWorkArea(WORKSPACE, MONITOR);
-                    if (this._ext.tilingManager.canRestoreMiniature(candidate, remainingWindows, workArea)) {
-                        this._ext._miniatureCascadeIds?.delete(candidate.get_id());
-                        this._ext.miniatureManager.restoreMiniature(candidate, null, { activate: false });
-                        this._ext._onMiniatureRestored(candidate);
-                        return GLib.SOURCE_REMOVE;
-                    }
-                    Logger.log(`_windowRemoved: keeping mini ${candidate.get_id()} - would overflow if restored`);
-                }
+            // Auto-restore oldest miniature when space is freed (not an overflow move).
+            if (!wasMovedByOverflow && this._tryAutoRestoreMiniature(remainingWindows, WORKSPACE, MONITOR)) {
+                return GLib.SOURCE_REMOVE;
             }
 
             // Try to restore window sizes with freed space (Reverse Smart Resize)
@@ -1238,6 +1280,7 @@ export const WindowHandler = GObject.registerClass({
                     const workArea = this._ext.tilingManager.getUsableWorkArea(WORKSPACE, MONITOR);
                     // Pass ALL remaining windows (including minis) so the fit simulation in
                     // findBestRestorationGain accounts for the space miniatures occupy.
+                    Logger.log(`[REVERSE-REMOVED] Window removed - attempting reverse smart resize`);
                     const restored = this._ext.tilingManager.tryRestoreWindowSizes(remainingWindows, workArea, null, null, WORKSPACE, MONITOR);
 
                     if (restored) {
