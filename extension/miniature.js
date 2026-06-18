@@ -279,11 +279,15 @@ export const MiniatureManager = GObject.registerClass({
         const targetX = computedSlot.x;
         const targetY = computedSlot.y;
 
-        // Use current frame rect for extLeft/extTop — preSize.x/y is stale if an intermediate tile call moved the window.
         const [actorBefore_x, actorBefore_y] = windowActor.get_position();
         const currentFrame = window.get_frame_rect();
-        const extLeft = currentFrame.x - actorBefore_x;
-        const extTop = currentFrame.y - actorBefore_y;
+
+        // Buffer rect vs frame rect is a stable border offset; the actor's live position
+        // isn't - after back-to-back move_resize_frame calls (e.g. a restore cascade
+        // re-miniaturizing siblings) the compositor lags, baking that stale gap into extLeft/extTop.
+        const bufferRect = window.get_buffer_rect();
+        const extLeft = currentFrame.x - bufferRect.x;
+        const extTop = currentFrame.y - bufferRect.y;
         Logger.log(`[MINIATURE] createMiniature ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): preFrame=(${preSize.x},${preSize.y} ${preSize.width}x${preSize.height}) currentFrame=(${currentFrame.x},${currentFrame.y}) actorBefore=(${actorBefore_x},${actorBefore_y}) target=(${targetX},${targetY}) scale=${scale.toFixed(4)} extLeft=${extLeft} extTop=${extTop}`);
 
         // Store state BEFORE animation - enforce effect and workspace animation
@@ -307,7 +311,7 @@ export const MiniatureManager = GObject.registerClass({
             const [actorW, actorH] = windowActor.get_size();
 
             if (prevKind === 'restore') {
-                // Interrupted restore — read current visual frame origin before canceling
+                // Interrupted restore, read current visual frame origin before canceling
                 const [cpx, cpy] = windowActor.get_pivot_point();
                 const cs = windowActor.scale_x;
                 const curTx = windowActor.translation_x;
@@ -320,8 +324,8 @@ export const MiniatureManager = GObject.registerClass({
                 const endTy = targetY - actorBefore_y - extTop * scale;
                 const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (cs - scale) / Math.max(0.001, 1.0 - scale)));
 
-                // Set kind before remove_all_transitions so that restore's onStopped — which
-                // fires synchronously — sees 'create' and skips its conditional removal.
+                // Set kind before remove_all_transitions, since restore's onStopped fires
+                // synchronously and needs to see 'create' to skip its conditional removal.
                 // IS_MINIATURE is already true (set above), so restore's actor reset is also skipped.
                 WindowState.set(window, MINIATURE_ANIM_KIND, 'create');
                 windowActor.remove_all_transitions();
@@ -406,7 +410,7 @@ export const MiniatureManager = GObject.registerClass({
 
         Logger.log(`[MINIATURE] createMiniature ${window.get_id()}: miniSize=${Math.round(preSize.width * scale)}x${Math.round(preSize.height * scale)}`);
 
-        // Only set the focus-restore guard when a registry can expire it — a stuck flag blocks restore forever.
+        // Only set the focus-restore guard when a registry can expire it, since a stuck flag blocks restore forever.
         if (this._timeoutRegistry) {
             WindowState.set(window, 'justMiniaturized', true);
             const timeoutId = this._timeoutRegistry.add(constants.MINIATURE_FOCUS_GUARD_MS, () => {
