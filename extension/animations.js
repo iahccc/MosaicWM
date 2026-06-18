@@ -24,7 +24,7 @@ export const AnimationsManager = GObject.registerClass({
     _init() {
         super._init();
         this._isDragging = false;
-        this._animatingWindows = new Set(); // Window IDs currently animating (drives animations-completed signal)
+        this._animatingWindows = new Map(); // Window ID -> actor, drives animations-completed signal
         this._animatingTargets = new Map(); // Window ID -> last targetRect, to detect redundant retile calls
         this._justEndedDrag = false;
         this._resizingWindowId = null;
@@ -44,12 +44,29 @@ export const AnimationsManager = GObject.registerClass({
         return this._resizingWindowId;
     }
 
+    // Drops entries whose actor no longer has the translation transition we
+    // started. Something else (a miniature ease, an edge-tile preview) can take
+    // over the actor and call remove_all_transitions() without going through
+    // removeAnimatingWindow, which would otherwise wedge animations-completed
+    // for the rest of the session. Checking the real Clutter state here means
+    // a future leak site like that self-heals instead of needing to be hunted down.
+    _pruneStaleAnimations() {
+        for (const [id, actor] of this._animatingWindows) {
+            if (!actor || actor.is_destroyed() || !actor.get_transition('translation_x')) {
+                this._animatingWindows.delete(id);
+                this._animatingTargets.delete(id);
+            }
+        }
+    }
+
     // Used by async utilities to wait for animations to complete
     hasActiveAnimations() {
+        this._pruneStaleAnimations();
         return this._animatingWindows.size > 0;
     }
 
     _checkAllAnimationsComplete() {
+        this._pruneStaleAnimations();
         if (this._animatingWindows.size === 0) {
             this.emit('animations-completed');
         }
@@ -147,7 +164,7 @@ export const AnimationsManager = GObject.registerClass({
         // the guard at the ease callback returns early without double cleanup.
         windowActor.remove_all_transitions();
 
-        this._animatingWindows.add(window.get_id());
+        this._animatingWindows.set(window.get_id(), windowActor);
         this._animatingTargets.set(window.get_id(), targetRect);
 
         const effectiveDuration = Math.ceil(duration * getSlowDownFactor());
