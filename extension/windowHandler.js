@@ -488,7 +488,7 @@ export const WindowHandler = GObject.registerClass({
     }
 
     // Tries to bring back the oldest miniature when space frees up. Shared by
-    // the close and move paths so they don't duplicate the fit check.
+    // the close, move and live-resize paths so they don't duplicate the fit check.
     _tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
         if (!this._ext.miniatureManager) return false;
 

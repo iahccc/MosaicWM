@@ -459,6 +459,12 @@ export const ResizeHandler = GObject.registerClass({
                         const excludeWindow = this._resizeInOverflow ? window : null;
                         const excludeFromTiling = this._resizeInOverflow;
                         this.tilingManager.tileWorkspaceWindows(workspace, excludeWindow, monitor, true, excludeFromTiling);
+
+                        // Shrinking the dragged window can free up room for a sibling
+                        // miniature mid-drag. The overflow path only checks the inverse.
+                        if (!this._resizeInOverflow && this._ext.windowHandler) {
+                            this._ext.windowHandler._tryAutoRestoreMiniature(mosaicWindows, workspace, monitor);
+                        }
                     }
 
                     this._sizeChanged = false;
@@ -477,7 +483,7 @@ export const ResizeHandler = GObject.registerClass({
                     return;
                 }
 
-                // Skip tiling while the evaluation queue is processing — it handles its own tiling
+                // Skip tiling while the evaluation queue is processing, since it handles its own tiling
                 if (this._ext.windowHandler && this._ext.windowHandler.isEvaluatingQueue) {
                     this._sizeChanged = false;
                     return;
