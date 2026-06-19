@@ -216,23 +216,33 @@ export const WindowHandler = GObject.registerClass({
     }
 
     // Lock a workspace to prevent recursive or conflicting tiling triggers.
+    // Reference-counted: overlapping tileWorkspaceWindows calls (e.g. drag-end
+    // and resize-end firing close together) each hold their own depth, so the
+    // workspace stays locked until every holder has unlocked.
     lockWorkspace(workspace) {
         if (!workspace) return;
-        this._workspaceLocks.set(workspace, true);
-        Logger.log(`Workspace ${workspace.index()} LOCKED for tiling`);
+        const depth = (this._workspaceLocks.get(workspace) ?? 0) + 1;
+        this._workspaceLocks.set(workspace, depth);
+        Logger.log(`Workspace ${workspace.index()} LOCKED for tiling (depth=${depth})`);
     }
 
     // Unlock a workspace after tiling is complete.
     unlockWorkspace(workspace) {
         if (!workspace) return;
-        this._workspaceLocks.delete(workspace);
-        Logger.log(`Workspace ${workspace.index()} UNLOCKED`);
+        const depth = (this._workspaceLocks.get(workspace) ?? 0) - 1;
+        if (depth <= 0) {
+            this._workspaceLocks.delete(workspace);
+            Logger.log(`Workspace ${workspace.index()} UNLOCKED`);
+        } else {
+            this._workspaceLocks.set(workspace, depth);
+            Logger.log(`Workspace ${workspace.index()} unlock (depth=${depth}, still locked)`);
+        }
     }
 
     // Check if a workspace is currently locked for tiling.
     isWorkspaceLocked(workspace) {
         if (!workspace) return false;
-        return this._workspaceLocks.get(workspace) === true;
+        return (this._workspaceLocks.get(workspace) ?? 0) > 0;
     }
 
     // Check if the evaluation queue is currently processing windows.

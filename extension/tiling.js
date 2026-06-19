@@ -1540,6 +1540,14 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
+    // Releases a lock acquired by tileWorkspaceWindows for paths that bail out
+    // before reaching _animateTileLayout (which normally owns the deferred unlock).
+    _unlockWorkspaceEarlyReturn(workspace) {
+        if (this._extension && this._extension.windowHandler) {
+            this._extension.windowHandler.unlockWorkspace(workspace);
+        }
+    }
+
     tileWorkspaceWindows(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling = false, dryRun = false, isRecursive = false) {
         if (!workspace || workspace.index() < 0) {
             Logger.log(`tileWorkspaceWindows: Invalid workspace (index=${workspace?.index?.() ?? 'null'}) - skipping`);
@@ -1600,6 +1608,7 @@ export const TilingManager = GObject.registerClass({
         
         const working_info = this._getWorkingInfo(workspace, reference_meta_window, _monitor, excludeFromTiling);
         if(!working_info) {
+            this._unlockWorkspaceEarlyReturn(workspace);
             return { overflow: false, layout: null };
         }
         let meta_windows = working_info.meta_windows;
@@ -1632,6 +1641,7 @@ export const TilingManager = GObject.registerClass({
                 // Don't move windows during drag - just show preview
                 if (this.isDragging) {
                     Logger.log('Both sides edge-tiled - deferring overflow until drag ends');
+                    this._unlockWorkspaceEarlyReturn(workspace);
                     return { overflow: false, layout: null }; // Let preview show but don't move windows
                 }
                 
@@ -1660,6 +1670,7 @@ export const TilingManager = GObject.registerClass({
                     }
                 }
                 
+                this._unlockWorkspaceEarlyReturn(workspace);
                 return { overflow: false, layout: null }; // Don't tile, edge-tiled windows stay in place
             }
             
@@ -1692,6 +1703,7 @@ export const TilingManager = GObject.registerClass({
                 // If no non-edge-tiled windows, nothing to tile
                 if (meta_windows.length === 0) {
                     Logger.log('No non-edge-tiled windows to tile');
+                    this._unlockWorkspaceEarlyReturn(workspace);
                     return { overflow: false, layout: null };
                 }
             }
@@ -1734,6 +1746,7 @@ export const TilingManager = GObject.registerClass({
         // DRY RUN: If dryRun flag is set, return overflow without moving anything
         if (dryRun) {
             this._positionSnapshot = null;
+            this._unlockWorkspaceEarlyReturn(workspace);
             return { overflow, layout: this._cachedTileResult?.windows || null };
         }
 
@@ -1769,6 +1782,7 @@ export const TilingManager = GObject.registerClass({
                         if (!resizeResult?.success) {
                             Logger.log('Smart resize could not fit sacred window');
                             this._positionSnapshot = null;
+                            this._unlockWorkspaceEarlyReturn(workspace);
                             return { overflow: true, layout: null };
                         }
                         // Use the tile_info from tryFitWithResize (computed with miniature sizes)
@@ -1878,6 +1892,9 @@ export const TilingManager = GObject.registerClass({
             // Only call drawTile if animations didn't handle positioning
             Logger.log('Animations did not handle positioning, calling drawTile');
             this._drawTile(tile_info, tileArea, meta_windows, false, computedSlots);
+            // _animateTileLayout owns the deferred unlock; since it didn't run,
+            // release the lock now that positioning is done synchronously.
+            this._unlockWorkspaceEarlyReturn(workspace);
         } else {
             Logger.log('Animations handled positioning, skipping drawTile');
         }
