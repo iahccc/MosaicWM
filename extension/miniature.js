@@ -17,6 +17,7 @@ import {
     MINIATURE_TARGET_POS,
     MINIATURE_EXT_LEFT,
     MINIATURE_EXT_TOP,
+    MINIATURE_SCREENSHOT_PAUSE,
     ANIMATING_MINIATURE,
     MINIATURE_OVERLAY,
     MINIATURE_ANIM_KIND,
@@ -124,6 +125,12 @@ const MiniatureEnforceEffect = GObject.registerClass({
 
         if (WindowState.get(this._window, ANIMATING_MINIATURE)) {
             // Animation controls transforms - don't interfere
+            super.vfunc_paint(...args);
+            return;
+        }
+
+        if (WindowState.get(this._window, MINIATURE_SCREENSHOT_PAUSE)) {
+            // Screenshot UI captures the actor directly - paint it at full size
             super.vfunc_paint(...args);
             return;
         }
@@ -630,6 +637,39 @@ export const MiniatureManager = GObject.registerClass({
             .filter(w => WindowState.get(w, IS_MINIATURE));
         for (const window of windows) {
             this.restoreMiniature(window, null, { activate: false });
+        }
+    }
+
+    // The screenshot UI captures window content straight from the actor, so a
+    // miniature's scale/translation would shrink and misplace that capture.
+    // Reset to full size for the capture and let resumeFromScreenshot() put it back.
+    pauseForScreenshot() {
+        const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null)
+            .filter(w => WindowState.get(w, IS_MINIATURE));
+        for (const window of windows) {
+            const actor = window.get_compositor_private();
+            if (!actor) continue;
+            WindowState.set(window, MINIATURE_SCREENSHOT_PAUSE, true);
+            actor.set_pivot_point(0, 0);
+            actor.set_scale(1, 1);
+            actor.set_translation(0, 0, 0);
+        }
+    }
+
+    resumeFromScreenshot() {
+        const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null)
+            .filter(w => WindowState.get(w, MINIATURE_SCREENSHOT_PAUSE));
+        for (const window of windows) {
+            WindowState.remove(window, MINIATURE_SCREENSHOT_PAUSE);
+            if (!WindowState.get(window, IS_MINIATURE)) continue;
+
+            const actor = window.get_compositor_private();
+            const scale = WindowState.get(window, MINIATURE_SCALE);
+            const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
+            const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+            const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+            if (actor && scale && tgt)
+                applyMiniatureActorState(actor, scale, extL, extT, tgt.x, tgt.y);
         }
     }
 

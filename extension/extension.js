@@ -10,6 +10,7 @@ import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
+import * as Screenshot from 'resource:///org/gnome/shell/ui/screenshot.js';
 import * as WindowPreviewModule from 'resource:///org/gnome/shell/ui/windowPreview.js';
 
 import { WindowingManager } from './windowing.js';
@@ -387,6 +388,12 @@ export default class WindowMosaicExtension extends Extension {
         this._injectionManager.overrideMethod(layoutProto, '_createBestLayout', originalMethod => {
             const extension = this;
             return function (...args) {
+                // Screenshot UI's window picker reuses WorkspaceLayout with its own
+                // window-wrapper shape (no metaWindow/source.metaWindow), which would
+                // make workspace resolution below fail and return an empty layout.
+                if (!Main.overview.visible)
+                    return originalMethod.apply(this, args);
+
                 // Determine workspace from the windows in this layout
                 let workspace = null;
                 for (const win of this._sortedWindows) {
@@ -434,6 +441,26 @@ export default class WindowMosaicExtension extends Extension {
                     monitor: Main.layoutManager.monitors[this._monitorIndex],
                 });
                 return this._layoutStrategy.computeLayout(this._sortedWindows, ...args);
+            };
+        });
+
+        // Screenshot UI's window picker captures actors directly - a miniature's
+        // scale/translation would shrink and misplace that capture, so suspend it
+        // for the capture window and restore it once the picker closes.
+        const screenshotProto = Screenshot.ScreenshotUI.prototype;
+        this._injectionManager.overrideMethod(screenshotProto, 'open', originalMethod => {
+            const extension = this;
+            return function (...args) {
+                extension.miniatureManager?.pauseForScreenshot();
+                return originalMethod.apply(this, args);
+            };
+        });
+        this._injectionManager.overrideMethod(screenshotProto, 'close', originalMethod => {
+            const extension = this;
+            return function (...args) {
+                const result = originalMethod.apply(this, args);
+                extension.miniatureManager?.resumeFromScreenshot();
+                return result;
             };
         });
 
