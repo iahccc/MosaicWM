@@ -2,6 +2,8 @@
 
 > 📣 **Follow the development journey on Mastodon!** Progress updates, design decisions, and behind-the-scenes posts:
 > [floss.social/@CleoMenezesJr](https://floss.social/@CleoMenezesJr/115606214788777474)
+>
+> 📣 **Join the testers room on Matrix!** [#mosaicwm:matrix.org](https://matrix.to/#/%23mosaicwm:matrix.org)
 
 **Rethinking window management for GNOME Shell**
 
@@ -161,7 +163,7 @@ If Mosaic WM has been useful to you, consider supporting its development. :)
 
 **Best ways to contribute right now:**
 
-- **Testing**: Try the extension and explore edge cases. Join the testers room on Matrix: [#mosaicwm:matrix.org](https://matrix.to/#/%23mosaicwm:matrix.org)
+- **Testing**: Try the extension and explore edge cases.
 - **Bug Reports**: Open issues with detailed reproduction steps
 - **Feature Ideas**: Share suggestions in GitHub Issues
 - **Documentation**: Add comments explaining the **WHY**: constraints, invariants, and non-obvious behavior. Well-named code already explains the what.
