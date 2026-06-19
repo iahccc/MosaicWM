@@ -1,4 +1,4 @@
-// Copyright 2025 Cleo Menezes Jr.
+// Copyright 2025-2026 Cleo Menezes Jr.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // get_compositor_private() can return a non-null actor that is already destroyed during

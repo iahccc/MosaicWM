@@ -1,4 +1,4 @@
-// Copyright 2025 Cleo Menezes Jr.
+// Copyright 2025-2026 Cleo Menezes Jr.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import GObject from 'gi://GObject';
@@ -130,7 +130,7 @@ const MiniatureEnforceEffect = GObject.registerClass({
         }
 
         if (WindowState.get(this._window, MINIATURE_SCREENSHOT_PAUSE)) {
-            // Screenshot UI captures the actor directly - paint it at full size
+            // paused for a screenshot capture, paint at full size
             super.vfunc_paint(...args);
             return;
         }
@@ -640,9 +640,9 @@ export const MiniatureManager = GObject.registerClass({
         }
     }
 
-    // The screenshot UI captures window content straight from the actor, so a
-    // miniature's scale/translation would shrink and misplace that capture.
-    // Reset to full size for the capture and let resumeFromScreenshot() put it back.
+    // Screenshot UI grabs the actor straight off the stage, so a miniature would
+    // get captured shrunk and in the wrong spot. Snap it back to full size here,
+    // resumeFromScreenshot() puts it back once the capture is done.
     pauseForScreenshot() {
         const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null)
             .filter(w => WindowState.get(w, IS_MINIATURE));

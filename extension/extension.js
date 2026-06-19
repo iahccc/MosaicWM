@@ -1,4 +1,4 @@
-// Copyright 2025 Cleo Menezes Jr.
+// Copyright 2025-2026 Cleo Menezes Jr.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import * as Logger from './logger.js';
@@ -388,9 +388,9 @@ export default class WindowMosaicExtension extends Extension {
         this._injectionManager.overrideMethod(layoutProto, '_createBestLayout', originalMethod => {
             const extension = this;
             return function (...args) {
-                // Screenshot UI's window picker reuses WorkspaceLayout with its own
-                // window-wrapper shape (no metaWindow/source.metaWindow), which would
-                // make workspace resolution below fail and return an empty layout.
+                // Screenshot UI's window picker reuses WorkspaceLayout too, but its
+                // window objects don't have metaWindow/source.metaWindow, so the
+                // workspace lookup below would just fail and we'd hand back nothing.
                 if (!Main.overview.visible)
                     return originalMethod.apply(this, args);
 
@@ -444,9 +444,8 @@ export default class WindowMosaicExtension extends Extension {
             };
         });
 
-        // Screenshot UI's window picker captures actors directly - a miniature's
-        // scale/translation would shrink and misplace that capture, so suspend it
-        // for the capture window and restore it once the picker closes.
+        // Miniatures get snapped back to full size while the picker grabs window
+        // content, see pauseForScreenshot/resumeFromScreenshot in miniature.js.
         const screenshotProto = Screenshot.ScreenshotUI.prototype;
         this._injectionManager.overrideMethod(screenshotProto, 'open', originalMethod => {
             const extension = this;
