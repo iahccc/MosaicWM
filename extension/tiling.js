@@ -98,6 +98,15 @@ export const TilingManager = GObject.registerClass({
         this._animationsManager?.animateWindow(window, { x: frame.x, y: frame.y, width, height });
     }
 
+    // Whichever window happens to be "newWindow" for a given tryFitWithResize call
+    // isn't necessarily the most recently opened one - a sibling's miniature-restore
+    // runs its own pass with itself as newWindow. addedTime is the one signal that
+    // survives regardless of who's driving the current call.
+    _isRecentlyAdded(window) {
+        const addedTime = WindowState.get(window, 'addedTime');
+        return !!addedTime && (Date.now() - addedTime) < constants.NEW_WINDOW_MINIATURIZE_PROTECTION_MS;
+    }
+
     setWindowingManager(manager) {
         this._windowingManager = manager;
     }
@@ -1766,7 +1775,7 @@ export const TilingManager = GObject.registerClass({
             // SAFETY: Only overflow windows that are genuinely new (added within last 2 seconds)
             // This prevents incorrectly expelling existing windows during resize retiling
             const addedTime = WindowState.get(reference_meta_window, 'addedTime');
-            const isNewlyAdded = addedTime && (Date.now() - addedTime) < 2000;
+            const isNewlyAdded = addedTime && (Date.now() - addedTime) < constants.NEW_WINDOW_MINIATURIZE_PROTECTION_MS;
             
             if (!isNewlyAdded && !WindowState.get(reference_meta_window, 'forceOverflow') && !WindowState.get(reference_meta_window, 'isRestoringSacred')) {
                 Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - not a new window`);
@@ -2561,13 +2570,18 @@ export const TilingManager = GObject.registerClass({
 
                 const ext0 = this._extension;
                 if (ext0?.miniatureManager) {
-                    const focusedId0   = (focusedWindowOverride ?? global.display.focus_window)?.get_id();
-                    const newWindowId0 = newWindow.get_id();
+                    const focusedId0 = (focusedWindowOverride ?? global.display.focus_window)?.get_id();
 
-                    for (const w of allWindows) {
+                    // Oldest first: whichever window has been open longest is the
+                    // best candidate to sacrifice, regardless of which window's
+                    // pass happens to be running right now.
+                    const orderedWindows0 = [...allWindows].sort((a, b) =>
+                        (WindowState.get(a, 'addedTime') ?? 0) - (WindowState.get(b, 'addedTime') ?? 0));
+
+                    for (const w of orderedWindows0) {
                         const d = windowData.get(w.get_id());
                         if (!d || d.pendingMiniature) continue;
-                        if (w.get_id() === focusedId0 || w.get_id() === newWindowId0) continue;
+                        if (w.get_id() === focusedId0 || this._isRecentlyAdded(w)) continue;
                         if (WindowState.get(w, IS_MINIATURE)) continue;
                         if (this._windowingManager.isMaximizedOrFullscreen(w)) continue;
 
@@ -2616,8 +2630,7 @@ export const TilingManager = GObject.registerClass({
                 // specific window as the user-active one when Mutter's focus hasn't
                 // shifted yet. Without it, restoring a miniature while focus sits on
                 // the other window would exclude both, leaving no miniaturization candidate.
-                const focusedId   = (focusedWindowOverride ?? global.display.focus_window)?.get_id();
-                const newWindowId = newWindow.get_id();
+                const focusedId = (focusedWindowOverride ?? global.display.focus_window)?.get_id();
 
                 const getMiniatureThreshold = (w) => {
                     const min        = this.getWindowMinimumSize(w);
@@ -2635,7 +2648,7 @@ export const TilingManager = GObject.registerClass({
                         const d = windowData.get(sim.id);
                         if (!d) return false;
                         if (d.pendingMiniature) return false;
-                        if (sim.id === focusedId || sim.id === newWindowId) return false;
+                        if (sim.id === focusedId || this._isRecentlyAdded(d.window)) return false;
                         if (WindowState.get(d.window, IS_MINIATURE)) return false;
                         if (this._windowingManager.isMaximizedOrFullscreen(d.window)) return false;
                         const { thresholdW, thresholdH } = getMiniatureThreshold(d.window);
@@ -2644,7 +2657,11 @@ export const TilingManager = GObject.registerClass({
 
                     if (candidates.length === 0) break;
 
-                    candidates.sort((a, b) => a.id - b.id);
+                    // Oldest first: the longest-open window is the best one to sacrifice,
+                    // regardless of which window's pass happens to be running right now.
+                    candidates.sort((a, b) =>
+                        (WindowState.get(windowData.get(a.id).window, 'addedTime') ?? 0) -
+                        (WindowState.get(windowData.get(b.id).window, 'addedTime') ?? 0));
                     const candidateSim  = candidates[0];
                     const candidateData = windowData.get(candidateSim.id);
 
