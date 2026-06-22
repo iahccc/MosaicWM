@@ -354,6 +354,12 @@ export const AnimationsManager = GObject.registerClass({
     // guessing from wherever Mutter happened to drop the window before tiling.
     // That raw position is arbitrary and can coincidentally land dead-center on
     // the existing window(s), silently producing a zero offset (no animation at all).
+    //
+    // TODO: always picks some direction once there's at least one sibling, even
+    // when the window ends up boxed in by neighbors on every side with no clear
+    // side to slide from. By the time this runs, windowHandler.js's _hasSiblings
+    // has already decided to suppress Mutter's native animation (skipNextEffect),
+    // so there's no going back to it here even if we detected the enclosure.
     _computeSlideInOffset(window, targetRect, windowLayouts) {
         const OFFSET = constants.SLIDE_IN_OFFSET_PX;
         const siblings = windowLayouts.filter(l => l.window.get_id() !== window.get_id());

@@ -801,6 +801,16 @@ export const WindowHandler = GObject.registerClass({
     // and disagreeing would leave the actor hidden with no entrance ever claimed).
     // Defaults to true when workspace/monitor aren't ready yet, since losing a real
     // slide-in is more noticeable than an unnecessary one.
+    //
+    // TODO: only checks whether any sibling exists, not whether the window ends up
+    // boxed in by siblings on every side, which also has no real direction to slide
+    // from and should get the native animation too. Telling that apart needs the
+    // final tiled layout, which isn't computed yet at this point (skipNextEffect
+    // has to be called here, before the layout exists). Options: run an early
+    // dry-run tiling pass with the new window included (geometry isn't always
+    // settled yet here, so the prediction could be wrong), or a cheaper heuristic
+    // from the current siblings alone (e.g. a fully packed grid with no free edge),
+    // which would only catch that one shape of enclosure, not every possible one.
     _hasSiblings(window) {
         const cached = WindowState.get(window, 'hasEntranceSiblings');
         if (cached !== undefined) return cached;
