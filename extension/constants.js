@@ -58,7 +58,7 @@ export const SMART_RESIZE_MIN_WINDOW_HEIGHT = 100;
 // Slide-in animation for new windows
 export const SLIDE_IN_OFFSET_PX = 100;
 export const SLIDE_IN_DURATION_MS = 300;
-export const SLIDE_IN_FAILSAFE_MS = 1000;     // Restore patched actor.ease if _mapWindow never animates
+export const SLIDE_IN_FAILSAFE_MS = 1000;     // Re-check interval if a window's entrance never gets claimed
 export const QUEUE_PROCESS_DELAY_MS = 100;   // Delay between processing window opening queue items (Mutter settling)
 
 // Miniature windows

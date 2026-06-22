@@ -3,7 +3,6 @@
 // WindowHandler - Manages window lifecycle signals and state transitions.
 
 import GLib from 'gi://GLib';
-import Meta from 'gi://Meta';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
 
@@ -31,188 +30,13 @@ export const WindowHandler = GObject.registerClass({
 
         this._overflowInProgress = false;
         this._windowSignals = new WeakMap(); // WeakMap so signal IDs are released when the window is GC'd
-        this._origShouldAnimateActor = null; 
-    }
-
-    patchMapWindow() {
-        if (this._origShouldAnimateActor) return; // Already patched
-
-        Logger.log('Patching Main.wm._shouldAnimateActor for slide-in animations');
-        this._origShouldAnimateActor = Main.wm._shouldAnimateActor;
-        
-        const self = this;
-        Main.wm._shouldAnimateActor = function(actor, types) {
-            const win = actor.meta_window;
-            const stack = (new Error()).stack;
-            const isMapCall = win && stack.includes('_mapWindow@');
-
-            if (isMapCall) {
-                const isRelated = self._ext && self._ext.windowingManager.isRelated(win);
-                const skipSlideIn = WindowState.get(win, 'movedByOverflow') || (self._ext && self._ext._overflowInProgress);
-
-                if (isRelated && !skipSlideIn) {
-                    // Reimplements the original's gates minus actor.get_texture(): Mutter
-                    // can emit 'map' before the window's first frame is committed to the
-                    // compositor, which fails that check and silently skips the open
-                    // animation - natively-installed apps race this far more often than
-                    // Flatpak ones, whose sandbox/portal startup latency gives the
-                    // compositor time to receive the first frame first. Skipping the check
-                    // is safe: Clutter can ease opacity/scale/translation before a texture
-                    // exists, it simply appears mid-transition once ready.
-                    if (this._skippedActors.delete(actor)) return false;
-                    if (!this._shouldAnimate()) return false;
-                    if (!types.includes(this._getAnimationWindowType(actor))) return false;
-
-                    const { offsetX, offsetY, animationMode } = self._evaluateSlideIn(win);
-
-                    if (offsetX !== 0 || offsetY !== 0) {
-                        Logger.log(`MAPPED SLIDE-IN (ease intercepted): Applying offset (${offsetX}, ${offsetY}) to window ${win.get_id()} Mode: ${animationMode}`);
-                        self._applySlideInAnimation(actor, offsetX, offsetY, animationMode);
-                    }
-
-                    return true;
-                }
-            }
-
-            return self._origShouldAnimateActor.call(this, actor, types);
-        };
-    }
-
-    unpatchMapWindow() {
-        if (this._origShouldAnimateActor) {
-            Logger.log('Unpatching Main.wm._shouldAnimateActor');
-            Main.wm._shouldAnimateActor = this._origShouldAnimateActor;
-            this._origShouldAnimateActor = null;
-        }
     }
 
     destroy() {
-        this.unpatchMapWindow();
         for (const entry of this._evaluationQueue)
             WindowState.remove(entry.window, 'pendingInQueue');
         this._evaluationQueue = [];
         this._isEvaluatingQueue = false;
-    }
-
-    _evaluateSlideIn(window) {
-        let offsetX = 0, offsetY = 0;
-        let animationMode = Clutter.AnimationMode.EASE_OUT_QUART;
-
-        const ws = window.get_workspace();
-        const mon = window.get_monitor();
-        const frame = window.get_frame_rect();
-
-        if (!ws || mon < 0 || frame.width <= 0) {
-            return { offsetX, offsetY, animationMode };
-        }
-
-        const existingWindows = ws.list_windows().filter(w =>
-            w.get_monitor() === mon &&
-            w.get_id() !== window.get_id() &&
-            !w.minimized &&
-            w.get_window_type() === Meta.WindowType.NORMAL &&
-            !this.windowingManager.isExcluded(w) &&
-            w.showing_on_its_workspace()
-        );
-
-        let offsetDirection = 0;
-        const currentWSIndex = ws.index();
-        const prevWSIndex = WindowState.get(window, 'previousWorkspace');
-
-        if (prevWSIndex !== undefined && prevWSIndex !== currentWSIndex) {
-            offsetDirection = prevWSIndex < currentWSIndex ? -1 : 1;
-        }
-
-        const OFFSET = constants.SLIDE_IN_OFFSET_PX;
-
-        if (existingWindows.length > 0) {
-            let centerX = 0, centerY = 0, count = 0;
-            for (const n of existingWindows) {
-                try {
-                    const r = n.get_frame_rect();
-                    if (r && r.width > 0) {
-                        centerX += r.x + r.width / 2;
-                        centerY += r.y + r.height / 2;
-                        count++;
-                    }
-                } catch (_e) {}
-            }
-            if (count > 0) {
-                centerX /= count;
-                centerY /= count;
-                const winCenterX = frame.x + frame.width / 2;
-                const winCenterY = frame.y + frame.height / 2;
-                const deltaX = winCenterX - centerX;
-                const deltaY = winCenterY - centerY;
-                
-                if (Math.abs(deltaX) >= Math.abs(deltaY)) {
-                    offsetX = deltaX > constants.ANIMATION_DIFF_THRESHOLD ? OFFSET : (deltaX < -constants.ANIMATION_DIFF_THRESHOLD ? -OFFSET : 0);
-                } else {
-                    offsetY = deltaY > constants.ANIMATION_DIFF_THRESHOLD ? OFFSET : (deltaY < -constants.ANIMATION_DIFF_THRESHOLD ? -OFFSET : 0);
-                }
-            }
-        } else if (offsetDirection !== 0) {
-            offsetX = offsetDirection * OFFSET * 3;
-            animationMode = Clutter.AnimationMode.EASE_OUT_BACK;
-        }
-
-        return { offsetX, offsetY, animationMode };
-    }
-
-    _applySlideInAnimation(actor, offsetX, offsetY, animationMode) {
-        const win = actor.meta_window;
-        const origEase = actor.ease;
-        let restored = false;
-
-        const restoreEase = () => {
-            if (restored) return;
-            restored = true;
-            actor.ease = origEase;
-        };
-
-        actor.ease = function(props) {
-            const callStack = (new Error()).stack;
-            if (callStack.includes('_mapWindow@')) {
-                // Restore ease immediately
-                restoreEase();
-
-                // Revert GNOME's initial scaling setup (from _mapWindow)
-                actor.set_scale(1.0, 1.0);
-                actor.set_pivot_point(0.5, 0.5);
-
-                // Apply our slide offset
-                actor.set_translation(offsetX, offsetY, 0);
-
-                // Force opacity to 0
-                actor.opacity = 0;
-
-                // Let GNOME handle the wait
-                WindowState.set(win, 'slideInAnimating', true);
-
-                origEase.call(this, {
-                    translation_x: 0,
-                    translation_y: 0,
-                    opacity: 255,
-                    duration: constants.SLIDE_IN_DURATION_MS,
-                    mode: animationMode,
-                    onStopped: () => {
-                        actor.opacity = 255;
-                        WindowState.remove(win, 'slideInAnimating');
-                        if (props.onStopped) props.onStopped();
-                    }
-                });
-            } else {
-                origEase.apply(this, arguments);
-            }
-        };
-
-        // Failsafe: if _mapWindow never animates this actor (animation cancelled,
-        // different code path), don't leave actor.ease patched forever.
-        this._timeoutRegistry.add(constants.SLIDE_IN_FAILSAFE_MS, () => {
-            restoreEase();
-            WindowState.remove(win, 'slideInAnimating');
-            return GLib.SOURCE_REMOVE;
-        }, 'windowHandler_easeRestoreFailsafe');
     }
 
     // Lock a workspace to prevent recursive or conflicting tiling triggers.
@@ -1085,6 +909,40 @@ export const WindowHandler = GObject.registerClass({
 
         const actor = window.get_compositor_private();
         if (actor) {
+            const isRelated = this.windowingManager.isRelated(window);
+            const skipSlideIn = WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
+                || this.windowingManager.isMaximizedOrFullscreen(window);
+            if (isRelated && !skipSlideIn) {
+                // Ask Mutter to skip its own open animation outright (the same public
+                // API altTab.js uses to skip the unminimize effect) instead of fighting
+                // it after the fact - our own pipeline drives the entrance once it knows
+                // the real tiled target and siblings, on its own timeline.
+                Main.wm.skipNextEffect(actor);
+
+                // onWindowAdded tries to hide the actor too, but it usually runs before
+                // the actor even exists yet (get_compositor_private() is still null there
+                // most of the time) - this is the first point we're guaranteed to have it,
+                // so the fade-in actually has something to fade from instead of starting
+                // (and silently staying) at the default opacity of 255.
+                actor.opacity = 0;
+
+                // animateWindow may run (and defer, per Clutter skipping transitions on
+                // unmapped actors) before the actor is actually mapped. Once it is, give
+                // it the one nudge it needs to actually ease instead of sitting hidden.
+                // One-shot: mapped flips on and off repeatedly later on (e.g. every time
+                // the Overview opens/closes), and runDeferredEntrance only has anything
+                // to do the first time anyway.
+                if (actor.mapped) {
+                    this._ext.animationsManager.runDeferredEntrance(window);
+                } else {
+                    const mappedSignalId = actor.connect('notify::mapped', () => {
+                        if (!actor.mapped) return;
+                        actor.disconnect(mappedSignalId);
+                        this._ext.animationsManager.runDeferredEntrance(window);
+                    });
+                }
+            }
+
             let signalId = null;
             let timeoutId = null;
             let processed = false;
@@ -1162,6 +1020,50 @@ export const WindowHandler = GObject.registerClass({
 
         // Mark window as newly added for overflow protection logic
         WindowState.set(window, 'addedTime', Date.now());
+
+        // Flag the first-ever tiling pass for this window so it slides in instead
+        // of using the "no jump" continuity math meant for windows that already
+        // have a real visual position. onWindowCreated separately asks Mutter to
+        // skip its own open animation (skipNextEffect) and nudges animateWindow's
+        // deferred entrance once the actor is actually mapped.
+        // Sacred (maximized/fullscreen) windows never reach animateReTiling at all -
+        // _getWorkingInfo short-circuits tileWorkspaceWindows for them entirely - so
+        // claiming their entrance here would only suppress Mutter's own working
+        // native maximize animation without ever supplying a replacement.
+        const skipSlideIn = WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
+            || this.windowingManager.isMaximizedOrFullscreen(window);
+        if (!skipSlideIn) {
+            WindowState.set(window, 'pendingFirstPlacement', true);
+            const actor = window.get_compositor_private();
+            // onWindowCreated races independently and may have already started (or
+            // queued) the real entrance ease by the time this runs - resetting opacity
+            // here would stomp that mid-flight (a direct property write the ease's own
+            // next frame then overwrites again), which is exactly what shows up as a blink.
+            if (actor && !this._ext.animationsManager.hasActiveOrPendingEntrance(window))
+                actor.opacity = 0;
+
+            // Failsafe: if animateWindow never claims this window (e.g. excluded
+            // right after creation), don't leave it invisible or the flag stuck.
+            // pendingFirstPlacement stays true for the entire span of a genuinely
+            // running ease (cleared only by its own onStopped) - a slowed-down
+            // slow_down_factor easily outlasts this fixed timeout, so re-arm instead
+            // of yanking opacity to its final value out from under an ease that's
+            // still legitimately mid-flight.
+            const scheduleFirstPlacementFailsafe = () => {
+                this._timeoutRegistry.add(constants.SLIDE_IN_FAILSAFE_MS, () => {
+                    if (!WindowState.get(window, 'pendingFirstPlacement')) return GLib.SOURCE_REMOVE;
+                    if (this._ext.animationsManager.hasActiveOrPendingEntrance(window)) {
+                        scheduleFirstPlacementFailsafe();
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    WindowState.remove(window, 'pendingFirstPlacement');
+                    const a = isWindowAlive(window) ? window.get_compositor_private() : null;
+                    if (a && !a.is_destroyed()) a.opacity = 255;
+                    return GLib.SOURCE_REMOVE;
+                }, 'windowHandler_firstPlacementFailsafe');
+            };
+            scheduleFirstPlacementFailsafe();
+        }
 
         let validityAttempts = 0;
         this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
@@ -1349,7 +1251,6 @@ export const WindowHandler = GObject.registerClass({
 
             if (Main.overview.visible) {
                 Logger.log('Window created while overview visible - deferring evaluation until overview hidden');
-                WindowState.set(WINDOW, 'createdDuringOverview', true);
                 WindowState.set(WINDOW, 'deferTilingUntilOverviewHidden', true);
                 this._ext.tilingManager.savePreferredSize(WINDOW);
                 this.connectWindowSignals(WINDOW);

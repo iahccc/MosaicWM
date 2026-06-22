@@ -5,6 +5,7 @@
 import * as Logger from './logger.js';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
 import { MINIATURE_ANIM_KIND } from './windowState.js';
@@ -27,6 +28,7 @@ export const AnimationsManager = GObject.registerClass({
         this._isDragging = false;
         this._animatingWindows = new Map(); // Window ID -> actor, drives animations-completed signal
         this._animatingTargets = new Map(); // Window ID -> last targetRect, to detect redundant retile calls
+        this._pendingEntranceEases = new Map(); // Window ID -> ease params, for entrances deferred until the actor is mapped
         this._justEndedDrag = false;
         this._resizingWindowId = null;
         this._timeoutRegistry = null;
@@ -100,20 +102,9 @@ export const AnimationsManager = GObject.registerClass({
 
     shouldAnimateWindow(window, draggedWindow = null) {
         if (!getAnimationsEnabled()) return false;
-        if (this._isOverviewActive) return false;
+        if (Main.overview.visible) return false;
         // During active resize, position all sibling windows instantly (real-time retile)
         if (this._resizingWindowId !== null) {
-            return false;
-        }
-
-        // Skip if slide-in animation is in progress (handled by first-frame)
-        if (WindowState.get(window, 'slideInAnimating')) {
-            return false;
-        }
-
-        // Skip for windows created during overview - already positioned correctly
-        if (WindowState.get(window, 'createdDuringOverview')) {
-            WindowState.remove(window, 'createdDuringOverview');
             return false;
         }
 
@@ -132,12 +123,31 @@ export const AnimationsManager = GObject.registerClass({
             draggedWindow = null,
             subtle = false,
             userOp = false,
+            firstPlacement = false,
+            slideInOffset = null,
         } = options;
 
         if (!this.shouldAnimateWindow(window, draggedWindow)) {
+            // The overview being visible is a "not yet", not a "never" - this window
+            // gets retiled again once it hides (onOverviewHidden's re-enqueue), and that
+            // pass deserves a real shot at animating (bounce for a sibling push, slide-in
+            // for an entrance). move_resize_frame is a no-op while the overview is still
+            // genuinely open anyway (Mutter discards it), so skip it entirely instead of
+            // "snapping" to a position that never actually took effect while permanently
+            // losing the chance to animate once the next pass sees needsMove as already false.
+            if (Main.overview.visible) {
+                if (onComplete) onComplete();
+                return;
+            }
+
             WindowState.set(window, 'isMosaicResizing', true);
             window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
             this._clearMosaicResizingSoon(window);
+            if (firstPlacement) {
+                WindowState.remove(window, 'pendingFirstPlacement');
+                const actor = window.get_compositor_private();
+                if (actor) actor.opacity = 255;
+            }
             if (onComplete) onComplete();
             return;
         }
@@ -148,6 +158,7 @@ export const AnimationsManager = GObject.registerClass({
             WindowState.set(window, 'isMosaicResizing', true);
             window.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
             this._clearMosaicResizingSoon(window);
+            if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
             if (onComplete) onComplete();
             return;
         }
@@ -197,8 +208,10 @@ export const AnimationsManager = GObject.registerClass({
 
         // idle  (currentTx=0): initialTx = frameX - targetX
         // moving (currentTx!=0): initialTx = (frameX + currentTx) - targetX  (no jump)
-        const initialTx = currentFrame.x + currentTx - targetRect.x;
-        const initialTy = currentFrame.y + currentTy - targetRect.y;
+        // First placement has no prior visual position worth preserving - start
+        // from the slide-in offset instead of the "no jump" continuity math.
+        const initialTx = slideInOffset ? slideInOffset.x : currentFrame.x + currentTx - targetRect.x;
+        const initialTy = slideInOffset ? slideInOffset.y : currentFrame.y + currentTy - targetRect.y;
 
         // Same "no jump" logic, applied to visual size: preserves the actor's
         // current on-screen size if a previous resize ease is still in flight.
@@ -213,8 +226,32 @@ export const AnimationsManager = GObject.registerClass({
             windowActor.set_scale(initialScaleX, initialScaleY);
         }
 
-        // Position keeps its own bounce; scale runs as a separate ease so it can use
-        // a different curve - an overshooting resize reads as a glitch, not a bounce.
+        const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete };
+
+        // Clutter silently skips implicit transitions on actors that aren't mapped yet
+        // (should_skip_implicit_transition in clutter-actor.c), snapping straight to the
+        // final value instead of animating - and a first placement can run this early,
+        // since this pipeline reliably outpaces the actor's own mapping. Defer the actual
+        // ease until onWindowCreated (windowHandler.js) confirms the actor is mapped,
+        // instead of calling ease() now and getting silently skipped.
+        if (firstPlacement && !windowActor.mapped) {
+            this._pendingEntranceEases.set(window.get_id(), { windowActor, ...easeParams });
+            return;
+        }
+
+        this._runEntranceEase(window, windowActor, easeParams);
+    }
+
+    // Runs the actual translation/scale ease. Called either immediately from
+    // animateWindow (actor already mapped) or later via runDeferredEntrance,
+    // once windowHandler.js confirms the actor is mapped.
+    _runEntranceEase(window, windowActor, { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete }) {
+        // Position keeps its own bounce; scale and opacity run as separate eases so
+        // they can use a different curve - EASE_OUT_BACK overshoots past its target
+        // and clamps there, so bundled into the same ease as translation it finishes
+        // (and visually settles) well before the bouncy slide-in does. A resize that
+        // overshoots reads as a glitch, and a fade that overshoots reads as already-
+        // finished while the window is still visibly sliding.
         if (!skipScale) {
             windowActor.ease({
                 scale_x: 1,
@@ -229,6 +266,22 @@ export const AnimationsManager = GObject.registerClass({
             });
         }
 
+        // The map-time opacity=0 was only ever a placeholder until this real pass
+        // knew where to slide in from - needed even with no offset (e.g. the very
+        // first window in an empty workspace), otherwise it never finishes fading in.
+        if (firstPlacement) {
+            windowActor.ease({
+                opacity: 255,
+                duration: effectiveDuration,
+                mode: ANIMATION_MODE_SUBTLE,
+                onStopped: (isFinished) => {
+                    if (!isFinished) return;
+                    if (windowActor && !windowActor.is_destroyed())
+                        windowActor.opacity = 255;
+                }
+            });
+        }
+
         windowActor.ease({
             translation_x: 0,
             translation_y: 0,
@@ -238,6 +291,7 @@ export const AnimationsManager = GObject.registerClass({
                 if (!isFinished) return; // redirect in progress; new animation owns cleanup
                 if (windowActor && !windowActor.is_destroyed())
                     windowActor.set_translation(0, 0, 0);
+                if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
                 this._animatingWindows.delete(window.get_id());
                 this._animatingTargets.delete(window.get_id());
                 this._checkAllAnimationsComplete();
@@ -247,8 +301,35 @@ export const AnimationsManager = GObject.registerClass({
         });
     }
 
+    // Called from windowHandler.js's onWindowCreated once the actor is confirmed
+    // mapped - safe to ease now that Clutter will no longer skip the transition outright.
+    runDeferredEntrance(window) {
+        const pending = this._pendingEntranceEases.get(window.get_id());
+        if (!pending) return;
+        this._pendingEntranceEases.delete(window.get_id());
+        const { windowActor, ...easeParams } = pending;
+        if (!windowActor || windowActor.is_destroyed()) return;
+        this._runEntranceEase(window, windowActor, easeParams);
+    }
+
+    // onWindowAdded and onWindowCreated race independently (no guaranteed order), and
+    // both can claim a window's entrance. If onWindowCreated already started or queued
+    // the real ease, onWindowAdded must not reset opacity back to 0 behind its back -
+    // that's a direct, non-eased property write, which stomps the fade mid-flight and
+    // reads as a visible blink once the ease's own next frame overwrites it again.
+    hasActiveOrPendingEntrance(window) {
+        const id = window.get_id();
+        return this._pendingEntranceEases.has(id) || this._animatingWindows.has(id);
+    }
+
     animateReTiling(windowLayouts, draggedWindow = null) {
         for (const { window, rect } of windowLayouts) {
+            // Cleared by animateWindow once this placement actually finishes (not
+            // here) - a single window-open burst can recurse through several
+            // tileWorkspaceWindows passes, and each one needs to still see this
+            // as a first placement, not just whichever pass happens to run first.
+            const isFirstPlacement = WindowState.get(window, 'pendingFirstPlacement');
+
             const currentRect = window.get_frame_rect();
 
             const needsMove = Math.abs(currentRect.x - rect.x) > constants.ANIMATION_DIFF_THRESHOLD ||
@@ -256,13 +337,55 @@ export const AnimationsManager = GObject.registerClass({
                              Math.abs(currentRect.width - rect.width) > constants.ANIMATION_DIFF_THRESHOLD ||
                              Math.abs(currentRect.height - rect.height) > constants.ANIMATION_DIFF_THRESHOLD;
 
-            if (!needsMove) {
+            // A first placement still needs to run through animateWindow even when
+            // the raw spawn position happens to already match the target - it owns
+            // clearing the opacity=0 onWindowAdded left it at and the slide-in offset.
+            if (!needsMove && !isFirstPlacement) {
                 window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
                 continue;
             }
 
-            this.animateWindow(window, rect, { draggedWindow });
+            const slideInOffset = isFirstPlacement
+                ? this._computeSlideInOffset(window, rect, windowLayouts)
+                : null;
+
+            this.animateWindow(window, rect, { draggedWindow, firstPlacement: isFirstPlacement, slideInOffset });
         }
+    }
+
+    // Derives the slide-in push direction from the real final layout instead of
+    // guessing from wherever Mutter happened to drop the window before tiling -
+    // that raw position is arbitrary and can coincidentally land dead-center on
+    // the existing window(s), silently producing a zero offset (no animation at all).
+    _computeSlideInOffset(window, targetRect, windowLayouts) {
+        const OFFSET = constants.SLIDE_IN_OFFSET_PX;
+        const siblings = windowLayouts.filter(l => l.window.get_id() !== window.get_id());
+
+        if (siblings.length === 0) {
+            // Nothing to push against - fall back to a workspace-switch cue, if any.
+            const ws = window.get_workspace();
+            const prevWSIndex = WindowState.get(window, 'previousWorkspace');
+            if (ws && prevWSIndex !== undefined && prevWSIndex !== ws.index())
+                return { x: (prevWSIndex < ws.index() ? -1 : 1) * OFFSET * 3, y: 0 };
+            return null;
+        }
+
+        let centerX = 0, centerY = 0;
+        for (const { rect } of siblings) {
+            centerX += rect.x + rect.width / 2;
+            centerY += rect.y + rect.height / 2;
+        }
+        centerX /= siblings.length;
+        centerY /= siblings.length;
+
+        const winCenterX = targetRect.x + targetRect.width / 2;
+        const winCenterY = targetRect.y + targetRect.height / 2;
+        const deltaX = winCenterX - centerX;
+        const deltaY = winCenterY - centerY;
+
+        return Math.abs(deltaX) >= Math.abs(deltaY)
+            ? { x: deltaX < 0 ? -OFFSET : OFFSET, y: 0 }
+            : { x: 0, y: deltaY < 0 ? -OFFSET : OFFSET };
     }
 
     removeAnimatingWindow(windowId) {

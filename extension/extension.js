@@ -252,9 +252,6 @@ export default class WindowMosaicExtension extends Extension {
         this._focusWindowChangedId = global.display.connect('notify::focus-window',
             () => this._onFocusWindowChanged());
 
-        // Apply slide-in animation patch
-        this.windowHandler.patchMapWindow();
-
         // Initialize Quick Settings indicator
         this._mosaicIndicator = new MosaicIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._mosaicIndicator);
