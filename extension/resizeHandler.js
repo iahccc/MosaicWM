@@ -71,6 +71,21 @@ export const ResizeHandler = GObject.registerClass({
         this._constraintRebalanceCount = 0;
     }
 
+    // A clamp seen shortly after window creation might just be the client still
+    // negotiating its own size, not a real minimum, so allow one retry per target.
+    _shouldRetryClamp(window, pendingSmartSize) {
+        const addedTime = WindowState.get(window, 'addedTime');
+        if (addedTime === undefined) return false;
+        if (Date.now() - addedTime >= constants.RESIZE_CLAMP_SETTLE_WINDOW_MS) return false;
+
+        const retriedTarget = WindowState.get(window, 'clampRetryTarget');
+        const alreadyRetriedThisTarget = retriedTarget
+            && retriedTarget.width === pendingSmartSize.width
+            && retriedTarget.height === pendingSmartSize.height;
+
+        return !alreadyRetriedThisTarget;
+    }
+
     onResizeBegin(window, grabpo) {
         this._resizeInOverflow = false;
         this._lastResizeTileTime = 0;
@@ -279,10 +294,28 @@ export const ResizeHandler = GObject.registerClass({
             const pendingSmartSize = WindowState.get(window, 'targetSmartResizeSize');
             if (pendingSmartSize) {
                 if (rect.width > pendingSmartSize.width + 2 || rect.height > pendingSmartSize.height + 2) {
+                    if (this._shouldRetryClamp(window, pendingSmartSize)) {
+                        Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamped while still settling: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height} - retrying once`);
+                        WindowState.set(window, 'clampRetryTarget', { width: pendingSmartSize.width, height: pendingSmartSize.height });
+                        const retryRect = window.get_frame_rect();
+                        this._timeoutRegistry.add(constants.RESIZE_CLAMP_RETRY_DELAY_MS, () => {
+                            if (isWindowAlive(window)) {
+                                Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamp retry firing: requesting ${pendingSmartSize.width}×${pendingSmartSize.height}`);
+                                window.move_resize_frame(false, retryRect.x, retryRect.y, pendingSmartSize.width, pendingSmartSize.height);
+                            } else {
+                                Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamp retry skipped - window gone`);
+                            }
+                            return GLib.SOURCE_REMOVE;
+                        }, 'resizeHandler_clampRetry');
+                        this._sizeChanged = false;
+                        return;
+                    }
+
                     Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamped: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height}`);
                     WindowState.set(window, 'targetSmartResizeSize', { width: rect.width, height: rect.height });
                     WindowState.set(window, 'actualMinWidth', rect.width);
                     WindowState.set(window, 'actualMinHeight', rect.height);
+                    WindowState.remove(window, 'clampRetryTarget');
 
                     // A window we just placed can clamp a few px against its own minimum.
                     // Rebalancing right away races the tiling pass that's still settling
@@ -295,6 +328,7 @@ export const ResizeHandler = GObject.registerClass({
                     }
                 } else {
                     WindowState.set(window, 'targetSmartResizeSize', null);
+                    WindowState.remove(window, 'clampRetryTarget');
                 }
                 this._sizeChanged = false;
                 return;
