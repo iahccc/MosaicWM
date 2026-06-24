@@ -33,6 +33,12 @@ export const AnimationsManager = GObject.registerClass({
         this._resizingWindowId = null;
         this._timeoutRegistry = null;
         this._isOverviewActive = false;
+        // Toggled by setMembershipChangeBounce around a close-triggered retile pass.
+        this._membershipChangeBounce = false;
+    }
+
+    setMembershipChangeBounce(active) {
+        this._membershipChangeBounce = active;
     }
 
     setTimeoutRegistry(registry) {
@@ -195,10 +201,14 @@ export const AnimationsManager = GObject.registerClass({
 
         const effectiveDuration = Math.ceil(duration * getSlowDownFactor());
 
+        // Bounce is reserved for a window joining or leaving the workspace. Everything
+        // else (miniaturize, swap, monitor change, exclusion, smart resize, edge snap)
+        // keeps the same membership and stays subtle.
+        const isMembershipChange = firstPlacement || this._membershipChangeBounce;
         let animationMode;
         if (mode !== null) {
             animationMode = mode;
-        } else if (subtle || this._justEndedDrag) {
+        } else if (subtle || this._justEndedDrag || !isMembershipChange) {
             animationMode = ANIMATION_MODE_SUBTLE;
         } else {
             animationMode = ANIMATION_MODE;
@@ -329,6 +339,20 @@ export const AnimationsManager = GObject.registerClass({
     }
 
     animateReTiling(windowLayouts, draggedWindow = null, miniLayouts = []) {
+        // A new window pushes siblings to make room; bounce those too, not just the entrant.
+        const passHasEntrant = windowLayouts.some(({ window }) => WindowState.get(window, 'pendingFirstPlacement')) ||
+            miniLayouts.some(({ window }) => WindowState.get(window, 'pendingFirstPlacement'));
+        const previousMembershipChangeBounce = this._membershipChangeBounce;
+        if (passHasEntrant) this._membershipChangeBounce = true;
+
+        try {
+            this._animateReTilingPass(windowLayouts, draggedWindow, miniLayouts);
+        } finally {
+            this._membershipChangeBounce = previousMembershipChangeBounce;
+        }
+    }
+
+    _animateReTilingPass(windowLayouts, draggedWindow, miniLayouts) {
         for (const { window, rect } of windowLayouts) {
             // Cleared by animateWindow once this placement actually finishes (not
             // here), since a single window-open burst can recurse through several

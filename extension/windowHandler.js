@@ -438,6 +438,7 @@ export const WindowHandler = GObject.registerClass({
                 workspace, monitor);
         }
 
+        // Resettling because a window just left, so bounce it like an entrance.
         if (restored) {
             // move_resize_frame above hasn't settled yet - retiling now would read
             // get_frame_rect() before the client acks the new size, hit the layout
@@ -447,11 +448,15 @@ export const WindowHandler = GObject.registerClass({
                 for (const w of restorableWindows) {
                     WindowState.remove(w, 'isReverseSmartResizing');
                 }
+                this.animationsManager.setMembershipChangeBounce(true);
                 this._ext.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+                this.animationsManager.setMembershipChangeBounce(false);
                 return GLib.SOURCE_REMOVE;
             }, settleTimeoutName);
         } else {
+            this.animationsManager.setMembershipChangeBounce(true);
             this._ext.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+            this.animationsManager.setMembershipChangeBounce(false);
         }
     }
 
