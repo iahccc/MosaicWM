@@ -1897,24 +1897,22 @@ export const TilingManager = GObject.registerClass({
 
             for (const candidate of overflowCandidates) {
                 const frame = candidate.get_frame_rect();
-                const pref = WindowState.get(candidate, 'preferredSize') ?? WindowState.get(candidate, 'openingSize');
-                const preW = pref ? pref.width : frame.width;
-                const preH = pref ? pref.height : frame.height;
-                const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(preW, preH);
-                const miniW = Math.round(preW * scale);
-                const miniH = Math.round(preH * scale);
+                // Scale from current frame so the visual fills the slot.
+                const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(frame.width, frame.height);
+                const miniW = Math.round(frame.width * scale);
+                const miniH = Math.round(frame.height * scale);
 
                 cumulativeSim.set(candidate.get_id(), { width: miniW, height: miniH });
-                pendingMinis.push({ candidate, frame, preW, preH, miniW, miniH });
+                pendingMinis.push({ candidate, frame, miniW, miniH });
 
                 const simSizes = [...cumulativeSim.entries()].map(([id, s]) => ({ id, width: s.width, height: s.height }));
 
                 if (!this._tile(simSizes, tileArea, true).overflow) {
                     Logger.log(`[OVERFLOW] No-ref overflow resolved by miniaturizing ${pendingMinis.length} window(s)`);
                     if (!this._pendingMiniatureWindows) this._pendingMiniatureWindows = [];
-                    for (const { candidate: c, frame: f, preW: pW, preH: pH, miniW: mW, miniH: mH } of pendingMinis) {
+                    for (const { candidate: c, frame: f, miniW: mW, miniH: mH } of pendingMinis) {
                         Logger.log(`[OVERFLOW] Miniaturizing ${c.get_id()} (${mW}x${mH})`);
-                        this._pendingMiniatureWindows.push({ window: c, preSize: { x: f.x, y: f.y, width: pW, height: pH } });
+                        this._pendingMiniatureWindows.push({ window: c, preSize: { x: f.x, y: f.y, width: f.width, height: f.height } });
                         const desc = windows.find(w => w.id === c.get_id());
                         if (desc) { desc.width = mW; desc.height = mH; }
                     }
@@ -2654,15 +2652,12 @@ export const TilingManager = GObject.registerClass({
                         ).length;
                         if (nonMiniCount <= 1) break;
 
-                        // d.current can resolve to targetSmartResizeSize (already shrunk) when
-                        // preferredSize/openingSize are both missing, so prefer those explicitly.
-                        const frame   = w.get_frame_rect();
-                        const natural = d.preferred || d.current;
-                        const preSize = { x: frame.x, y: frame.y, width: natural.width, height: natural.height };
-                        const scale   = constants.MINIATURE_TARGET_SIZE_PX / Math.max(preSize.width, preSize.height);
+                        const frame  = w.get_frame_rect();
+                        // Scale from current frame so the visual fills the slot.
+                        const scale  = constants.MINIATURE_TARGET_SIZE_PX / Math.max(frame.width, frame.height);
                         d.pendingMiniature = true;
-                        d.miniSize         = { width: Math.round(preSize.width * scale), height: Math.round(preSize.height * scale) };
-                        d.pendingPreSize   = preSize;
+                        d.miniSize         = { width: Math.round(frame.width * scale), height: Math.round(frame.height * scale) };
+                        d.pendingPreSize   = { x: frame.x, y: frame.y, width: frame.width, height: frame.height };
                         Logger.log(`[SMART RESIZE] ${w.get_id()}: miniaturizing to make room (${d.miniSize.width}x${d.miniSize.height})`);
 
                         if (!this._tile(buildSimulated(0.0), workArea, true).overflow) break;
@@ -2742,16 +2737,14 @@ export const TilingManager = GObject.registerClass({
                     candidateData.miniatureTargetSlot = null;
                     Logger.log(`[MINIATURE] Marking ${candidateSim.id}(${candidateData.window.get_wm_class()}) as PENDING miniature (will be created after layout)`);
 
-                    // candidateData.current can resolve to targetSmartResizeSize (already shrunk)
-                    // when preferredSize/openingSize are both missing, so prefer those explicitly.
                     const frame4a   = candidateData.window.get_frame_rect();
+                    // Scale from current frame so the visual fills the slot.
                     const natural4a = candidateData.preferred || candidateData.current;
-                    const preSize   = { x: frame4a.x, y: frame4a.y, width: natural4a.width, height: natural4a.height };
-                    const scale     = constants.MINIATURE_TARGET_SIZE_PX / Math.max(preSize.width, preSize.height);
-                    const miniSize  = { width: Math.round(preSize.width * scale), height: Math.round(preSize.height * scale) };
-                    candidateData.miniSize = miniSize;
-                    candidateData.pendingPreSize = preSize;
-                    Logger.log(`[MINIATURE] ${candidateSim.id} PENDING at ${preSize.width}x${preSize.height} → miniSize: ${miniSize.width}x${miniSize.height} scale: ${scale}`);
+                    const scale     = constants.MINIATURE_TARGET_SIZE_PX / Math.max(frame4a.width, frame4a.height);
+                    const miniSize  = { width: Math.round(frame4a.width * scale), height: Math.round(frame4a.height * scale) };
+                    candidateData.miniSize       = miniSize;
+                    candidateData.pendingPreSize = { x: frame4a.x, y: frame4a.y, width: frame4a.width, height: frame4a.height };
+                    Logger.log(`[MINIATURE] ${candidateSim.id} PENDING at frame=${frame4a.width}x${frame4a.height} restore=${natural4a.width}x${natural4a.height} → miniSize: ${miniSize.width}x${miniSize.height} scale: ${scale}`);
 
                     // Do NOT remove from allWindows/allResizable yet, keep it for layout computation
                     // (the window will be treated as miniature-sized in buildSimulated)
@@ -2817,7 +2810,6 @@ export const TilingManager = GObject.registerClass({
                     Logger.log(`[MINIATURE] ${w.get_id()} stored in pendingWindows: preSize=${storedPreSize.width}x${storedPreSize.height}, SKIPPING move_resize_frame (will be miniaturized)`);
                     continue;
                 }
-
                 this._animateResize(w, frame, sim.width, sim.height, true);
                 Logger.log(`[SMART RESIZE] ${sim.id}: ${d.current.width}×${d.current.height} → ${sim.width}×${sim.height}`);
             }
