@@ -1330,7 +1330,7 @@ export const TilingManager = GObject.registerClass({
         for(const w of _windows)
             windows.push(this.getMask(w));
 
-        const work_area = workspace.get_work_area_for_monitor(current_monitor);
+        const work_area = this._clampedWorkArea(workspace, current_monitor);
         if(!work_area) return false;
 
         return {
@@ -1514,7 +1514,7 @@ export const TilingManager = GObject.registerClass({
     }
 
     _cascadeMonitorWindows(workspace, monitor) {
-        const workArea = workspace.get_work_area_for_monitor(monitor);
+        const workArea = this._clampedWorkArea(workspace, monitor);
         if (!workArea || workArea.width <= 0) return;
 
         const windows = this._windowingManager
@@ -1566,7 +1566,7 @@ export const TilingManager = GObject.registerClass({
         if (!workspace || workspace.index() < 0) return;
         if (this._extension && !this._extension.isMosaicEnabledForWorkspace(workspace)) return;
 
-        const workArea = workspace.get_work_area_for_monitor(monitor);
+        const workArea = this._clampedWorkArea(workspace, monitor);
         if (!workArea || workArea.width <= 0 || workArea.height <= 0) return;
 
         const allWindows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
@@ -1868,8 +1868,7 @@ export const TilingManager = GObject.registerClass({
             }
         }
 
-        // Overflow without a reference window: attempt to miniaturize one window to restore fit.
-        // Handles re-tiles after window close or miniature restore where the layout is still too large.
+        // No reference window means nothing to eject, so try miniaturizing candidates to reclaim space.
         if (overflow && !reference_meta_window && !this.isDragging && this._extension?.miniatureManager) {
             const focusedId = global.display.focus_window?.get_id();
 
@@ -1883,6 +1882,19 @@ export const TilingManager = GObject.registerClass({
                 .sort((a, b) => (WindowState.get(a, 'addedTime') ?? 0) - (WindowState.get(b, 'addedTime') ?? 0));
 
             let overflowResolved = false;
+
+            // Accumulate mini sizes across iterations so multiple windows can stack to resolve overflow.
+            const cumulativeSim = new Map(meta_windows.map(w => {
+                if (WindowState.get(w, IS_MINIATURE)) {
+                    const ms = getMiniatureSize(w);
+                    const f = w.get_frame_rect();
+                    return [w.get_id(), ms ? { width: ms.width, height: ms.height } : { width: f.width, height: f.height }];
+                }
+                const f = w.get_frame_rect();
+                return [w.get_id(), { width: f.width, height: f.height }];
+            }));
+            const pendingMinis = [];
+
             for (const candidate of overflowCandidates) {
                 const frame = candidate.get_frame_rect();
                 const pref = WindowState.get(candidate, 'preferredSize') ?? WindowState.get(candidate, 'openingSize');
@@ -1892,29 +1904,20 @@ export const TilingManager = GObject.registerClass({
                 const miniW = Math.round(preW * scale);
                 const miniH = Math.round(preH * scale);
 
-                const simSizes = meta_windows.map(w => {
-                    if (w.get_id() === candidate.get_id())
-                        return { id: w.get_id(), width: miniW, height: miniH };
-                    if (WindowState.get(w, IS_MINIATURE)) {
-                        const ms = getMiniatureSize(w);
-                        const f = w.get_frame_rect();
-                        return ms
-                            ? { id: w.get_id(), width: ms.width, height: ms.height }
-                            : { id: w.get_id(), width: f.width, height: f.height };
-                    }
-                    const f = w.get_frame_rect();
-                    return { id: w.get_id(), width: f.width, height: f.height };
-                });
+                cumulativeSim.set(candidate.get_id(), { width: miniW, height: miniH });
+                pendingMinis.push({ candidate, frame, preW, preH, miniW, miniH });
+
+                const simSizes = [...cumulativeSim.entries()].map(([id, s]) => ({ id, width: s.width, height: s.height }));
 
                 if (!this._tile(simSizes, tileArea, true).overflow) {
-                    Logger.log(`[OVERFLOW] No-ref overflow resolved: miniaturizing ${candidate.get_id()} (${miniW}x${miniH})`);
+                    Logger.log(`[OVERFLOW] No-ref overflow resolved by miniaturizing ${pendingMinis.length} window(s)`);
                     if (!this._pendingMiniatureWindows) this._pendingMiniatureWindows = [];
-                    this._pendingMiniatureWindows.push({
-                        window: candidate,
-                        preSize: { x: frame.x, y: frame.y, width: preW, height: preH },
-                    });
-                    const desc = windows.find(w => w.id === candidate.get_id());
-                    if (desc) { desc.width = miniW; desc.height = miniH; }
+                    for (const { candidate: c, frame: f, preW: pW, preH: pH, miniW: mW, miniH: mH } of pendingMinis) {
+                        Logger.log(`[OVERFLOW] Miniaturizing ${c.get_id()} (${mW}x${mH})`);
+                        this._pendingMiniatureWindows.push({ window: c, preSize: { x: f.x, y: f.y, width: pW, height: pH } });
+                        const desc = windows.find(w => w.id === c.get_id());
+                        if (desc) { desc.width = mW; desc.height = mH; }
+                    }
                     this.invalidateLayoutCache();
                     tile_info = this._tile(windows, tileArea);
                     overflow = tile_info.overflow;
@@ -1924,7 +1927,7 @@ export const TilingManager = GObject.registerClass({
             }
 
             if (!overflowResolved)
-                Logger.log('[OVERFLOW] No-ref overflow: no single miniaturization resolves it, applying clamped positions');
+                Logger.log('[OVERFLOW] No-ref overflow: miniaturizing all candidates still overflows, applying clamped positions');
         }
 
         this._positionSnapshot = null;
@@ -2236,7 +2239,7 @@ export const TilingManager = GObject.registerClass({
         const workspace = window.get_workspace();
         const monitor = window.get_monitor();
         if (workspace && monitor !== null && monitor !== undefined) {
-            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const workArea = this._clampedWorkArea(workspace, monitor);
             if (workArea && size.width >= workArea.width && size.height >= workArea.height) {
                 Logger.log(`savePreferredSize: Rejected monitor-sized dimensions ${size.width}x${size.height} for ${window.get_id()}`);
                 return;
@@ -2469,8 +2472,18 @@ export const TilingManager = GObject.registerClass({
         return windowArea / workspaceArea;
     }
 
+    // get_work_area_for_monitor can overshoot physical bounds in some display setups.
+    _clampedWorkArea(workspace, monitor) {
+        const area = workspace.get_work_area_for_monitor(monitor);
+        if (!area) return null;
+        const geom = global.display.get_monitor_geometry(monitor);
+        const maxW = geom.x + geom.width - area.x;
+        const maxH = geom.y + geom.height - area.y;
+        if (area.width <= maxW && area.height <= maxH) return area;
+        return { x: area.x, y: area.y, width: Math.min(area.width, maxW), height: Math.min(area.height, maxH) };
+    }
+
     // Helper to get usable work area considering edge tiles
-     
     getUsableWorkArea(workspace, monitor) {
         if (this._edgeTilingManager) {
             const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
@@ -2479,15 +2492,15 @@ export const TilingManager = GObject.registerClass({
                 const zones = edgeTiledWindows.map(w => w.zone);
                 const hasLeft = zones.some(z => [TileZone.LEFT_FULL, TileZone.TOP_LEFT, TileZone.BOTTOM_LEFT].includes(z));
                 const hasRight = zones.some(z => [TileZone.RIGHT_FULL, TileZone.TOP_RIGHT, TileZone.BOTTOM_RIGHT].includes(z));
-                
+
                 if (hasLeft && hasRight) {
                     return { x: 0, y: 0, width: 0, height: 0 };
                 }
-                
+
                 return this._edgeTilingManager.calculateRemainingSpace(workspace, monitor);
             }
         }
-        return workspace.get_work_area_for_monitor(monitor);
+        return this._clampedWorkArea(workspace, monitor);
     }
 
     // Calculate layouts without moving windows (for Overview)
@@ -2634,6 +2647,7 @@ export const TilingManager = GObject.registerClass({
                         if (w.get_id() === focusedId0 || this._isRecentlyAdded(w)) continue;
                         if (WindowState.get(w, IS_MINIATURE)) continue;
                         if (this._windowingManager.isMaximizedOrFullscreen(w)) continue;
+                        if (!d.isResizable) continue;
 
                         const nonMiniCount = allWindows.filter(aw =>
                             !WindowState.get(aw, IS_MINIATURE) && !windowData.get(aw.get_id())?.pendingMiniature

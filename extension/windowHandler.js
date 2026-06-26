@@ -756,13 +756,7 @@ export const WindowHandler = GObject.registerClass({
         }
 
         // Path 4: Smart Resize attempt
-        let workArea = workspace.get_work_area_for_monitor(monitor);
-        if (this.edgeTilingManager) {
-            const edgeTiledWindows = this.edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
-            if (edgeTiledWindows.length > 0) {
-                workArea = this.edgeTilingManager.calculateRemainingSpace(workspace, monitor);
-            }
-        }
+        const workArea = this.tilingManager.getUsableWorkArea(workspace, monitor);
 
         const allExistingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
             .filter(w => w.get_id() !== window.get_id() && !this.edgeTilingManager.isEdgeTiled(w)

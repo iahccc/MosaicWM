@@ -718,7 +718,7 @@ export const ResizeHandler = GObject.registerClass({
         if (!canFit) {
             Logger.log(`handleUnmaximizeUndo: Window ${windowId} doesn't fit normally - attempting Smart Resize fit`);
             // Pass window as focused override: preMaxSize is its ceiling, so it won't be miniaturized.
-            const fitResult = this.tilingManager.tryFitWithResize(window, existingWindows, targetWorkspace.get_work_area_for_monitor(monitor), window);
+            const fitResult = this.tilingManager.tryFitWithResize(window, existingWindows, this.tilingManager.getUsableWorkArea(targetWorkspace, monitor), window);
             canFit = fitResult?.success ?? false;
             resizeNeeded = canFit;
             // Pending minis MUST reach the tile pass, since skipping leaves siblings at miniature size with no real miniature.
