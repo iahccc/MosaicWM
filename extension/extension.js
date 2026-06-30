@@ -72,6 +72,14 @@ export default class WindowMosaicExtension extends Extension {
         this._focusWindowChangedId = 0;
         this._miniatureRestoredId  = 0;
 
+        this._dnd = null;
+        this._dndEnterId = 0;
+        this._dndPositionId = 0;
+        this._dndLeaveId = 0;
+        this._dndActive = false;
+        this._dndRestoreTimer = null;
+        this._dndPendingWindowId = null;
+
         this._injectionManager = null;
 
         // Centralized timeout management for async operations
@@ -137,7 +145,7 @@ export default class WindowMosaicExtension extends Extension {
     };
 
     // =========================================================================
-    // SIGNAL HANDLERS - Workspace Changes
+    // SIGNAL HANDLERS: Workspace Changes
     // =========================================================================
 
     _workspaceSwitchedHandler = () => {
@@ -251,6 +259,13 @@ export default class WindowMosaicExtension extends Extension {
             (_, window) => this._onMiniatureRestored(window));
         this._focusWindowChangedId = global.display.connect('notify::focus-window',
             () => this._onFocusWindowChanged());
+
+        this._dnd = global.backend?.get_dnd() ?? null;
+        if (this._dnd) {
+            this._dndEnterId = this._dnd.connect('dnd-enter', this._onDndEnter.bind(this));
+            this._dndPositionId = this._dnd.connect('dnd-position-change', this._onDndPositionChange.bind(this));
+            this._dndLeaveId = this._dnd.connect('dnd-leave', this._onDndLeave.bind(this));
+        }
 
         // Initialize Quick Settings indicator
         this._mosaicIndicator = new MosaicIndicator(this);
@@ -628,6 +643,46 @@ export default class WindowMosaicExtension extends Extension {
         }
     }
 
+    _onDndEnter() {
+        this._dndActive = true;
+    }
+
+    _onDndPositionChange(_dnd, x, y) {
+        if (!this._dndActive || !this.miniatureManager) return;
+        const window = this.miniatureManager.findMiniatureAtPoint(x, y);
+        if (window) {
+            if (this._dndPendingWindowId === window.get_id()) return;
+            if (this._dndRestoreTimer !== null) {
+                this._timeoutRegistry.remove(this._dndRestoreTimer);
+                this._dndRestoreTimer = null;
+            }
+            this._dndPendingWindowId = window.get_id();
+            this._dndRestoreTimer = this._timeoutRegistry.add(
+                constants.DND_MINIATURE_RESTORE_DELAY_MS,
+                () => {
+                    this._dndRestoreTimer = null;
+                    this._dndPendingWindowId = null;
+                    this.miniatureManager?.restoreMiniature(window, null);
+                    return GLib.SOURCE_REMOVE;
+                },
+                'extension_dndMiniatureRestore'
+            );
+        } else if (this._dndRestoreTimer !== null) {
+            this._timeoutRegistry.remove(this._dndRestoreTimer);
+            this._dndRestoreTimer = null;
+            this._dndPendingWindowId = null;
+        }
+    }
+
+    _onDndLeave() {
+        this._dndActive = false;
+        if (this._dndRestoreTimer !== null) {
+            this._timeoutRegistry?.remove(this._dndRestoreTimer);
+            this._dndRestoreTimer = null;
+        }
+        this._dndPendingWindowId = null;
+    }
+
     _setupKeybindings() {
         const settings = this.getSettings('org.gnome.shell.extensions.mosaic-wm');
 
@@ -774,6 +829,22 @@ export default class WindowMosaicExtension extends Extension {
             global.display.disconnect(this._focusWindowChangedId);
             this._focusWindowChangedId = 0;
         }
+
+        if (this._dnd) {
+            if (this._dndEnterId) this._dnd.disconnect(this._dndEnterId);
+            if (this._dndPositionId) this._dnd.disconnect(this._dndPositionId);
+            if (this._dndLeaveId) this._dnd.disconnect(this._dndLeaveId);
+            this._dndEnterId = 0;
+            this._dndPositionId = 0;
+            this._dndLeaveId = 0;
+            this._dnd = null;
+        }
+        if (this._dndRestoreTimer !== null) {
+            this._timeoutRegistry?.remove(this._dndRestoreTimer);
+            this._dndRestoreTimer = null;
+        }
+        this._dndActive = false;
+        this._dndPendingWindowId = null;
 
         if (this.miniatureManager) {
             // Disconnect listener first, otherwise restoreMiniature re-enters
