@@ -167,15 +167,28 @@ export const AnimationsManager = GObject.registerClass({
             return;
         }
 
+        this._pruneStaleAnimations();
+
         // Redundant retile to the same destination already in flight (e.g. the
         // window-open queue re-evaluates the same window ~100ms later). Restarting
         // the ease here would cut the original transition off before its EASE_OUT_BACK
         // overshoot plays, replacing a full bounce with an imperceptible one. Let the
-        // existing ease run to completion instead.
+        // existing ease run to completion instead, but still re-apply geometry in
+        // case Mutter/client timing dropped the first configure request.
         const lastTarget = this._animatingTargets.get(window.get_id());
         if (this._animatingWindows.has(window.get_id()) && lastTarget &&
             lastTarget.x === targetRect.x && lastTarget.y === targetRect.y &&
             lastTarget.width === targetRect.width && lastTarget.height === targetRect.height) {
+            const currentFrame = window.get_frame_rect();
+            const frameMatchesTarget =
+                Math.abs(currentFrame.x - targetRect.x) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                Math.abs(currentFrame.y - targetRect.y) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                Math.abs(currentFrame.width - targetRect.width) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                Math.abs(currentFrame.height - targetRect.height) <= constants.ANIMATION_DIFF_THRESHOLD;
+            if (!frameMatchesTarget) {
+                WindowState.set(window, 'isMosaicResizing', true);
+                window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+            }
             if (onComplete) onComplete();
             return;
         }
@@ -227,14 +240,6 @@ export const AnimationsManager = GObject.registerClass({
         const initialScaleY = targetRect.height > 0 ? (currentFrame.height * currentScaleY) / targetRect.height : 1;
 
         WindowState.set(window, 'isMosaicResizing', true);
-        // A pure move applies to the actor's allocation immediately, but a Wayland
-        // client only commits a matching buffer for an actual size change some time
-        // after the configure request, not synchronously here. Moving first, before
-        // asking for the new size, means the position component is already correct
-        // by the time set_translation reads it below, regardless of how long the
-        // resize itself takes to land. The size mismatch in the meantime is already
-        // covered by the scale animation below, which doesn't depend on this.
-        window.move_frame(userOp, targetRect.x, targetRect.y);
         window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
 
         windowActor.set_translation(initialTx, initialTy, 0);
@@ -243,7 +248,7 @@ export const AnimationsManager = GObject.registerClass({
             windowActor.set_scale(initialScaleX, initialScaleY);
         }
 
-        const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete };
+        const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete, targetRect, userOp };
 
         // Clutter silently skips implicit transitions on actors that aren't mapped yet
         // (should_skip_implicit_transition in clutter-actor.c) and just snaps to the
@@ -261,7 +266,7 @@ export const AnimationsManager = GObject.registerClass({
     // Runs the actual translation/scale ease. Called either immediately from
     // animateWindow (actor already mapped) or later via runDeferredEntrance,
     // once windowHandler.js confirms the actor is mapped.
-    _runEntranceEase(window, windowActor, { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete }) {
+    _runEntranceEase(window, windowActor, { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete, targetRect, userOp }) {
         // Position keeps its own bounce; scale and opacity run as separate eases so
         // they can use a different curve. EASE_OUT_BACK overshoots past its target
         // and clamps there, so bundled into the same ease as translation it finishes
@@ -311,7 +316,23 @@ export const AnimationsManager = GObject.registerClass({
                 this._animatingWindows.delete(window.get_id());
                 this._animatingTargets.delete(window.get_id());
                 this._checkAllAnimationsComplete();
-                WindowState.set(window, 'isMosaicResizing', false);
+                if (targetRect) {
+                    const frame = window.get_frame_rect();
+                    const frameMatchesTarget =
+                        Math.abs(frame.x - targetRect.x) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                        Math.abs(frame.y - targetRect.y) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                        Math.abs(frame.width - targetRect.width) <= constants.ANIMATION_DIFF_THRESHOLD &&
+                        Math.abs(frame.height - targetRect.height) <= constants.ANIMATION_DIFF_THRESHOLD;
+                    if (!frameMatchesTarget) {
+                        WindowState.set(window, 'isMosaicResizing', true);
+                        window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+                        this._clearMosaicResizingSoon(window);
+                    } else {
+                        WindowState.set(window, 'isMosaicResizing', false);
+                    }
+                } else {
+                    WindowState.set(window, 'isMosaicResizing', false);
+                }
                 if (onComplete) onComplete();
             }
         });
