@@ -26,7 +26,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install shexli
+      # tree-sitter 0.26 breaks ABI with the 0.25 javascript grammar shexli ships, which segfaults the parser
+      - run: pip install shexli "tree-sitter<0.26"
       - run: shexli ${{ github.workspace }}/extension/
 
   build:
