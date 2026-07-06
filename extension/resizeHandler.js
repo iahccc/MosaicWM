@@ -139,8 +139,9 @@ export const ResizeHandler = GObject.registerClass({
         this._lastResizeTileTime = 0;
         this.animationsManager.setResizingWindow(window.get_id());
 
-        // Always clear smart-resize target so manual resize takes precedence
+        // Always clear pending resize targets so manual resize takes precedence
         WindowState.set(window, 'targetSmartResizeSize', null);
+        WindowState.remove(window, 'targetRestoredSize');
         if (WindowState.get(window, 'isSmartResizing')) {
             Logger.log(`Manual resize started for ${window.get_id()} - clearing smart-resize state`);
             WindowState.set(window, 'isSmartResizing', false);
