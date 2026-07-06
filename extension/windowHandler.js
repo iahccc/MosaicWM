@@ -399,10 +399,11 @@ export const WindowHandler = GObject.registerClass({
         return true;
     }
 
-    // Deduped via closeRetileHandledAt since both signals fire for the same close/move -
-    // whichever gets here first does the work, the other (often arriving much later
-    // behind afterAnimations) skips. No time expiry: a close never repeats, and a move
-    // clears the flag in enqueueWindowForEvaluation so a later close/move reads as fresh.
+    // Deduped via closeRetileHandledAt since both close signals land here; whichever
+    // gets here first does the work, the other (often arriving much later behind
+    // afterAnimations) skips. No time expiry: a close never repeats, a DnD move clears
+    // the flag on re-enqueue, and an overflow move never claims at all since it never
+    // re-enqueues (a stale claim would block the retile at the window's real close).
     // Options below capture real behavioral differences between the two callers, not duplication.
     _retileAfterWindowGone(removedWindow, remainingWindows, workspace, monitor, freedWidth, freedHeight, options = {}) {
         const {
@@ -421,7 +422,8 @@ export const WindowHandler = GObject.registerClass({
             Logger.log(`_retileAfterWindowGone: already handled for ${removedWindow.get_id()} - skipping duplicate`);
             return;
         }
-        WindowState.set(removedWindow, 'closeRetileHandledAt', true);
+        if (!wasMovedByOverflow)
+            WindowState.set(removedWindow, 'closeRetileHandledAt', true);
 
         if (cleanSmartResizingFlags) {
             Logger.log('[SMART RESIZE] Cleaning up transient flags for remaining windows');
@@ -590,6 +592,9 @@ export const WindowHandler = GObject.registerClass({
     // Ensures a new window fits via smart resize, queued to handle rapid spawns.
     enqueueWindowForEvaluation(window, workspace, monitor) {
         const windowId = window.get_id();
+        // A (re)considered window voids any earlier close-retile dedup claim; cleared
+        // before the dedupe returns below so a skipped re-enqueue still resets it.
+        WindowState.remove(window, 'closeRetileHandledAt');
         // Deduplicate
         if (this._evaluationQueue.some(entry => entry.window.get_id() === windowId)) {
             Logger.log(`Skipping duplicate enqueue for window ${windowId}`);
@@ -603,9 +608,6 @@ export const WindowHandler = GObject.registerClass({
             return;
         }
         Logger.log(`Enqueueing window ${windowId} for evaluation`);
-        // A window being (re)considered for the mosaic is a fresh lifecycle position -
-        // any earlier close-retile dedup claim (from a previous move) no longer applies.
-        WindowState.remove(window, 'closeRetileHandledAt');
         WindowState.set(window, 'pendingInQueue', true);
         this._evaluationQueue.push({ window, workspace, monitor });
         if (!this._isEvaluatingQueue) {
