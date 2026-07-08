@@ -434,6 +434,14 @@ export const AnimationsManager = GObject.registerClass({
         }
     }
 
+    // Drops any entrance ease still pending map before the window was excluded
+    // from tiling, so it can't fire later and clobber the snap-to-visible reset.
+    cancelPendingEntrance(window) {
+        const id = window.get_id();
+        this._pendingEntranceEases.delete(id);
+        this.removeAnimatingWindow(id);
+    }
+
     // No ease here means no onStopped to clear the flag, so give Mutter a
     // moment to actually fire size-changed before we drop it.
     _clearMosaicResizingSoon(window) {

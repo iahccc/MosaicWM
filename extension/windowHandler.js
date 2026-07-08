@@ -68,6 +68,19 @@ export const WindowHandler = GObject.registerClass({
         this._readinessWaiters.add(waiter);
     }
 
+    // Floating windows never enter the tile pass that would clear opacity=0;
+    // reveal so the slide-in failsafe isn't their only path to visibility.
+    _revealExcludedWindow(window) {
+        if (!WindowState.get(window, 'pendingFirstPlacement')) return;
+        WindowState.remove(window, 'pendingFirstPlacement');
+        this.animationsManager.cancelPendingEntrance(window);
+        const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
+        if (actor && !actor.is_destroyed()) {
+            actor.remove_transition('opacity');
+            actor.opacity = 255;
+        }
+    }
+
     // Lock a workspace to prevent recursive or conflicting tiling triggers.
     // Reference-counted: overlapping tileWorkspaceWindows calls (e.g. drag-end
     // and resize-end firing close together) each hold their own depth, so the
@@ -297,6 +310,10 @@ export const WindowHandler = GObject.registerClass({
 
         if (isNowExcluded) {
             Logger.log(`Window ${windowId} became excluded; retiling without it`);
+
+            // Exclusion arriving after opacity=0 was set (e.g. always-on-top
+            // toggled mid-entrance) strands the actor invisible; reveal now.
+            this._revealExcludedWindow(window);
 
             const frame = window.get_frame_rect();
             const freedWidth = frame.width;
@@ -915,6 +932,7 @@ export const WindowHandler = GObject.registerClass({
                 if(this.windowingManager.isExcluded(window)) {
                     Logger.log('Window excluded from tiling');
                     WindowState.remove(window, 'arrivalPending');
+                    this._revealExcludedWindow(window);
                     return GLib.SOURCE_REMOVE;
                 }
 
@@ -1007,6 +1025,7 @@ export const WindowHandler = GObject.registerClass({
             const isRelated = this.windowingManager.isRelated(window);
             const skipSlideIn = WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
                 || this.windowingManager.isMaximizedOrFullscreen(window)
+                || this.windowingManager.isExcluded(window)
                 || !this._hasSiblings(window);
             if (isRelated && !skipSlideIn) {
                 // Ask Mutter to skip its own open animation outright (the same public
@@ -1115,6 +1134,7 @@ export const WindowHandler = GObject.registerClass({
         // for a window opening alone (see _hasSiblings): nothing to slide in next to.
         const skipSlideIn = WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
             || this.windowingManager.isMaximizedOrFullscreen(window)
+            || this.windowingManager.isExcluded(window)
             || !this._hasSiblings(window);
         if (!skipSlideIn) {
             WindowState.set(window, 'pendingFirstPlacement', true);
@@ -1321,6 +1341,7 @@ export const WindowHandler = GObject.registerClass({
                 Logger.log('waitForGeometry: Window is excluded - connecting signals but skipping tiling');
                 WindowState.remove(WINDOW, 'arrivalPending');
                 this.connectWindowSignals(WINDOW);
+                this._revealExcludedWindow(WINDOW);
                 return GLib.SOURCE_REMOVE;
             }
 
