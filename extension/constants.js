@@ -62,6 +62,10 @@ export const SACRED_ENTER_DEBOUNCE_MS = 200;
 
 export const ANIMATION_DIFF_THRESHOLD = 10;
 
+// How far a committed size may sit from the ease's target and still count as the
+// ease's own echo. Terminals round up by a cell, so keep this under one cell.
+export const EASE_TARGET_TOLERANCE_PX = 2;
+
 // Fallback when get_min_size() has no hint
 export const SMART_RESIZE_MIN_WINDOW_WIDTH = 100;
 export const SMART_RESIZE_MIN_WINDOW_HEIGHT = 100;

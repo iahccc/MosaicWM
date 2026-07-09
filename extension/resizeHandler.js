@@ -467,11 +467,18 @@ export const ResizeHandler = GObject.registerClass({
 
             if (this._skipNextTiling === window.get_id()) return;
 
-            // The ease owns the actor; retiling here would cut it mid-flight and
-            // leave the window at the wrong target. onStopped clears the flag.
+            // The ease owns the actor while the size it reports is the one the ease
+            // itself asked for; retiling on that echo would cut it mid-flight. A
+            // divergence means the client refused and committed its own size (cell
+            // rounding), which the layout has to see or neighbors end up overlapped.
             if (WindowState.get(window, 'isMosaicResizing')) {
-                this._sizeChanged = false;
-                return;
+                const easeTarget = this.animationsManager.getAnimatingTarget(window.get_id());
+                if (easeTarget &&
+                    Math.abs(rect.width - easeTarget.width) <= constants.EASE_TARGET_TOLERANCE_PX &&
+                    Math.abs(rect.height - easeTarget.height) <= constants.EASE_TARGET_TOLERANCE_PX) {
+                    this._sizeChanged = false;
+                    return;
+                }
             }
 
             const tileState = this.edgeTilingManager.getWindowState(window);

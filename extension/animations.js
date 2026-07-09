@@ -427,6 +427,12 @@ export const AnimationsManager = GObject.registerClass({
             : { x: 0, y: deltaY < 0 ? -OFFSET : OFFSET };
     }
 
+    // Where an in-flight ease is driving the window, so size-changed can tell the
+    // ease's own move_resize_frame apart from a client committing a different size.
+    getAnimatingTarget(windowId) {
+        return this._animatingTargets.get(windowId) || null;
+    }
+
     removeAnimatingWindow(windowId) {
         this._animatingTargets.delete(windowId);
         if (this._animatingWindows.delete(windowId)) {
