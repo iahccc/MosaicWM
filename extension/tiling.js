@@ -2681,7 +2681,7 @@ export const TilingManager = GObject.registerClass({
         }
 
         if (shrunkWindows.length === 0) {
-            Logger.log('tryRestoreWindowSizes: No shrunk windows to restore (0/3 windows had deficits > 2px)');
+            Logger.log(`tryRestoreWindowSizes: No shrunk windows to restore (0/${windows.length} windows had deficits > 2px)`);
             return false;
         }
 

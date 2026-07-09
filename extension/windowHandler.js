@@ -474,7 +474,12 @@ export const WindowHandler = GObject.registerClass({
 
         let restored = false;
         if (shouldTryRestore) {
-            Logger.log(`${reverseLogLabel} - attempting reverse smart resize with freed ${freedWidth}x${freedHeight}`);
+            // Printing the freed dims where they're ignored sends readers chasing the
+            // 0x0 that 'window-removed' always reports; say where the space came from.
+            const freedDesc = passFreedDimsToRestore
+                ? `freed ${freedWidth}x${freedHeight}`
+                : 'free space measured from the work area';
+            Logger.log(`${reverseLogLabel}: attempting reverse smart resize with ${freedDesc}`);
             const workArea = this._ext.tilingManager.getUsableWorkArea(workspace, monitor);
             const target = includeMinisInRestoreCall ? remainingWindows : restorableWindows;
             restored = this._ext.tilingManager.tryRestoreWindowSizes(
@@ -1271,7 +1276,7 @@ export const WindowHandler = GObject.registerClass({
         if (!actor || actor.is_destroyed()) {
             this._ext.tilingManager.clearPreferredSize(window);
         } else {
-            Logger.log('_windowRemoved: Window still exists (DnD move) - keeping preferred size');
+            Logger.log('_windowRemoved: Window still exists (DnD move); keeping preferred size');
         }
 
         this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
@@ -1289,7 +1294,7 @@ export const WindowHandler = GObject.registerClass({
                              !this._ext.edgeTilingManager.isEdgeTiled(w) &&
                              !this._ext.windowingManager.isExcluded(w));
 
-            Logger.log(`_windowRemoved: ${remainingWindows.length} remaining windows, freed ${freedWidth}x${freedHeight}, wasOverflowMove=${wasMovedByOverflow}`);
+            Logger.log(`_windowRemoved: ${remainingWindows.length} remaining windows, wasOverflowMove=${wasMovedByOverflow}`);
 
             // Try to restore window sizes with freed space (Reverse Smart Resize)
             // Miniatures are excluded since their slot is fixed and shouldn't be grown to preferred.
@@ -1314,7 +1319,7 @@ export const WindowHandler = GObject.registerClass({
                         return GLib.SOURCE_REMOVE;
                     }
                     if (wasMovedByOverflow) {
-                        Logger.log('_windowRemoved: Workspace empty but window was moved by overflow - skipping navigation');
+                        Logger.log('_windowRemoved: Workspace empty but window was moved by overflow; skipping navigation');
                     } else {
                         Logger.log('_windowRemoved: Workspace truly empty, navigating away');
                         this._ext.windowingManager.renavigate(WORKSPACE, global.workspace_manager.get_active_workspace() === WORKSPACE, this._ext._lastVisitedWorkspace, MONITOR);
