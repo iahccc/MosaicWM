@@ -897,9 +897,7 @@ export const TilingManager = GObject.registerClass({
                 ? Math.round(this._restoreDisplacement(result) / constants.RESTORE_PROXIMITY_TOLERANCE_PX)
                 : 0;
 
-            // Proximity outranks the score, but never a layout that actually fits:
-            // an overflowing pick lands out of bounds and Mutter clamps it back on
-            // top of its neighbor. With nothing fitting, fall back to the old order.
+            // Proximity outranks the score, but never a fitting layout: an overflowing pick lands out of bounds and Mutter clamps it onto its neighbor.
             const isBetter = fits !== bestFits
                 ? fits
                 : (bucket < bestBucket || (bucket === bestBucket && score > bestScore));

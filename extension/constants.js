@@ -62,8 +62,8 @@ export const SACRED_ENTER_DEBOUNCE_MS = 200;
 
 export const ANIMATION_DIFF_THRESHOLD = 10;
 
-// How far a committed size may sit from the ease's target and still count as the
-// ease's own echo. Terminals round up by a cell, so keep this under one cell.
+// Slack for recognizing a committed size as the ease's own echo; beyond it, the
+// size is one the client picked for itself.
 export const EASE_TARGET_TOLERANCE_PX = 2;
 
 // Fallback when get_min_size() has no hint

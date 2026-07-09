@@ -426,6 +426,17 @@ export const ResizeHandler = GObject.registerClass({
                 ? sizeWorkspace.get_work_area_for_monitor(sizeMonitor) : null;
             const isMonitorSized = sizeWorkArea && rect.width >= sizeWorkArea.width && rect.height >= sizeWorkArea.height;
 
+            // An ease echoes back the size the layout picked, which says nothing about
+            // what the window wants. Anything else arriving mid-ease is the client's own
+            // size, so that one belongs in preferredSize. No target means no ease to echo.
+            const easeTarget = WindowState.get(window, 'isMosaicResizing')
+                ? this.animationsManager.getAnimatingTarget(window.get_id())
+                : null;
+            const isEaseEcho = !!easeTarget &&
+                Math.abs(rect.width - easeTarget.width) <= constants.EASE_TARGET_TOLERANCE_PX &&
+                Math.abs(rect.height - easeTarget.height) <= constants.EASE_TARGET_TOLERANCE_PX;
+            const clientOwnedSize = !!easeTarget && !isEaseEcho;
+
             if (isMonitorSized) {
                 Logger.log(`onSizeChanged: Rejected monitor-sized dimensions ${rect.width}x${rect.height} for ${window.get_id()}`);
             } else if (userForcedResize) {
@@ -443,7 +454,7 @@ export const ResizeHandler = GObject.registerClass({
                     WindowState.get(window, 'unmaximizing') ||
                     WindowState.get(window, 'isRestoringSacred') ||
                     WindowState.get(window, 'openedMaximized') ||
-                    WindowState.get(window, 'isMosaicResizing')) {
+                    (WindowState.get(window, 'isMosaicResizing') && !clientOwnedSize)) {
                     Logger.log(`onSizeChanged: Save blocked by transition flag for ${window.get_id()}`);
                 } else {
                     const currentPreferredSize = WindowState.get(window, 'preferredSize');
@@ -467,18 +478,12 @@ export const ResizeHandler = GObject.registerClass({
 
             if (this._skipNextTiling === window.get_id()) return;
 
-            // The ease owns the actor while the size it reports is the one the ease
-            // itself asked for; retiling on that echo would cut it mid-flight. A
-            // divergence means the client refused and committed its own size (cell
-            // rounding), which the layout has to see or neighbors end up overlapped.
-            if (WindowState.get(window, 'isMosaicResizing')) {
-                const easeTarget = this.animationsManager.getAnimatingTarget(window.get_id());
-                if (easeTarget &&
-                    Math.abs(rect.width - easeTarget.width) <= constants.EASE_TARGET_TOLERANCE_PX &&
-                    Math.abs(rect.height - easeTarget.height) <= constants.EASE_TARGET_TOLERANCE_PX) {
-                    this._sizeChanged = false;
-                    return;
-                }
+            // The ease owns the actor, and its own echo tells us nothing new. A size
+            // the client picked instead has to reach the layout, or it keeps placing
+            // the window at a size it doesn't have and neighbors end up overlapped.
+            if (isEaseEcho) {
+                this._sizeChanged = false;
+                return;
             }
 
             const tileState = this.edgeTilingManager.getWindowState(window);
