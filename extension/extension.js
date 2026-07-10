@@ -510,7 +510,13 @@ export default class WindowMosaicExtension extends Extension {
                     }
                 }
 
-                const isEnabled = workspace ? !extension._disabledWorkspaceStates.get(workspace) : true;
+                // Opened from inside the overview, the screenshot picker slips past the
+                // check above, and its windows carry no metaWindow to locate a workspace
+                // with. Without this the mosaic strategy hands back an empty slot list.
+                if (!workspace)
+                    return originalMethod.apply(this, args);
+
+                const isEnabled = !extension._disabledWorkspaceStates.get(workspace);
 
                 // Determine if we should use Mosaic or Fallback to Native
                 let useMosaic = isEnabled;
