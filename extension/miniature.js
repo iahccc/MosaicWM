@@ -188,6 +188,7 @@ const MiniatureClickOverlay = GObject.registerClass({
         this._miniatureManager = miniatureManager;
         this._destroyed = false;
         this._iconSuppressReasons = new Set();
+        this._iconDelayId = 0;
 
         // Windows with no app associated (some dialogs, some XWayland clients)
         // just get no icon; the overlay still works as a click target.
@@ -264,7 +265,8 @@ const MiniatureClickOverlay = GObject.registerClass({
     showIcon(duration) {
         if (this._destroyed || !this._icon) return;
         if (this._iconSuppressReasons.size > 0) return;
-        this._icon.remove_all_transitions();
+        // Only the opacity one, since the fade can start while the icon is still flying in.
+        this._icon.remove_transition('opacity');
         if (duration <= 0) {
             this._icon.opacity = 255;
             return;
@@ -276,9 +278,51 @@ const MiniatureClickOverlay = GObject.registerClass({
         });
     }
 
+    // The window's visual center is an affine combination of the scale and translation
+    // its ease animates, so matching that duration and mode traces the center exactly.
+    flyIconIn(dx, dy, duration) {
+        if (this._destroyed || !this._icon) return;
+        this._cancelIconDelay();
+        this._icon.remove_all_transitions();
+
+        // Animations off zeroes every duration, so there's no flight to ride.
+        if (duration <= 0) {
+            this._icon.set_translation(0, 0, 0);
+            this.showIcon(0);
+            return;
+        }
+
+        this._icon.opacity = 0;
+        this._icon.set_translation(dx, dy, 0);
+        this._icon.ease({
+            translation_x: 0,
+            translation_y: 0,
+            duration,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
+
+        // Fade over what's left of the flight, so the icon is solid the moment it lands.
+        const fadeDelay = Math.round(duration * constants.MINIATURE_ICON_FADE_START);
+        this._iconDelayId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, fadeDelay, () => {
+            this._iconDelayId = 0;
+            this.showIcon(duration - fadeDelay);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelIconDelay() {
+        if (!this._iconDelayId) return;
+        GLib.source_remove(this._iconDelayId);
+        this._iconDelayId = 0;
+    }
+
+    // Aborts a flight in progress too, otherwise unsuppressing would light the icon
+    // up wherever the ease had left it.
     hideIcon() {
         if (this._destroyed || !this._icon) return;
+        this._cancelIconDelay();
         this._icon.remove_all_transitions();
+        this._icon.set_translation(0, 0, 0);
         this._icon.opacity = 0;
     }
 
@@ -296,6 +340,7 @@ const MiniatureClickOverlay = GObject.registerClass({
     fadeOutAndDestroy(duration) {
         if (this._destroyed) return;
         this.reactive = false;
+        this._cancelIconDelay();
         if (!this._icon || this._icon.opacity === 0 || duration <= 0) {
             this.destroy();
             return;
@@ -311,6 +356,7 @@ const MiniatureClickOverlay = GObject.registerClass({
 
     destroy() {
         this._destroyed = true;
+        this._cancelIconDelay();
         super.destroy();
     }
 });
@@ -386,6 +432,14 @@ export const MiniatureManager = GObject.registerClass({
         const enforceEffect = new MiniatureEnforceEffect(window);
         windowActor.add_effect(enforceEffect);
 
+        // Where the icon has to end up: the overlay's own center, which BinLayout
+        // gives it for free once the flight's translation reaches zero.
+        const endCenterX = targetX + preSize.width * scale / 2;
+        const endCenterY = targetY + preSize.height * scale / 2;
+        let iconFlyDx = 0;
+        let iconFlyDy = 0;
+        let iconFlyDuration = 0;
+
         if (animate) {
             const prevKind = WindowState.get(window, MINIATURE_ANIM_KIND);
 
@@ -406,6 +460,11 @@ export const MiniatureManager = GObject.registerClass({
                 const endTx = targetX - actorBefore_x - extLeft * scale;
                 const endTy = targetY - actorBefore_y - extTop * scale;
                 const animDuration = Math.max(1, Math.round(constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (cs - scale) / Math.max(0.001, 1.0 - scale)));
+
+                // Frame is already shrunk to cs here, so its center rides that scale.
+                iconFlyDx = visualX + currentFrame.width * cs / 2 - endCenterX;
+                iconFlyDy = visualY + currentFrame.height * cs / 2 - endCenterY;
+                iconFlyDuration = animDuration;
 
                 // Set kind before remove_all_transitions, since restore's onStopped fires
                 // synchronously and needs to see 'create' to skip its conditional removal.
@@ -436,8 +495,6 @@ export const MiniatureManager = GObject.registerClass({
                             if (finalTgt && finalSc) {
                                 applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
                             }
-                            // The overlay is only built after this ease is kicked off, so read it back from state.
-                            WindowState.get(window, MINIATURE_OVERLAY)?.showIcon(Math.ceil(constants.MINIATURE_ICON_FADE_IN_MS * getSlowDownFactor()));
                             const [finalAx, finalAy] = windowActor.get_position();
                             const [finalW, finalH] = windowActor.get_size();
                             Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
@@ -455,6 +512,10 @@ export const MiniatureManager = GObject.registerClass({
                 const tx = targetX - actorBefore_x - px * dw - extLeft * scale;
                 const ty = targetY - actorBefore_y - py * dh - extTop * scale;
 
+                iconFlyDuration = Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor());
+                iconFlyDx = currentFrame.x + currentFrame.width / 2 - endCenterX;
+                iconFlyDy = currentFrame.y + currentFrame.height / 2 - endCenterY;
+
                 windowActor.remove_all_transitions();
                 windowActor.set_pivot_point(px, py);
                 windowActor.set_translation(0, 0, 0);
@@ -464,7 +525,7 @@ export const MiniatureManager = GObject.registerClass({
                     scale_y: scale,
                     translation_x: tx,
                     translation_y: ty,
-                    duration: Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor()),
+                    duration: iconFlyDuration,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                     onStopped: () => {
                         WindowState.remove(window, ANIMATING_MINIATURE);
@@ -480,8 +541,6 @@ export const MiniatureManager = GObject.registerClass({
                             if (finalTgt && finalSc) {
                                 applyMiniatureActorState(windowActor, finalSc, finalExtL, finalExtT, finalTgt.x, finalTgt.y);
                             }
-                            // The overlay is only built after this ease is kicked off, so read it back from state.
-                            WindowState.get(window, MINIATURE_OVERLAY)?.showIcon(Math.ceil(constants.MINIATURE_ICON_FADE_IN_MS * getSlowDownFactor()));
                             const [finalAx, finalAy] = windowActor.get_position();
                             const [finalW, finalH] = windowActor.get_size();
                             Logger.log(`[MINIATURE] createMiniature animation complete ${window.get_id()}: FINAL actor=(${finalAx},${finalAy} ${finalW}x${finalH}) scale=${finalSc} FINAL_VISUAL=${Math.round(finalW * finalSc)}x${Math.round(finalH * finalSc)}`);
@@ -516,8 +575,9 @@ export const MiniatureManager = GObject.registerClass({
         global.window_group.insert_child_above(overlay, windowActor);
         WindowState.set(window, MINIATURE_OVERLAY, overlay);
 
-        // No ease ran, so no onStopped will ever fire to fade the icon in.
-        if (!animate) overlay.showIcon(0);
+        // The window's ease is already a few lines old by now, but it runs on the same
+        // frame clock, so the icon still lands with it.
+        overlay.flyIconIn(iconFlyDx, iconFlyDy, animate ? iconFlyDuration : 0);
         if (this._overviewActive) overlay.setIconSuppressed('overview', true);
 
         Logger.log(`[MINIATURE] Created miniature for ${window.get_id()}, scale=${scale.toFixed(4)}`);

@@ -79,7 +79,7 @@ export const QUEUE_PROCESS_DELAY_MS = 100;   // Delay between processing window 
 // Miniature windows
 export const MINIATURE_TARGET_SIZE_PX = 256;  // Longest side of a miniaturized window
 export const MINIATURE_ICON_SIZE_PX = 64;     // Same size the Overview uses, so the icon can hand off without resizing
-export const MINIATURE_ICON_FADE_IN_MS = 180;  // Miniature has already settled, so the icon can take its time
+export const MINIATURE_ICON_FADE_START = 0.5;  // Point in the icon's flight where it starts fading in; a fraction since an interrupted restore shortens the flight
 export const MINIATURE_ICON_FADE_OUT_MS = 90;  // Window is growing back underneath, so the icon has to clear out fast
 export const MINIATURE_ANIM_MS = 250;
 export const MINIATURE_FOCUS_GUARD_MS = 500;  // Block focus-triggered restore right after miniaturizing
