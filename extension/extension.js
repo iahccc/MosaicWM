@@ -3,11 +3,13 @@
 
 import * as Logger from './logger.js';
 import { Extension, InjectionManager } from 'resource:///org/gnome/shell/extensions/extension.js';
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as OverviewControls from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 import * as Screenshot from 'resource:///org/gnome/shell/ui/screenshot.js';
@@ -33,7 +35,7 @@ import { DragHandler } from './dragHandler.js';
 import { ResizeHandler } from './resizeHandler.js';
 import { MiniatureManager } from './miniature.js';
 import * as WindowState from './windowState.js';
-import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS } from './windowState.js';
+import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS, MINIATURE_OVERLAY } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
 
 export default class WindowMosaicExtension extends Extension {
@@ -370,6 +372,20 @@ export default class WindowMosaicExtension extends Extension {
                             record.clone.x = tgt.x - monitor.x - extL * sc;
                             record.clone.y = tgt.y - monitor.y - extT * sc;
                         }
+
+                        // _createClone only ever sees the window actor, and the icon
+                        // overlay is its sibling, so the icon would vanish for the whole
+                        // slide. The overlay already sits at frame scale, hence no set_scale.
+                        const overlay = WindowState.get(metaWindow, MINIATURE_OVERLAY);
+                        if (overlay && tgt) {
+                            const iconClone = new Clutter.Clone({
+                                source: overlay,
+                                x: tgt.x - monitor.x,
+                                y: tgt.y - monitor.y,
+                            });
+                            overlay.connectObject('destroy', () => iconClone.destroy(), iconClone);
+                            wsGroup.add_child(iconClone);
+                        }
                     }
                 }
             }
@@ -413,6 +429,65 @@ export default class WindowMosaicExtension extends Extension {
                 }
                 return origBoundingBoxGetter.call(this);
             },
+        });
+
+        // Mirror ICON_SIZE and ICON_OVERLAP from gnome-shell's windowPreview.js: the
+        // icon rests with 30% of itself hanging below the preview's bottom edge.
+        const PREVIEW_ICON_SIZE = 64;
+        const PREVIEW_ICON_OVERLAP = 0.7;
+        const previewProto = WindowPreviewModule.WindowPreview.prototype;
+
+        // The shell already writes translation_y here to follow the preview's hover
+        // growth, so our lift has to add to it rather than replace it. A window
+        // restored from inside a static overview never re-runs _updateIconScale,
+        // so re-check the flag instead of trusting the stored lift.
+        this._injectionManager.overrideMethod(previewProto, '_adjustOverlayOffsets', originalMethod => {
+            return function (...args) {
+                originalMethod.apply(this, args);
+                if (this._mosaicIconLift && WindowState.get(this.metaWindow, IS_MINIATURE))
+                    this._icon.translation_y += this._mosaicIconLift;
+            };
+        });
+
+        // For a miniature the icon starts centered on the preview (right where the
+        // session icon was) and slides down to the native footer anchor. Driven by
+        // the adjustment, not an ease, so a half-open swipe leaves it halfway.
+        this._injectionManager.overrideMethod(previewProto, '_updateIconScale', originalMethod => {
+            return function (...args) {
+                const mw = this.metaWindow;
+                const { currentState, initialState, finalState } =
+                    this._overviewAdjustment.getStateTransitionParams();
+
+                // A straight run to the app grid is one transition from 0 to 2, so
+                // currentState alone would sweep through the picker and flash an icon
+                // the shell keeps hidden. At rest the two endpoints collapse onto the
+                // current state, and _init lands there, so the icon has to be placed.
+                const { ControlsState } = OverviewControls;
+                const throughPicker = initialState === finalState ||
+                    initialState === ControlsState.WINDOW_PICKER ||
+                    finalState === ControlsState.WINDOW_PICKER;
+
+                if (!mw || !WindowState.get(mw, IS_MINIATURE) || !throughPicker || currentState > 1) {
+                    this._mosaicIconLift = 0;
+                    return originalMethod.apply(this, args);
+                }
+
+                const t = Math.max(0, Math.min(1, currentState));
+                const container = this.window_container;
+
+                // _init runs this before the actor is allocated or styled, so the live box
+                // is empty and the icon has no preferred height yet. boundingBox is the
+                // size state 0 starts from, and the icon is always ICON_SIZE tall.
+                const allocH = container.allocation.get_height() * container.scale_y;
+                const visualH = allocH > 0 ? allocH : this.boundingBox.height;
+                const [, preferredIconH] = this._icon.get_preferred_height(-1);
+                const iconH = preferredIconH || PREVIEW_ICON_SIZE;
+
+                this._mosaicIconLift = (1 - t) * (iconH * (PREVIEW_ICON_OVERLAP - 0.5) - visualH / 2);
+                this._icon.set({ scale_x: 1, scale_y: 1 });
+                this._adjustOverlayOffsets();
+                return undefined;
+            };
         });
 
         const layoutProto = Workspace.WorkspaceLayout.prototype;
@@ -503,9 +578,13 @@ export default class WindowMosaicExtension extends Extension {
         this._wmEventIds.push(global.window_manager.connect('destroy', (_, win) => this.windowHandler.onWindowDestroyed(win.meta_window)));
         this._displayEventIds.push(global.display.connect('grab-op-begin', (display, window, grabpo) => this.dragHandler._grabOpBeginHandler(display, window, grabpo)));
         this._displayEventIds.push(global.display.connect('grab-op-end', (display, window, grabpo) => this.dragHandler._grabOpEndHandler(display, window, grabpo)));
-        this._onOverviewShowingId = Main.overview.connect('showing', () => this.animationsManager.setOverviewActive(true));
+        this._onOverviewShowingId = Main.overview.connect('showing', () => {
+            this.animationsManager.setOverviewActive(true);
+            this.miniatureManager?.setOverviewActive(true);
+        });
         this._onOverviewHiddenId = Main.overview.connect('hidden', () => {
             this.animationsManager.setOverviewActive(false);
+            this.miniatureManager?.setOverviewActive(false);
             this.windowHandler.onOverviewHidden();
         });
 
