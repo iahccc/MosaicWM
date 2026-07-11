@@ -51,6 +51,7 @@ This aligns with GNOME's philosophy of reducing cognitive load and letting users
 
 ### Other
 - **Keyboard Shortcuts**: Swap windows with keyboard (configurable)
+- **Window Hints**: Press <kbd>Super</kbd>+<kbd>W</kbd> to show letter labels over every visible window, then press its label to focus it
 - **Multi-Monitor**: Works across multiple displays (experimental)
 
 ### Quick Settings
@@ -91,6 +92,7 @@ Once enabled, the extension works automatically:
 - **Maximize/Fullscreen**: Window moves to its own workspace
 - **Minimize**: Window is excluded from tiling
 - **Too many windows**: Extra windows shrink into small thumbnails. Click one to bring it back to focus
+- **Focus by label**: Hold <kbd>Super</kbd> after pressing <kbd>Super</kbd>+<kbd>W</kbd>, then type the label displayed on a window. Releasing <kbd>Super</kbd> cancels the picker
 
 ### Prerequisites
 

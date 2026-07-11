@@ -37,6 +37,7 @@ import { MiniatureManager } from './miniature.js';
 import * as WindowState from './windowState.js';
 import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS, MINIATURE_OVERLAY } from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
+import { WindowHintsOverlay } from './windowHints.js';
 
 export default class WindowMosaicExtension extends Extension {
     constructor(metadata) {
@@ -62,6 +63,7 @@ export default class WindowMosaicExtension extends Extension {
         this.drawingManager = null;
         this.animationsManager = null;
         this.windowingManager = null;
+        this.windowHintsOverlay = null;
 
         // Handler classes
         this.windowHandler = null;
@@ -214,6 +216,7 @@ export default class WindowMosaicExtension extends Extension {
         this.drawingManager = new DrawingManager();
         this.animationsManager = new AnimationsManager();
         this.windowingManager = new WindowingManager();
+        this.windowHintsOverlay = new WindowHintsOverlay();
 
         // Wire up dependencies
         this.windowingManager.setEdgeTilingManager(this.edgeTilingManager);
@@ -815,6 +818,9 @@ export default class WindowMosaicExtension extends Extension {
         Main.wm.addKeybinding('swap-down', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
             () => this._swapActiveWindow('down'));
 
+        Main.wm.addKeybinding('window-hints', settings, Meta.KeyBindingFlags.NONE, Shell.ActionMode.NORMAL,
+            () => this.windowHintsOverlay?.toggle());
+
         Logger.log('All swap keybindings registered successfully');
         Logger.log('Keyboard shortcuts registered');
     }
@@ -908,7 +914,13 @@ export default class WindowMosaicExtension extends Extension {
         Main.wm.removeKeybinding('swap-right');
         Main.wm.removeKeybinding('swap-up');
         Main.wm.removeKeybinding('swap-down');
+        Main.wm.removeKeybinding('window-hints');
         Logger.log('Keyboard shortcuts removed');
+
+        if (this.windowHintsOverlay) {
+            this.windowHintsOverlay.destroy();
+            this.windowHintsOverlay = null;
+        }
 
         if (this.edgeTilingManager) this.edgeTilingManager.destroy();
         if (this.drawingManager) this.drawingManager.destroy();
@@ -1012,6 +1024,7 @@ export default class WindowMosaicExtension extends Extension {
         this.drawingManager = null;
         this.animationsManager = null;
         this.windowingManager = null;
+        this.windowHintsOverlay = null;
         this._timeoutRegistry = null;
         this._mutterSettings = null;
         this._settingsOverrider = null;

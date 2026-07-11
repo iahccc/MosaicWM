@@ -51,5 +51,10 @@
       <summary>Swap window downward</summary>
       <description>Swap the active window with its lower neighbor (quarter tiles only)</description>
     </key>
+    <key name="window-hints" type="as">
+      <default>['&lt;Super&gt;w']</default>
+      <summary>Focus a window by label</summary>
+      <description>Show letter labels over windows in the current workspace and focus the selected window</description>
+    </key>
   </schema>
 </schemalist>
