@@ -10,6 +10,7 @@ import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
 import { MINIATURE_ANIM_KIND } from './windowState.js';
 import { getAnimationsEnabled, getSlowDownFactor } from './timing.js';
+import { isWindowAlive } from './liveness.js';
 
 import GObject from 'gi://GObject';
 
@@ -468,6 +469,35 @@ export const AnimationsManager = GObject.registerClass({
         const id = window.get_id();
         this._pendingEntranceEases.delete(id);
         this.removeAnimatingWindow(id);
+    }
+
+    // A workspace move can unmap the actor and cancel its entrance ease. Complete
+    // that entrance before the move so opacity=0 and stale animation bookkeeping
+    // cannot follow the window into its destination workspace.
+    finishPendingEntrance(window, force = false) {
+        if (!force && !WindowState.get(window, 'pendingFirstPlacement'))
+            return false;
+
+        WindowState.remove(window, 'pendingFirstPlacement');
+        this.cancelPendingEntrance(window);
+        WindowState.set(window, 'isMosaicResizing', false);
+
+        const actor = isWindowAlive(window)
+            ? window.get_compositor_private()
+            : null;
+        if (actor && !actor.is_destroyed()) {
+            for (const property of [
+                'opacity',
+                'translation_x',
+                'translation_y',
+                'scale_x',
+                'scale_y',
+            ]) actor.remove_transition(property);
+            actor.set_translation(0, 0, 0);
+            actor.set_scale(1, 1);
+            actor.opacity = 255;
+        }
+        return true;
     }
 
     // No ease here means no onStopped to clear the flag, so give Mutter a

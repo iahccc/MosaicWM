@@ -797,6 +797,10 @@ export default class WindowMosaicExtension extends Extension {
         const pendingRestore = this._pendingWorkspaceHistoryRestore;
         if (!pendingRestore || pendingRestore.workspace !== workspace)
             return false;
+        if (!isWorkspaceAlive(workspace, this._workspaceManager)) {
+            this._pendingWorkspaceHistoryRestore = null;
+            return false;
+        }
         if (this._workspaceManager.get_active_workspace() !== workspace)
             return false;
 
@@ -819,10 +823,12 @@ export default class WindowMosaicExtension extends Extension {
         const pendingRestore = this._pendingWorkspaceHistoryRestore;
         if (!pendingRestore)
             return null;
+        if (!isWorkspaceAlive(pendingRestore.workspace, this._workspaceManager))
+            return null;
 
         const historyWindow = global.display.find_window_by_id?.(pendingRestore.windowId)
             ?? global.display.list_all_windows().find(w => w.get_id() === pendingRestore.windowId);
-        if (!historyWindow)
+        if (!isWindowAlive(historyWindow))
             return null;
         if (historyWindow.get_workspace() !== pendingRestore.workspace || historyWindow.get_monitor() !== pendingRestore.monitor)
             return null;

@@ -11,6 +11,7 @@ import * as WindowState from './windowState.js';
 import { IS_MINIATURE, ANIMATING_MINIATURE, MINIATURE_ANIM_KIND } from './windowState.js';
 import { getMiniatureSize } from './miniature.js';
 import { monotonicNow } from './timing.js';
+import { isWorkspaceAlive } from './liveness.js';
 
 import GObject from 'gi://GObject';
 
@@ -619,15 +620,15 @@ export const EdgeTilingManager = GObject.registerClass({
         }
     }
 
-    // A window exiled as sacred sits on its own workspace while its tiling stays behind on the
-    // one it came from, and that's where the windows it was tiled against are still waiting.
+    // A sacred window stays physically isolated while its logical cohort may be
+    // displaced more than once by later maximizations. The shared cohort always
+    // points at the workspace where its tiling partners are currently waiting.
     _tilingWorkspace(window) {
-        const originIndex = WindowState.get(window, 'maximizedUndoInfo')?.originalWorkspace;
-        if (originIndex === undefined) return window.get_workspace();
-
-        const wsManager = global.workspace_manager;
-        if (originIndex < 0 || originIndex >= wsManager.get_n_workspaces()) return window.get_workspace();
-        return wsManager.get_workspace_by_index(originIndex) ?? window.get_workspace();
+        const cohortWorkspace = WindowState.get(window, 'maximizedUndoInfo')
+            ?.sacredCohort?.workspaceRef;
+        return isWorkspaceAlive(cohortWorkspace, global.workspace_manager)
+            ? cohortWorkspace
+            : window.get_workspace();
     }
 
     // monitor is optional; the drag callers already work from a single monitor's work area.
@@ -1025,6 +1026,10 @@ export const EdgeTilingManager = GObject.registerClass({
     _evacuateMosaicToNewWorkspace(mosaicWindows, workspace, monitor) {
         Logger.log(`Both sides edge-tiled - moving ${mosaicWindows.length} mosaic windows to new workspace`);
         const newWorkspace = this._windowingManager.createOrReuseAdjacentWorkspace(workspace);
+        if (!newWorkspace) {
+            Logger.warn('Could not create a live workspace for the evacuated mosaic');
+            return;
+        }
 
         for (const mosaicWindow of mosaicWindows) {
             mosaicWindow.change_workspace(newWorkspace);

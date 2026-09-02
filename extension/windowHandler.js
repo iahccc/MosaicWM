@@ -14,7 +14,7 @@ import { TileZone } from './constants.js';
 import * as WindowState from './windowState.js';
 import { IS_MINIATURE } from './windowState.js';
 import { ComputedLayouts } from './mosaicModel.js';
-import { isWindowAlive } from './liveness.js';
+import { isWindowAlive, isWorkspaceAlive } from './liveness.js';
 import { afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow } from './timing.js';
 
 export const WindowHandler = GObject.registerClass({
@@ -71,7 +71,8 @@ export const WindowHandler = GObject.registerClass({
     // workspace, sacred, opening alone) can't take that bet: the failsafe a full
     // second later would be their only way back to visible.
     shouldSkipSlideIn(window) {
-        return WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
+        return WindowState.get(window, 'workspaceMoveEntranceGuard')
+            || WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
             || !this._ext.isMosaicEnabledForWorkspace(window.get_workspace())
             || this.windowingManager.isMaximizedOrFullscreen(window)
             || this.windowingManager.isExcludedByPolicy(window)
@@ -81,14 +82,7 @@ export const WindowHandler = GObject.registerClass({
     // Floating windows never enter the tile pass that would clear opacity=0;
     // reveal so the slide-in failsafe isn't their only path to visibility.
     revealPendingEntrance(window) {
-        if (!WindowState.get(window, 'pendingFirstPlacement')) return;
-        WindowState.remove(window, 'pendingFirstPlacement');
-        this.animationsManager.cancelPendingEntrance(window);
-        const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
-        if (actor && !actor.is_destroyed()) {
-            actor.remove_transition('opacity');
-            actor.opacity = 255;
-        }
+        this.animationsManager.finishPendingEntrance(window);
     }
 
     // Lock a workspace to prevent recursive or conflicting tiling triggers.
@@ -99,18 +93,24 @@ export const WindowHandler = GObject.registerClass({
         if (!workspace) return;
         const depth = (this._workspaceLocks.get(workspace) ?? 0) + 1;
         this._workspaceLocks.set(workspace, depth);
-        Logger.log(`Workspace ${workspace.index()} LOCKED for tiling (depth=${depth})`);
+        const index = isWorkspaceAlive(workspace, global.workspace_manager)
+            ? workspace.index()
+            : 'stale';
+        Logger.log(`Workspace ${index} LOCKED for tiling (depth=${depth})`);
     }
 
     unlockWorkspace(workspace) {
         if (!workspace) return;
         const depth = (this._workspaceLocks.get(workspace) ?? 0) - 1;
+        const index = isWorkspaceAlive(workspace, global.workspace_manager)
+            ? workspace.index()
+            : 'stale';
         if (depth <= 0) {
             this._workspaceLocks.delete(workspace);
-            Logger.log(`Workspace ${workspace.index()} UNLOCKED`);
+            Logger.log(`Workspace ${index} UNLOCKED`);
         } else {
             this._workspaceLocks.set(workspace, depth);
-            Logger.log(`Workspace ${workspace.index()} unlock (depth=${depth}, still locked)`);
+            Logger.log(`Workspace ${index} unlock (depth=${depth}, still locked)`);
         }
     }
 
@@ -219,8 +219,9 @@ export const WindowHandler = GObject.registerClass({
         WindowState.set(window, 'previousExclusionState', currentExclusion);
 
         const currentWorkspace = window.get_workspace();
-        if (currentWorkspace) {
+        if (isWorkspaceAlive(currentWorkspace, global.workspace_manager)) {
             WindowState.set(window, 'previousWorkspace', currentWorkspace.index());
+            WindowState.set(window, 'previousWorkspaceRef', currentWorkspace);
         }
     }
 
@@ -236,6 +237,7 @@ export const WindowHandler = GObject.registerClass({
 
         WindowState.remove(window, 'previousExclusionState');
         WindowState.remove(window, 'previousWorkspace');
+        WindowState.remove(window, 'previousWorkspaceRef');
     }
 
     _isFrameMonitorSized(win) {
@@ -473,10 +475,11 @@ export const WindowHandler = GObject.registerClass({
 
     // Brings back the most recently used miniature when space frees up. Shared by
     // the close, move and live-resize paths so they don't duplicate the fit check.
-    _tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
+    _tryAutoRestoreMiniature(remainingWindows, workspace, monitor,
+        { mruOrder = null } = {}) {
         if (!this._ext.miniatureManager) return false;
 
-        const mru  = this.windowingManager.getMRUOrder(workspace);
+        const mru = mruOrder ?? this.windowingManager.getMRUOrder(workspace);
         const rank = w => mru.get(w.get_id()) ?? Number.MAX_SAFE_INTEGER;
 
         // Ascending here, unlike the sacrifice sites: index 0 is the most recent,
@@ -492,7 +495,8 @@ export const WindowHandler = GObject.registerClass({
         // canRestoreMiniature only simulates, so falling through to the next candidate
         // costs nothing; the most recent may not fit while an older one still does.
         for (const candidate of miniatureWindows) {
-            if (!this._ext.tilingManager.canRestoreMiniature(candidate, remainingWindows, workArea)) {
+            if (!this._ext.tilingManager.canRestoreMiniature(
+                candidate, remainingWindows, workArea, { mruOrder: mru })) {
                 Logger.log(`_tryAutoRestoreMiniature: keeping mini ${candidate.get_id()}, would overflow if restored`);
                 continue;
             }
@@ -520,8 +524,12 @@ export const WindowHandler = GObject.registerClass({
     // as a side effect. Falling back to whatever ended up active resyncs the workspace the
     // reindex actually landed on, instead of silently dropping the retile pass.
     _resolveRetileWorkspace(workspace) {
-        if (workspace && workspace.index() >= 0) return workspace;
-        return global.workspace_manager.get_active_workspace();
+        const workspaceManager = global.workspace_manager;
+        if (isWorkspaceAlive(workspace, workspaceManager)) return workspace;
+        const activeWorkspace = workspaceManager.get_active_workspace();
+        return isWorkspaceAlive(activeWorkspace, workspaceManager)
+            ? activeWorkspace
+            : null;
     }
 
     _retileAfterWindowGone(removedWindow, remainingWindows, workspace, monitor, freedWidth, freedHeight, options = {}) {
@@ -783,11 +791,15 @@ export const WindowHandler = GObject.registerClass({
     // Recover from a workspace removed mid-flight (async smart resize can leave index -1),
     // falling back to the window's current one; {skip:true} when there's nowhere valid.
     _resolveQueueItemWorkspace(window, workspace) {
-        if (workspace.index() >= 0) return { skip: false, workspace };
+        const workspaceManager = global.workspace_manager;
+        if (isWorkspaceAlive(workspace, workspaceManager))
+            return { skip: false, workspace };
+        if (!isWindowAlive(window))
+            return { skip: true };
 
         const currentWorkspace = window.get_workspace();
-        if (currentWorkspace && currentWorkspace.index() >= 0) {
-            Logger.log(`Evaluation queue: stale workspace (index -1), using window's current WS-${currentWorkspace.index()}`);
+        if (isWorkspaceAlive(currentWorkspace, workspaceManager)) {
+            Logger.log(`Evaluation queue: stale workspace, using window's current WS-${currentWorkspace.index()}`);
             return { skip: false, workspace: currentWorkspace };
         }
         Logger.log(`Evaluation queue: window ${window.get_id()} has invalid workspace, skipping`);
@@ -799,13 +811,19 @@ export const WindowHandler = GObject.registerClass({
     // in-flight cascade), else keep cascading this batch's overflow. Returns that workspace.
     _applyQueueCascade(window, workspace, arrivedFromDnD, state, overflowedWorkspaces) {
         const activeWorkspace = this.windowingManager.getWorkspace();
+        const workspaceManager = global.workspace_manager;
 
         // A drop is a destination the user chose, so "they navigated away" doesn't apply; without
         // this the overview drag lands the window and the cascade immediately drags it back.
         const droppedByUser = arrivedFromDnD;
 
-        if (!droppedByUser && activeWorkspace && state.batchActiveWorkspace &&
-            activeWorkspace.index() !== state.batchActiveWorkspace.index()) {
+        if (!isWorkspaceAlive(state.lastOverflowWorkspace, workspaceManager))
+            state.lastOverflowWorkspace = null;
+
+        const batchWorkspaceAlive = isWorkspaceAlive(
+            state.batchActiveWorkspace, workspaceManager);
+        if (!droppedByUser && isWorkspaceAlive(activeWorkspace, workspaceManager) &&
+            batchWorkspaceAlive && activeWorkspace !== state.batchActiveWorkspace) {
             Logger.log(`Evaluation queue: User switched to WS-${activeWorkspace.index()} during processing (batch started on WS-${state.batchActiveWorkspace.index()}) - following user`);
             state.lastOverflowWorkspace = null;
             overflowedWorkspaces.clear();
@@ -820,14 +838,19 @@ export const WindowHandler = GObject.registerClass({
     }
 
     _cascadeToOverflow(window, workspace, state, overflowedWorkspaces) {
-        // Stop cascading once the overflow destination itself failed, or it loops.
-        if (overflowedWorkspaces.has(state.lastOverflowWorkspace.index())) {
-            Logger.log(`Evaluation queue: overflow destination WS-${state.lastOverflowWorkspace.index()} already failed - stopping cascade, window ${window.get_id()} stays on WS-${workspace.index()}`);
+        const dest = state.lastOverflowWorkspace;
+        if (!isWorkspaceAlive(dest, global.workspace_manager)) {
             state.lastOverflowWorkspace = null;
             return workspace;
         }
 
-        const dest = state.lastOverflowWorkspace;
+        // Stop cascading once the overflow destination itself failed, or it loops.
+        if (overflowedWorkspaces.has(dest)) {
+            Logger.log(`Evaluation queue: overflow destination WS-${dest.index()} already failed - stopping cascade, window ${window.get_id()} stays on WS-${workspace.index()}`);
+            state.lastOverflowWorkspace = null;
+            return workspace;
+        }
+
         Logger.log(`Evaluation queue: cascading window ${window.get_id()} to overflow destination WS-${dest.index()}`);
         if (window.get_workspace() !== dest) {
             WindowState.set(window, 'movedByOverflow', true);
@@ -839,10 +862,18 @@ export const WindowHandler = GObject.registerClass({
     async _evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD, state, overflowedWorkspaces) {
         try {
             const resultWorkspace = await this._ensureWindowFits(window, workspace, monitor, arrivedFromDnD);
-            if (resultWorkspace && resultWorkspace.index() !== workspace.index()) {
-                overflowedWorkspaces.add(workspace.index());
+            if (!isWindowAlive(window)) return;
+
+            if (isWorkspaceAlive(resultWorkspace, global.workspace_manager) &&
+                resultWorkspace !== workspace) {
+                if (isWorkspaceAlive(workspace, global.workspace_manager))
+                    overflowedWorkspaces.add(workspace);
                 state.lastOverflowWorkspace = resultWorkspace;
             }
+
+            const resolved = this._resolveQueueItemWorkspace(window, workspace);
+            if (resolved.skip) return;
+            workspace = resolved.workspace;
 
             const managedWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
                 .filter(w => !this.windowingManager.isExcluded(w) && !WindowState.get(w, 'pendingInQueue'));
@@ -856,13 +887,19 @@ export const WindowHandler = GObject.registerClass({
     }
 
     _renavigateIfTrulyEmpty(window, workspace, monitor, state) {
+        if (!isWorkspaceAlive(workspace, global.workspace_manager)) return;
+
         // Don't renavigate a workspace that's empty only because overflow is mid-transition.
-        const isEjectedByOverflow = state.lastOverflowWorkspace && state.lastOverflowWorkspace.index() !== workspace.index();
+        const overflowWorkspace = isWorkspaceAlive(
+            state.lastOverflowWorkspace, global.workspace_manager)
+            ? state.lastOverflowWorkspace
+            : null;
+        const isEjectedByOverflow = overflowWorkspace && overflowWorkspace !== workspace;
         if (!isEjectedByOverflow) {
             Logger.log(`Queue: Window ${window.get_id()} moved and left WS-${workspace.index()} empty - renavigating`);
             this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
         } else {
-            Logger.log(`Queue: WS-${workspace.index()} empty due to overflow - skipping renavigate to stay on WS-${state.lastOverflowWorkspace.index()}`);
+            Logger.log(`Queue: WS-${workspace.index()} empty due to overflow - skipping renavigate to stay on WS-${overflowWorkspace.index()}`);
         }
     }
 
@@ -1274,6 +1311,10 @@ export const WindowHandler = GObject.registerClass({
             return;
         }
 
+        // Sacred isolation moves existing windows as one batch and owns the
+        // destination retile; do not enqueue one arrival pass per sibling.
+        if (WindowState.get(window, 'movedBySacred')) return;
+
         // Going on-all-workspaces (sticky, or landing on a secondary monitor under
         // workspaces-only-on-primary) re-adds the window to every workspace at once.
         // It isn't arriving anywhere; the monitor signals own its placement, and
@@ -1318,9 +1359,7 @@ export const WindowHandler = GObject.registerClass({
                         scheduleFirstPlacementFailsafe();
                         return GLib.SOURCE_REMOVE;
                     }
-                    WindowState.remove(window, 'pendingFirstPlacement');
-                    const a = isWindowAlive(window) ? window.get_compositor_private() : null;
-                    if (a && !a.is_destroyed()) a.opacity = 255;
+                    this.revealPendingEntrance(window);
                     return GLib.SOURCE_REMOVE;
                 }, 'windowHandler_firstPlacementFailsafe');
             };
@@ -1356,7 +1395,11 @@ export const WindowHandler = GObject.registerClass({
                     WindowState.remove(WINDOW, 'arrivalPending');
                     return GLib.SOURCE_REMOVE;
                 }
-                return this.waitForGeometry(WINDOW, WORKSPACE, MONITOR);
+                const liveWorkspace = WINDOW.get_workspace();
+                if (!isWorkspaceAlive(liveWorkspace, global.workspace_manager))
+                    return GLib.SOURCE_CONTINUE;
+                return this.waitForGeometry(
+                    WINDOW, liveWorkspace, WINDOW.get_monitor());
             }, 'windowHandler_geometryCheck');
 
             return true;
@@ -1373,21 +1416,38 @@ export const WindowHandler = GObject.registerClass({
     // Detect a DnD across workspaces: window was just removed from a different
     // workspace within SAFETY_TIMEOUT_BUFFER_MS, so this add is the drop side.
     _handleCrossWorkspaceDnD(WINDOW, WORKSPACE) {
-        const previousWorkspaceIndex = WindowState.get(WINDOW, 'previousWorkspace');
         const removedTimestamp = WindowState.get(WINDOW, 'removedTimestamp');
         const timeSinceRemoved = removedTimestamp ? monotonicNow() - removedTimestamp : Infinity;
 
-        const isCrossWorkspaceDrop = previousWorkspaceIndex !== undefined
-            && previousWorkspaceIndex !== WORKSPACE.index()
-            && timeSinceRemoved < constants.SAFETY_TIMEOUT_BUFFER_MS;
+        const isCrossWorkspaceDrop = this._movedAcrossWorkspaces(WINDOW, WORKSPACE) &&
+            timeSinceRemoved < constants.SAFETY_TIMEOUT_BUFFER_MS;
         if (!isCrossWorkspaceDrop || WindowState.get(WINDOW, 'movedByOverflow')) return;
 
         // Mark as DnD arrival; triggers expansion after tiling
         WindowState.set(WINDOW, 'arrivedFromDnD', true);
 
         WindowState.remove(WINDOW, 'previousWorkspace');
+        WindowState.remove(WINDOW, 'previousWorkspaceRef');
         WindowState.remove(WINDOW, 'removedTimestamp');
         WindowState.remove(WINDOW, 'manualWorkspaceMove');
+    }
+
+    _movedAcrossWorkspaces(window, workspace) {
+        const previousWorkspaceRef = WindowState.get(window, 'previousWorkspaceRef');
+        if (previousWorkspaceRef) return previousWorkspaceRef !== workspace;
+
+        const previousWorkspaceIndex = WindowState.get(window, 'previousWorkspace');
+        if (previousWorkspaceIndex === undefined ||
+            !isWorkspaceAlive(workspace, global.workspace_manager)) return false;
+        return previousWorkspaceIndex !== workspace.index();
+    }
+
+    _rememberRemovedWorkspace(window, workspace) {
+        WindowState.set(window, 'previousWorkspaceRef', workspace);
+        if (isWorkspaceAlive(workspace, global.workspace_manager))
+            WindowState.set(window, 'previousWorkspace', workspace.index());
+        else
+            WindowState.remove(window, 'previousWorkspace');
     }
 
     onWindowRemoved(workspace, window) {
@@ -1395,6 +1455,10 @@ export const WindowHandler = GObject.registerClass({
         if (!this._ext.windowingManager.isRelated(window)) {
             return;
         }
+
+        // The sacred batch explicitly retiles after all moves settle. Running the
+        // normal removal path here would clear resize state and retile per sibling.
+        if (WindowState.get(window, 'movedBySacred')) return;
 
         // On destroy, both the 'unmanaged' handler and the workspace
         // 'window-removed' signal land here, so dedupe to keep the retile/restore
@@ -1407,7 +1471,7 @@ export const WindowHandler = GObject.registerClass({
         }
         WindowState.set(window, 'removalHandledAt', now);
 
-        WindowState.set(window, 'previousWorkspace', workspace.index());
+        this._rememberRemovedWorkspace(window, workspace);
         WindowState.set(window, 'removedTimestamp', now);
 
         const wasMovedByOverflow = WindowState.get(window, 'movedByOverflow');
@@ -1509,6 +1573,7 @@ export const WindowHandler = GObject.registerClass({
 
             if (WindowState.get(WINDOW, 'movedByOverflow')) {
                 Logger.log('Skipping early tile in waitForGeometry - window was moved by overflow (Flags cleared to prevent leakage)');
+                this.revealPendingEntrance(WINDOW);
                 WindowState.remove(WINDOW, 'movedByOverflow');
                 WindowState.remove(WINDOW, 'arrivalPending');
                 return GLib.SOURCE_REMOVE;
@@ -1523,18 +1588,27 @@ export const WindowHandler = GObject.registerClass({
             }
 
             const performTiling = async () => {
+                if (!isWindowAlive(WINDOW)) return;
                 if (WindowState.get(WINDOW, 'movedByOverflow')) {
                     Logger.log('Skipping duplicate evaluation queueing - window was already evaluated and moved by overflow');
                     WindowState.remove(WINDOW, 'arrivalPending');
                     return;
                 }
-                this.enqueueWindowForEvaluation(WINDOW, WORKSPACE, MONITOR);
+                const liveWorkspace = WINDOW.get_workspace();
+                if (!isWorkspaceAlive(liveWorkspace, global.workspace_manager)) {
+                    WindowState.remove(WINDOW, 'arrivalPending');
+                    return;
+                }
+                this.enqueueWindowForEvaluation(
+                    WINDOW, liveWorkspace, WINDOW.get_monitor());
             };
 
             const isDnDArrival = WindowState.get(WINDOW, 'arrivedFromDnD');
-            const previousWorkspaceIndex = WindowState.get(WINDOW, 'previousWorkspace');
+            const movedAcrossWorkspaces = this._movedAcrossWorkspaces(
+                WINDOW, WORKSPACE);
 
-            if (isDnDArrival || WindowState.get(WINDOW, 'movedByOverflow') || (previousWorkspaceIndex !== undefined && previousWorkspaceIndex !== WORKSPACE.index())) {
+            if (isDnDArrival || WindowState.get(WINDOW, 'movedByOverflow') ||
+                movedAcrossWorkspaces) {
                 Logger.log('Cross-workspace move: Waiting for workspace animation');
                 afterWorkspaceSwitch(performTiling, this._ext._timeoutRegistry);
             } else {
