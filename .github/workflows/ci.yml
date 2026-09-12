@@ -17,6 +17,7 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run lint
+      - run: npm run test:unit
 
   shexli:
     name: Shexli
@@ -28,11 +29,32 @@ jobs:
           python-version: "3.12"
       # tree-sitter 0.26 breaks ABI with the 0.25 javascript grammar shexli ships, which segfaults the parser
       - run: pip install shexli "tree-sitter<0.26"
+      # shexli 0.2.1 hard-codes 50 as its newest plausible Shell version; its
+      # EGO-M-004 report for 51 is currently a metadata false positive.
       - run: shexli ${{ github.workspace }}/extension/
 
   build:
-    name: Build
+    name: GNOME 51 build and regression
     runs-on: ubuntu-latest
+    container: fedora:45
     steps:
       - uses: actions/checkout@v4
+      # firefox is here for test-firefox-miniature.js, which declares it as required: this job
+      # means to run every regression, so a missing binary must fail rather than be skipped.
+      - run: dnf install -y zip gnome-shell dbus-daemon mesa-dri-drivers alacritty firefox
+      - run: glib-compile-schemas --strict --dry-run extension/schemas
       - run: bash scripts/build.sh -b
+      # "all" enumerates scripts/test-*.js, so a new regression cannot be added without a
+      # runner. Naming three files here is what left test-constrained-model-slot,
+      # test-solo-monitor-sized-admission, test-firefox-miniature, test-reinclude-local and
+      # test-unmaximize-animation unreferenced.
+      #
+      # HEADLESS_REQUIRE_ALL turns a skipped regression into a failure: this job is the one
+      # place that is supposed to cover everything, and a silent skip is how coverage rots.
+      - run: bash scripts/test-headless.sh all
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          HEADLESS_REQUIRE_ALL: "1"
+      - run: MOSAIC_TEST_MULTI_MONITOR=1 bash scripts/test-headless.sh test-maximized-layout.js
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"

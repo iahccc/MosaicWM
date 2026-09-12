@@ -60,8 +60,10 @@ export class MosaicRenderer {
         for (const member of group.members()) {
             if (!isWindowAlive(member.window)) continue;
             // createMiniature drives the miniature through the actor's scale, so moving the
-            // frame here would compound on top of it.
-            if (WindowState.get(member.window, IS_MINIATURE)) continue;
+            // frame here would compound on top of it. A native restore also owns its frame
+            // until Shell finishes; its reserved layout slot is applied afterwards.
+            if (WindowState.get(member.window, IS_MINIATURE) ||
+                WindowState.get(member.window, WindowState.NATIVE_SIZE_RETURN)) continue;
             const r = member.region;
             MosaicConstraints.commitRegion(member.window, r);
             applied++;

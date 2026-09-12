@@ -7,6 +7,7 @@ import Meta from 'gi://Meta';
 import Clutter from 'gi://Clutter';
 import * as Logger from './logger.js';
 import { TileZone } from './constants.js';
+import { isWindowAlive } from './liveness.js';
 import { isResizeGrabOp, isMoveGrabOp } from './grabOps.js';
 import * as constants from './constants.js';
 import { afterAnimations } from './timing.js';
@@ -269,6 +270,11 @@ export const DragHandler = GObject.registerClass({
         }
 
         Logger.log(`Edge tiling: applying zone ${this._currentZone}`);
+        if (this._currentZone === TileZone.MAXIMIZE) {
+            this._dropByMaximizing(window);
+            return;
+        }
+
         const occupiedWindow = this.edgeTilingManager.getWindowInZone(this._currentZone, workspace, monitor);
 
         if (occupiedWindow && occupiedWindow.get_id() !== window.get_id()) {
@@ -296,6 +302,37 @@ export const DragHandler = GObject.registerClass({
             this._restorePreviewMiniatures();
             this._skipNextTiling = null;
         }
+    }
+
+    _dropByMaximizing(window) {
+        if (!window.can_maximize()) {
+            Logger.log(`DnD: window ${window.get_id()} cannot maximize; cancelling top-edge drop`);
+            this._restorePreviewMiniatures();
+            return;
+        }
+
+        // grab-op-end is still dispatching here. Asking Mutter to maximize synchronously while
+        // the move grab is being torn down can defer the native state change, leaving a full-size
+        // edge-tile presentation behind in the meantime. Skip the generic drag retile once, keep
+        // the preview presentation, and issue only the native state transition on the next idle.
+        this._skipNextTiling = window.get_id();
+        const previewMiniatures = this._previewMiniaturizedWindows;
+        this._previewMiniaturizedWindows = [];
+        this._timeoutRegistry.addIdle(() => {
+            this._skipNextTiling = null;
+            if (!isWindowAlive(window)) {
+                // The maximized presentation these previews were waiting for will never arrive;
+                // hand them back instead of leaving them frozen in preview scale.
+                if (this._previewMiniaturizedWindows.length === 0)
+                    this._previewMiniaturizedWindows = previewMiniatures;
+                this._restorePreviewMiniatures();
+                return GLib.SOURCE_REMOVE;
+            }
+
+            Logger.log(`DnD: committing native maximize for ${window.get_id()}`);
+            window.maximize();
+            return GLib.SOURCE_REMOVE;
+        }, 'dragHandler_nativeMaximize');
     }
 
     _dropByTiling(window, workArea) {
