@@ -474,6 +474,31 @@ export const EdgeTilingManager = GObject.registerClass({
         return state && state.zone !== TileZone.NONE;
     }
 
+    // Dominant mode owns the whole non-edge layout. Drop this window's edge ownership
+    // without restoring its old frame; the dominant layout will place it immediately.
+    // Preserve the pre-tile size as preferred intent so leaving dominance has a natural size.
+    releaseForDominance(window) {
+        const state = WindowState.get(window, 'edgeTilingState');
+        if (!state || state.zone === TileZone.NONE) return false;
+
+        this._lastRemoveTileAt = monotonicNow();
+        this._removeResizeListener(window);
+        WindowState.remove(window, 'edgeTilingState');
+        WindowState.set(window, 'preferredSize', { width: state.width, height: state.height });
+        WindowState.remove(window, 'targetRestoredSize');
+        WindowState.remove(window, 'actualMinWidth');
+        WindowState.remove(window, 'actualMinHeight');
+        WindowState.remove(window, 'targetSmartResizeSize');
+        WindowState.set(window, 'isConstrainedByMosaic', false);
+
+        this._releaseAutoTileLinks(window);
+        if (this._isQuarterZone(state.zone))
+            this._expandAdjacentQuarterToFull(window, state.zone);
+
+        Logger.log(`[DOMINANT] Released edge tile ${window.get_id()} from zone ${state.zone}`);
+        return true;
+    }
+
     // Entry of the keyboard contract, split between the two arrow axes below. Maximized is
     // answered before the zone is even read, since a window maximized off a tile keeps its zone.
     resolveArrowIntent(window, direction) {
@@ -481,7 +506,7 @@ export const EdgeTilingManager = GObject.registerClass({
 
         if (window.is_maximized()) {
             if (direction === 'up') return { kind: 'none' };
-            // Only unmaximize; the sacred path repositions it once the maximized flag clears.
+            // Only unmaximize; the normal layout path owns placement once the flag clears.
             if (direction === 'down') return { kind: 'unmaximize' };
             return this._keyboardTileIntent(window, direction);
         }
@@ -617,17 +642,6 @@ export const EdgeTilingManager = GObject.registerClass({
         } else {
             return TileZone.RIGHT_FULL;
         }
-    }
-
-    // A window exiled as sacred sits on its own workspace while its tiling stays behind on the
-    // one it came from, and that's where the windows it was tiled against are still waiting.
-    _tilingWorkspace(window) {
-        const originIndex = WindowState.get(window, 'maximizedUndoInfo')?.originalWorkspace;
-        if (originIndex === undefined) return window.get_workspace();
-
-        const wsManager = global.workspace_manager;
-        if (originIndex < 0 || originIndex >= wsManager.get_n_workspaces()) return window.get_workspace();
-        return wsManager.get_workspace_by_index(originIndex) ?? window.get_workspace();
     }
 
     // monitor is optional; the drag callers already work from a single monitor's work area.
@@ -939,8 +953,7 @@ export const EdgeTilingManager = GObject.registerClass({
             (now - this._lastRemoveTileAt) < constants.EDGE_TILE_EXIT_SUPPRESSION_MS;
     }
 
-    // A window leaving the workspace takes its auto-tiled companions back to the mosaic with it.
-    // Maximizing never untiles, so the sacred path has to ask for this on its own.
+    // A window leaving an auto-tile group takes its dependents back to the mosaic with it.
     releaseAutoTileDependents(window) {
         const dependents = WindowState.get(window, 'autoTileDependents');
         if (!dependents || dependents.size === 0) return;
@@ -969,14 +982,6 @@ export const EdgeTilingManager = GObject.registerClass({
         }
     }
 
-    // Maximizing never untiles, so without this the vacated quarter stays dead space: the mosaic
-    // only ever gets the opposite side, and the window stacked against it can't reach it either.
-    expandQuarterPartner(window) {
-        const zone = this.getWindowState(window)?.zone;
-        if (!zone || !this._isQuarterZone(zone)) return;
-        this._expandAdjacentQuarterToFull(window, zone);
-    }
-
     // The quarter stacked against the one leaving has the whole side to itself now.
     _expandAdjacentQuarterToFull(window, savedZone) {
         Logger.log(`Quarter tile ${window.get_id()} leaving zone ${savedZone}`);
@@ -984,7 +989,7 @@ export const EdgeTilingManager = GObject.registerClass({
         const adjacentZone = this._getAdjacentQuarterZone(savedZone);
         if (!adjacentZone) return;
 
-        const workspace = this._tilingWorkspace(window);
+        const workspace = window.get_workspace();
         const monitor = window.get_monitor();
         const adjacentWindow = this._findWindowInZone(adjacentZone, workspace, monitor);
         if (!adjacentWindow) return;
@@ -1039,46 +1044,6 @@ export const EdgeTilingManager = GObject.registerClass({
 
         newWorkspace.activate(global.get_current_time());
         this._windowingManager.showWorkspaceSwitcher(newWorkspace, monitor);
-    }
-
-    // Same pairing applyTile makes, minus the overflow check around it: a window that returns
-    // from its sacred workspace still carries its zone, so no tile ever lands to trigger one.
-    tryPairMosaicIntoOppositeHalf(tiledWindow) {
-        const zone = this.getWindowState(tiledWindow)?.zone;
-        if (!zone) return false;
-
-        // Still maximized means no free half, and its frame would size the pair down to nothing.
-        if (tiledWindow.is_maximized()) return false;
-
-        const workspace = tiledWindow.get_workspace();
-        if (!workspace) return false;
-        const monitor = tiledWindow.get_monitor();
-
-        const mosaicWindows = this.getNonEdgeTiledWindows(workspace, monitor);
-        if (mosaicWindows.length !== 1) return false;
-
-        return this._tryPairIntoOppositeHalf(mosaicWindows[0], tiledWindow, zone,
-            workspace.get_work_area_for_monitor(monitor));
-    }
-
-    // Counterpart of the expansion on exile: the quarter this window was stacked against took the
-    // whole side while it was away, so reclaiming the tile means splitting that side in two again.
-    tryRestoreQuarterPartner(returningWindow) {
-        const zone = this.getWindowState(returningWindow)?.zone;
-        if (!zone || !this._isQuarterZone(zone)) return false;
-
-        // Still sacred means the safety timeout forced the return before the unmaximize landed.
-        if (returningWindow.is_maximized() || returningWindow.is_fullscreen()) return false;
-
-        const workspace = returningWindow.get_workspace();
-        if (!workspace) return false;
-        const monitor = returningWindow.get_monitor();
-
-        const fullZone = this._getFullZoneFromQuarter(zone);
-        if (!this._findWindowInZone(fullZone, workspace, monitor)) return false;
-
-        Logger.log(`Re-splitting zone ${fullZone} to give ${returningWindow.get_id()} its quarter back`);
-        return this.applyTile(returningWindow, zone, workspace.get_work_area_for_monitor(monitor), true);
     }
 
     _tryPairIntoOppositeHalf(mosaicWindow, tiledWindow, zone, workArea) {

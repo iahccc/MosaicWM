@@ -3,7 +3,7 @@
 // Custom layout strategy to preserve mosaic geometry in Overview
 
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
-import { ComputedLayouts } from './mosaicModel.js';
+import { MosaicModel } from './mosaicModel.js';
 import { WINDOW_SPACING } from './constants.js';
 
 // Scales down the layout instead of reorganizing windows (preserves spatial memory)
@@ -78,7 +78,7 @@ export class MosaicLayoutStrategy extends Workspace.LayoutStrategy {
 
             // The mosaic's computed layout beats the live frame; mid-animation the frame is
             // a transient size and the overview would mirror the blur.
-            const rect = ComputedLayouts.get(mw) || mw.get_frame_rect();
+            const rect = MosaicModel.presentationSlotFor(mw) || mw.get_frame_rect();
             if (!rect) continue;
 
             const x = (rect.x - workArea.x) * scale + area.x + offsetX + gap;

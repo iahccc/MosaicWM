@@ -90,13 +90,11 @@ export const PIN_OVERFLOW_GRACE_MS = 300; // Overflow must survive this long bef
 export const ISRESIZING_FLAG_RESET_MS = 2;
 // Mutter can skip the size-changed confirmation on a fast maximize/unmaximize
 // toggle, so force the move after this long instead of leaving the window stuck.
-export const SACRED_RESTORE_SAFETY_TIMEOUT_MS = 1500;
 // New windows fire both window-created and window-added, which would otherwise
 // evaluate them twice. Skip a re-enqueue if we just evaluated this window.
 export const DUPLICATE_EVALUATION_WINDOW_MS = 300;
 // Wait this long after a maximize before isolating the window, so a quick
 // maximize/unmaximize toggle never even starts the move.
-export const SACRED_ENTER_DEBOUNCE_MS = 200;
 
 export const ANIMATION_DIFF_THRESHOLD = 10;
 

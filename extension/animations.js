@@ -28,7 +28,11 @@ export const AnimationsManager = GObject.registerClass({
         this._isDragging = false;
         this._animatingWindows = new Map(); // Window ID -> actor, drives animations-completed signal
         this._animatingTargets = new Map(); // Window ID -> last targetRect, to detect redundant retile calls
-        this._pendingEntranceEases = new Map(); // Window ID -> ease params, for entrances deferred until the actor is mapped
+        // First-placement entrances stay hidden until the logical frame and compositor actor
+        // both represent the presentation Mosaic planned. Mapping/frame_rect alone is not
+        // enough: slow Wayland clients can still be painting their old oversized buffer after
+        // move_resize_frame(), which would cover siblings that have already moved aside.
+        this._pendingEntranceEases = new Map(); // Window ID -> {windowActor, targetRect, ...ease params}
         this._justEndedDrag = false;
         this._resizingWindowId = null;
         this._timeoutRegistry = null;
@@ -63,7 +67,8 @@ export const AnimationsManager = GObject.registerClass({
         for (const [id, actor] of this._animatingWindows) {
             let stale;
             try {
-                stale = !actor || actor.is_destroyed() || !actor.get_transition('translation_x');
+                stale = !actor || actor.is_destroyed() ||
+                    (!this._pendingEntranceEases.has(id) && !actor.get_transition('translation_x'));
             } catch (_e) {
                 // Actor's underlying GObject was fully disposed (e.g. window destroyed
                 // mid-animation), not merely Clutter-destroyed, so any method call
@@ -179,7 +184,7 @@ export const AnimationsManager = GObject.registerClass({
         const animationMode = this._pickAnimationMode({ mode, subtle, firstPlacement });
 
         const { initialTx, initialTy, initialScaleX, initialScaleY } = this._computeInitialTransform(
-            { currentFrame, currentTx, currentTy, currentScaleX, currentScaleY, targetRect, slideInOffset });
+            { currentFrame, currentTx, currentTy, currentScaleX, currentScaleY, targetRect, slideInOffset, firstPlacement });
 
         WindowState.set(window, 'isMosaicResizing', true);
         // A pure move applies to the actor's allocation immediately, but a Wayland
@@ -200,13 +205,13 @@ export const AnimationsManager = GObject.registerClass({
 
         const easeParams = { effectiveDuration, animationMode, skipScale, firstPlacement, onComplete };
 
-        // Clutter silently skips implicit transitions on actors that aren't mapped yet
-        // (should_skip_implicit_transition in clutter-actor.c) and just snaps to the
-        // final value. A first placement can easily run this early since this pipeline
-        // outpaces the actor's own mapping, so defer until onWindowCreated (windowHandler.js)
-        // confirms it's mapped, instead of calling ease() now and having it get skipped.
-        if (firstPlacement && !windowActor.mapped) {
-            this._pendingEntranceEases.set(window.get_id(), { windowActor, ...easeParams });
+        // First placement is a visibility transaction. Clutter cannot ease an unmapped actor,
+        // and a mapped Wayland actor may still carry the pre-layout buffer while its configure
+        // request is in flight. Keep it hidden until both conditions are true so the planned
+        // sibling/miniature geometry can never be exposed next to a stale oversized entrant.
+        if (firstPlacement &&
+            (!windowActor.mapped || !this._firstPlacementPresentationReady(window, windowActor, targetRect))) {
+            this._storeDeferredEntrance(window, windowActor, targetRect, easeParams);
             return;
         }
 
@@ -223,23 +228,98 @@ export const AnimationsManager = GObject.registerClass({
         }
 
         WindowState.set(window, 'isMosaicResizing', true);
+        const actor = window.get_compositor_private();
+        if (firstPlacement && actor) actor.opacity = 0;
         window.move_resize_frame(userOp, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+
+        if (firstPlacement && this._deferOrFinishInstantFirstPlacement(
+            window, actor, targetRect, onComplete)) return;
         this._clearMosaicResizingSoon(window);
-        if (firstPlacement) {
-            WindowState.remove(window, 'pendingFirstPlacement');
-            const actor = window.get_compositor_private();
-            if (actor) actor.opacity = 255;
-        }
         if (onComplete) onComplete();
+    }
+
+    _deferOrFinishInstantFirstPlacement(window, actor, targetRect, onComplete) {
+        if (!actor?.mapped || !this._firstPlacementPresentationReady(window, actor, targetRect)) {
+            this._storeDeferredEntrance(window, actor, targetRect,
+                this._instantEntranceParams(onComplete));
+            return true;
+        }
+        WindowState.remove(window, 'pendingFirstPlacement');
+        actor.opacity = 255;
+        return false;
     }
 
     _applyNoActor(window, targetRect, { firstPlacement, onComplete }) {
         Logger.log(`No actor for window ${window.get_id()}, skipping animation`);
         WindowState.set(window, 'isMosaicResizing', true);
         window.move_resize_frame(false, targetRect.x, targetRect.y, targetRect.width, targetRect.height);
+        if (firstPlacement) {
+            this._storeDeferredEntrance(window, null, targetRect,
+                this._instantEntranceParams(onComplete));
+            return;
+        }
         this._clearMosaicResizingSoon(window);
-        if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
         if (onComplete) onComplete();
+    }
+
+    _instantEntranceParams(onComplete) {
+        return {
+            effectiveDuration: 0,
+            animationMode: ANIMATION_MODE_SUBTLE,
+            skipScale: true,
+            firstPlacement: true,
+            onComplete,
+        };
+    }
+
+    _storeDeferredEntrance(window, windowActor, targetRect, easeParams) {
+        const id = window.get_id();
+        const previous = this._pendingEntranceEases.get(id);
+        if (previous) this._disconnectDeferredEntranceRetry(previous);
+
+        const pending = {
+            windowActor,
+            targetRect: {...targetRect},
+            ...easeParams,
+        };
+        this._pendingEntranceEases.set(id, pending);
+        this._armDeferredEntranceRetry(window, pending);
+        if (windowActor) this._animatingWindows.set(id, windowActor);
+        this._animatingTargets.set(id, targetRect);
+        const live = window.get_frame_rect();
+        Logger.log(`[ANIM] Deferring first placement ${id}: mapped=${windowActor?.mapped ?? false}, live=${live.width}x${live.height}@${live.x},${live.y}, target=${targetRect.width}x${targetRect.height}@${targetRect.x},${targetRect.y}`);
+    }
+
+    _armDeferredEntranceRetry(window, pending) {
+        const actor = pending.windowActor;
+        if (!actor || actor.is_destroyed() || pending.allocationSignalId) return;
+
+        // MetaWindow::size-changed fires as soon as the logical frame reaches the configure
+        // target, but Wayland clients can still be presenting the previous buffer for another
+        // compositor frame. Clutter updates the window actor allocation when that buffer catches
+        // up, which is the presentation-level event the entrance gate actually depends on.
+        pending.allocationSignalId = actor.connect('notify::allocation', () => {
+            if (this._pendingEntranceEases.get(window.get_id()) !== pending) return;
+            this.runDeferredEntrance(window);
+        });
+    }
+
+    _disconnectDeferredEntranceRetry(pending) {
+        if (!pending?.allocationSignalId || !pending.windowActor) return;
+        try {
+            pending.windowActor.disconnect(pending.allocationSignalId);
+        } catch (_e) {
+            // Actor may already have been disposed with the window.
+        }
+        pending.allocationSignalId = 0;
+    }
+
+    _clearDeferredEntrance(windowId) {
+        const pending = this._pendingEntranceEases.get(windowId);
+        if (!pending) return null;
+        this._disconnectDeferredEntranceRetry(pending);
+        this._pendingEntranceEases.delete(windowId);
+        return pending;
     }
 
     // Redundant retile to the same destination already in flight (e.g. the
@@ -264,7 +344,7 @@ export const AnimationsManager = GObject.registerClass({
         return ANIMATION_MODE;
     }
 
-    _computeInitialTransform({ currentFrame, currentTx, currentTy, currentScaleX, currentScaleY, targetRect, slideInOffset }) {
+    _computeInitialTransform({ currentFrame, currentTx, currentTy, currentScaleX, currentScaleY, targetRect, slideInOffset, firstPlacement = false }) {
         // idle  (currentTx=0): initialTx = frameX - targetX
         // moving (currentTx!=0): initialTx = (frameX + currentTx) - targetX  (no jump)
         // First placement has no prior visual position worth preserving, so start
@@ -272,10 +352,17 @@ export const AnimationsManager = GObject.registerClass({
         const initialTx = slideInOffset ? slideInOffset.x : currentFrame.x + currentTx - targetRect.x;
         const initialTy = slideInOffset ? slideInOffset.y : currentFrame.y + currentTy - targetRect.y;
 
-        // Same "no jump" logic, applied to visual size: preserves the actor's
-        // current on-screen size if a previous resize ease is still in flight.
-        const initialScaleX = targetRect.width > 0 ? (currentFrame.width * currentScaleX) / targetRect.width : 1;
-        const initialScaleY = targetRect.height > 0 ? (currentFrame.height * currentScaleY) / targetRect.height : 1;
+        // Existing windows need visual-size continuity when a resize ease is redirected.
+        // A first placement has no previous Mosaic presentation to preserve: its raw spawn
+        // size is merely client startup geometry. Reusing that size as an entrance scale can
+        // expose a freshly admitted large window at >1x after its target frame has committed,
+        // covering siblings/miniatures that the same layout pass already moved aside.
+        const initialScaleX = firstPlacement
+            ? 1
+            : (targetRect.width > 0 ? (currentFrame.width * currentScaleX) / targetRect.width : 1);
+        const initialScaleY = firstPlacement
+            ? 1
+            : (targetRect.height > 0 ? (currentFrame.height * currentScaleY) / targetRect.height : 1);
 
         return { initialTx, initialTy, initialScaleX, initialScaleY };
     }
@@ -343,11 +430,56 @@ export const AnimationsManager = GObject.registerClass({
     // mapped, safe to ease now that Clutter will no longer skip the transition outright.
     runDeferredEntrance(window) {
         const pending = this._pendingEntranceEases.get(window.get_id());
-        if (!pending) return;
-        this._pendingEntranceEases.delete(window.get_id());
-        const { windowActor, ...easeParams } = pending;
-        if (!windowActor || windowActor.is_destroyed()) return;
+        if (!pending) return false;
+        const {windowActor: storedActor, targetRect, ...easeParams} = pending;
+        const windowActor = storedActor ?? window.get_compositor_private();
+        if (!windowActor || windowActor.is_destroyed()) {
+            if (windowActor?.is_destroyed()) {
+                this._clearDeferredEntrance(window.get_id());
+                this.removeAnimatingWindow(window.get_id());
+            }
+            return false;
+        }
+        if (!storedActor) {
+            pending.windowActor = windowActor;
+            this._animatingWindows.set(window.get_id(), windowActor);
+            this._armDeferredEntranceRetry(window, pending);
+        }
+        if (!windowActor.mapped || !this._firstPlacementPresentationReady(window, windowActor, targetRect))
+            return false;
+
+        this._clearDeferredEntrance(window.get_id());
+        this._animatingWindows.set(window.get_id(), windowActor);
+        const committedBuffer = window.get_buffer_rect();
+        Logger.log(`[ANIM] First placement presentation committed for ${window.get_id()}: actor=${windowActor.width}x${windowActor.height}@${windowActor.x},${windowActor.y} buffer=${committedBuffer.width}x${committedBuffer.height}@${committedBuffer.x},${committedBuffer.y}; releasing entrance`);
         this._runEntranceEase(window, windowActor, easeParams);
+        return true;
+    }
+
+    _firstPlacementPresentationReady(window, actor, targetRect) {
+        if (!targetRect) return true;
+        if (!this._rectMatches(window.get_frame_rect(), targetRect)) return false;
+
+        // The logical frame can lead the compositor presentation by one or more frames on
+        // Wayland. A fresh Firefox window is the common case: frame_rect already reports the
+        // resized target while MetaWindowActor still owns the old near-fullscreen allocation.
+        // Releasing opacity in that interval paints the stale buffer over siblings even though
+        // the solver's final rectangles do not overlap. Buffer rect is the actor's untransformed
+        // presentation bounds, so allocation equality is the correct visibility commit point.
+        if (!actor || !actor.has_allocation()) return false;
+        const buffer = window.get_buffer_rect();
+        return this._rectMatches({
+            x: actor.x,
+            y: actor.y,
+            width: actor.width,
+            height: actor.height,
+        }, buffer);
+    }
+
+    _rectMatches(actual, target) {
+        const epsilon = constants.ANIMATION_DIFF_THRESHOLD;
+        return ['x', 'y', 'width', 'height'].every(key =>
+            Math.abs(actual[key] - target[key]) <= epsilon);
     }
 
     // onWindowAdded and onWindowCreated race independently (no guaranteed order), and
@@ -462,11 +594,47 @@ export const AnimationsManager = GObject.registerClass({
         }
     }
 
+    // A role transition (dominant/miniature/fullscreen handoff) supersedes ordinary Mosaic
+    // relayout/entrance animation ownership. Merely dropping bookkeeping is not enough: a
+    // running Clutter ease would keep mutating translation/scale after the role solver has
+    // committed a new presentation. Claim the actor synchronously so the role transaction
+    // starts from the MetaWindow's live frame with no stale ordinary transform layered on it.
+    claimWindowForRoleTransition(window) {
+        if (!window) return;
+        const id = window.get_id();
+
+        // Remove the pending record before cancelling actor transitions: remove_all_transitions
+        // fires old onStopped(false) callbacks synchronously, and those callbacks must not be
+        // able to resurrect a deferred entrance that this role transaction just superseded.
+        this._clearDeferredEntrance(id);
+
+        const actor = window.get_compositor_private();
+        if (actor && !actor.is_destroyed()) {
+            actor.remove_all_transitions();
+            // Miniature presentation is the role state, not an ordinary tiling transform.
+            // Cancelling a stale Mosaic ease may settle it to the current miniature target,
+            // but must never expand the actor back to 1:1 before the role transaction has a
+            // chance to animate it through MiniatureManager's normal pipeline.
+            if (!WindowState.get(window, WindowState.IS_MINIATURE)) {
+                actor.set_pivot_point(0, 0);
+                actor.set_scale(1, 1);
+                actor.set_translation(0, 0, 0);
+            }
+            actor.opacity = 255;
+        }
+
+        WindowState.remove(window, 'pendingFirstPlacement');
+        WindowState.set(window, 'isMosaicResizing', false);
+        this._animatingTargets.delete(id);
+        if (this._animatingWindows.delete(id))
+            this._checkAllAnimationsComplete();
+    }
+
     // Drops any entrance ease still pending map before the window was excluded
     // from tiling, so it can't fire later and clobber the snap-to-visible reset.
     cancelPendingEntrance(window) {
         const id = window.get_id();
-        this._pendingEntranceEases.delete(id);
+        this._clearDeferredEntrance(id);
         this.removeAnimatingWindow(id);
     }
 
@@ -480,6 +648,9 @@ export const AnimationsManager = GObject.registerClass({
     }
 
     cleanup() {
+        for (const pending of this._pendingEntranceEases.values())
+            this._disconnectDeferredEntranceRetry(pending);
+        this._pendingEntranceEases.clear();
         this._animatingWindows.clear();
         this._animatingTargets.clear();
         this._checkAllAnimationsComplete();

@@ -9,9 +9,9 @@ import Meta from 'gi://Meta';
 
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
-import { TileZone, ZONE_SIDE } from './constants.js';
+import {TileZone, ZONE_SIDE} from './constants.js';
 import * as WindowState from './windowState.js';
-import { ComputedLayouts, MosaicModel } from './mosaicModel.js';
+import {MosaicModel} from './mosaicModel.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -21,10 +21,12 @@ import {
     MINIATURE_OVERLAY,
     ANIMATING_MINIATURE,
     PENDING_MINIATURE,
+    PRE_MINIATURE_SIZE,
 } from './windowState.js';
-import { getMiniatureSize, applyMiniatureActorState, animateMiniatureToTarget } from './miniature.js';
-import { isWindowAlive } from './liveness.js';
-import { getSlowDownFactor, monotonicNow } from './timing.js';
+import {getMiniatureSize, applyMiniatureActorState, animateMiniatureToTarget} from './miniature.js';
+import {isWindowAlive} from './liveness.js';
+import {miniatureSizeForSource, solveMiniatureRail} from './mosaicLayoutSolver.js';
+import {getSlowDownFactor, monotonicNow} from './timing.js';
 
 const POSITION_STABILITY_WEIGHT = 40;
 // Tuning these two changes nothing on its own since they rank in tiers, never in one sum.
@@ -38,7 +40,10 @@ const HOLLOW_CENTER_WEIGHT = 0.3;
 // budget and stop early instead of materializing all of it for a huge window count.
 export function* generateRowCompositions(n) {
     if (n <= 0) return;
-    if (n === 1) { yield [1]; return; }
+    if (n === 1) {
+        yield [1];
+        return;
+    }
 
     function* build(remaining, groupsLeft, acc) {
         if (remaining === 0) {
@@ -54,6 +59,7 @@ export function* generateRowCompositions(n) {
             acc.pop();
         }
     }
+
     for (let groups = 1; groups <= n; groups++)
         yield* build(n, groups, []);
 }
@@ -61,17 +67,24 @@ export function* generateRowCompositions(n) {
 // Mutter will not place a window outside the work area; it silently clamps. Land on the same
 // spot it would, or the layout believes the window is somewhere it never was.
 function clampToWorkArea(x, y, width, height, bounds) {
-    if (!bounds) return { x, y };
+    if (!bounds) return {x, y};
     return {
         x: Math.max(bounds.x, Math.min(x, bounds.x + bounds.width - width)),
         y: Math.max(bounds.y, Math.min(y, bounds.y + bounds.height - height)),
     };
 }
 
+function normalizeLayoutOffset(offset) {
+    return {
+        x: offset?.x ?? 0,
+        y: offset?.y ?? 0,
+    };
+}
+
 export const TilingManager = GObject.registerClass({
     GTypeName: 'MosaicTilingManager',
     Signals: {
-        'mosaic-changed': { param_types: [GObject.TYPE_OBJECT] }, // Emitted when layout changes (param: workspace)
+        'mosaic-changed': {param_types: [GObject.TYPE_OBJECT]}, // Emitted when layout changes (param: workspace)
     },
 }, class TilingManager extends GObject.Object {
     _init(_extension) {
@@ -107,6 +120,7 @@ export const TilingManager = GObject.registerClass({
         this._activePinnedShape = null;
         this._activePinnedVertical = null;
         this._activePinnedWorkspace = null;
+        this._miniatureRailSides = new WeakMap();
 
         // Layout cache to avoid redundant O(n!) permutation calculations
         this._lastLayoutHash = null;
@@ -128,6 +142,16 @@ export const TilingManager = GObject.registerClass({
         // Swap/reorder operations live per workspace, keyed by Meta.Workspace via WeakMap
         // to avoid monkey-patching native GObjects (same reason windowState.js exists).
         this._workspaceSwaps = new WeakMap();
+    }
+
+    withSmartResizeBlock(callback) {
+        const previous = this._isSmartResizingBlocked;
+        this._isSmartResizingBlocked = true;
+        try {
+            return callback();
+        } finally {
+            this._isSmartResizingBlocked = previous;
+        }
     }
 
     setEdgeTilingManager(manager) {
@@ -163,7 +187,7 @@ export const TilingManager = GObject.registerClass({
     // (read from targetSmartResizeSize, set independently of this call).
     _animateResize(window, frame, width, height, deferToRetile = false) {
         if (deferToRetile || WindowState.get(window, 'pendingFirstPlacement')) return;
-        this._animationsManager?.animateWindow(window, { x: frame.x, y: frame.y, width, height });
+        this._animationsManager?.animateWindow(window, {x: frame.x, y: frame.y, width, height});
     }
 
     // Whichever window happens to be "newWindow" for a given tryFitWithResize call
@@ -185,12 +209,12 @@ export const TilingManager = GObject.registerClass({
 
         const smartSize = WindowState.get(window, 'targetSmartResizeSize');
         if (smartSize) {
-            return { width: smartSize.width, height: smartSize.height };
+            return {width: smartSize.width, height: smartSize.height};
         }
 
         const restoredSize = WindowState.get(window, 'targetRestoredSize');
         if (restoredSize) {
-            return { width: restoredSize.width, height: restoredSize.height };
+            return {width: restoredSize.width, height: restoredSize.height};
         }
 
         const modelOrFrameSize = this._getSizeFromModelOrFrame(window);
@@ -200,7 +224,7 @@ export const TilingManager = GObject.registerClass({
 
         const preferred = WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
         if (preferred) {
-            return { width: preferred.width, height: preferred.height };
+            return {width: preferred.width, height: preferred.height};
         }
 
         return {
@@ -212,14 +236,14 @@ export const TilingManager = GObject.registerClass({
     // With the overview open Mutter drops our moves, so the frame is stale by
     // construction; the last computed slot is what the layout actually decided.
     _getSizeFromModelOrFrame(window) {
-        const slot = MosaicModel.slotFor(window);
+        const slot = MosaicModel.normalSlotFor(window);
         if (slot && slot.width > 0 && slot.height > 0) {
-            return { width: slot.width, height: slot.height };
+            return {width: slot.width, height: slot.height};
         }
 
         const frame = window.get_frame_rect();
         if (frame.width > 0 && frame.height > 0) {
-            return { width: frame.width, height: frame.height };
+            return {width: frame.width, height: frame.height};
         }
 
         return null;
@@ -243,13 +267,18 @@ export const TilingManager = GObject.registerClass({
         if (actualMinW) baseW = Math.max(actualMinW, baseW);
         if (actualMinH) baseH = Math.max(actualMinH, baseH);
 
-        return { width: baseW, height: baseH };
+        return {width: baseW, height: baseH};
     }
 
     // Stamp when a shrink target is applied so the clamp detector can tell "hasn't shrunk yet"
     // (transient) from "won't shrink" (a real minimum), keyed off the target, not the window's age.
-    _setSmartResizeTarget(window, size) {
-        WindowState.set(window, 'targetSmartResizeSize', { width: size.width, height: size.height });
+    setSmartResizeTarget(window, size) {
+        // A smart-resize target is newer geometry than any restore-settle bridge. Keeping the
+        // old restored size around lets a later size-changed ack clear this target and revive
+        // stale full-size geometry on the next retile, which can manufacture overflow and exile
+        // an otherwise-fitting sibling to another workspace.
+        WindowState.remove(window, 'targetRestoredSize');
+        WindowState.set(window, 'targetSmartResizeSize', {width: size.width, height: size.height});
         WindowState.set(window, 'targetSmartResizeSetAt', monotonicNow());
     }
 
@@ -257,7 +286,7 @@ export const TilingManager = GObject.registerClass({
         if (window.get_max_size) {
             const [hasHint, maxW, maxH] = window.get_max_size();
             if (hasHint && maxW > 0 && maxH > 0)
-                return { width: maxW, height: maxH };
+                return {width: maxW, height: maxH};
         }
         return null;
     }
@@ -266,7 +295,7 @@ export const TilingManager = GObject.registerClass({
         const currentSize = this.getEffectiveWindowSize(window);
         const minSize = this.getWindowMinimumSize(window);
         return currentSize.width <= minSize.width + tolerance &&
-               currentSize.height <= minSize.height + tolerance;
+            currentSize.height <= minSize.height + tolerance;
     }
 
     findBestRestorationGain(windows, shrunkWindows, workArea) {
@@ -276,14 +305,14 @@ export const TilingManager = GObject.registerClass({
                 if (!shrunk) {
                     // Miniatures sit at their scaled slot size, so use getMiniatureSize to match WindowDescriptor.
                     const miniSize = getMiniatureSize(w);
-                    if (miniSize) return { id: w.get_id(), width: miniSize.width, height: miniSize.height };
+                    if (miniSize) return {id: w.get_id(), width: miniSize.width, height: miniSize.height};
                     // Use targetSmartResizeSize when present since WindowDescriptor uses the same
                     // value during actual tiling, and diverging here would make simulations inconsistent.
                     const smartResizeSize = WindowState.get(w, 'targetSmartResizeSize');
                     if (smartResizeSize)
-                        return { id: w.get_id(), width: smartResizeSize.width, height: smartResizeSize.height };
+                        return {id: w.get_id(), width: smartResizeSize.width, height: smartResizeSize.height};
                     const f = w.get_frame_rect();
-                    return { id: w.get_id(), width: f.width, height: f.height };
+                    return {id: w.get_id(), width: f.width, height: f.height};
                 }
 
                 const f = w.get_frame_rect();
@@ -298,13 +327,13 @@ export const TilingManager = GObject.registerClass({
                     nh = Math.min(nh, maxSize.height);
                 }
 
-                return { id: w.get_id(), width: nw, height: nh };
+                return {id: w.get_id(), width: nw, height: nh};
             });
 
             const tile_result = this._tile(simulatedWindows, workArea, true);
             if (!tile_result.overflow) {
                 Logger.log(`findBestRestorationGain: Found workable factor ${gainFactor.toFixed(1)}`);
-                return { gain: gainFactor, layout: simulatedWindows };
+                return {gain: gainFactor, layout: simulatedWindows};
             }
         }
         return null;
@@ -328,7 +357,7 @@ export const TilingManager = GObject.registerClass({
 
     getMask(window) {
         const id = window.id !== undefined ? window.id : (window.get_id ? window.get_id() : null);
-        if(id !== null && this.masks.has(id))
+        if (id !== null && this.masks.has(id))
             return new Mask(window);
         return window;
     }
@@ -357,7 +386,7 @@ export const TilingManager = GObject.registerClass({
 
     setDragLayoutHint(layout) {
         this._dragLayoutHint = layout?.permOrder?.length
-            ? { order: layout.permOrder, shape: layout.shape }
+            ? {order: layout.permOrder, shape: layout.shape}
             : null;
     }
 
@@ -397,7 +426,7 @@ export const TilingManager = GObject.registerClass({
                     const drawX = win.targetX !== undefined ? win.targetX : x;
                     const drawY = win.targetY !== undefined ? win.targetY : y;
 
-                    positions.push({ id: win.id, x: drawX, y: drawY, width: win.width, height: win.height });
+                    positions.push({id: win.id, x: drawX, y: drawY, width: win.width, height: win.height});
                     x += win.width + constants.WINDOW_SPACING;
                 }
                 y += level.height + constants.WINDOW_SPACING;
@@ -410,7 +439,7 @@ export const TilingManager = GObject.registerClass({
                     const drawX = win.targetX !== undefined ? win.targetX : x;
                     const drawY = win.targetY !== undefined ? win.targetY : y;
 
-                    positions.push({ id: win.id, x: drawX, y: drawY, width: win.width, height: win.height });
+                    positions.push({id: win.id, x: drawX, y: drawY, width: win.width, height: win.height});
                     y += win.height + constants.WINDOW_SPACING;
                 }
                 x += level.width + constants.WINDOW_SPACING;
@@ -535,8 +564,9 @@ export const TilingManager = GObject.registerClass({
                 constants.ANIMATION_DURATION_MS);
             WindowState.get(window, MINIATURE_OVERLAY)?.animateToPosition(constants.ANIMATION_DURATION_MS);
         }
-        // MosaicLayoutStrategy reads ComputedLayouts for the overview slot, so keep it in sync.
-        ComputedLayouts.set(window, { x: pos.x, y: pos.y, width: pos.width, height: pos.height });
+        // Dragging a miniature changes only its presentation; its normal restore geometry stays intact.
+        MosaicModel.setPresentationSlot(window, {x: pos.x, y: pos.y, width: pos.width, height: pos.height},
+            window.get_workspace?.(), window.get_monitor?.());
     }
 
     _applyDragLayoutWindow(window, pos) {
@@ -612,7 +642,7 @@ export const TilingManager = GObject.registerClass({
     }
 
     applyTmp(array) {
-        if(this.tmp_swap.length !== 0) {
+        if (this.tmp_swap.length !== 0) {
             this._swapElements(array, this.tmp_swap[0], this.tmp_swap[1]);
         }
     }
@@ -633,7 +663,7 @@ export const TilingManager = GObject.registerClass({
     // shape stops fitting. vertical is the axis the shape was verified against (see
     // _orientationFor for why that can't just be re-derived on the next pass).
     pinComposition(workspace, shape, order, vertical) {
-        this._pinnedComposition.set(workspace, { count: order.length, shape, vertical });
+        this._pinnedComposition.set(workspace, {count: order.length, shape, vertical});
         Logger.log(`pinComposition: pinned shape [${shape.join(',')}] for ${order.length} windows`);
         this.applyOrderOp(workspace, order);
     }
@@ -654,12 +684,12 @@ export const TilingManager = GObject.registerClass({
                 workArea = this._edgeTilingManager.calculateRemainingSpace(workspace, monitor);
             }
         }
-        return { meta_windows, workArea };
+        return {meta_windows, workArea};
     }
 
     bestRecomposition(workspace, monitor, focusedWindow, direction) {
         const startTime = GLib.get_monotonic_time();
-        const { meta_windows, workArea } = this._mosaicWindowsAndArea(workspace, monitor);
+        const {meta_windows, workArea} = this._mosaicWindowsAndArea(workspace, monitor);
 
         const descriptors = this.windowsToDescriptors(meta_windows, monitor, focusedWindow);
         const n = descriptors.length;
@@ -683,7 +713,7 @@ export const TilingManager = GObject.registerClass({
         });
     }
 
-    _searchRecomposition({ focusedId, focused, others, workArea, useVertical, n, sign, axis, originCenter, startTime }) {
+    _searchRecomposition({focusedId, focused, others, workArea, useVertical, n, sign, axis, originCenter, startTime}) {
         const spacing = constants.WINDOW_SPACING;
         let best = null;
 
@@ -702,7 +732,7 @@ export const TilingManager = GObject.registerClass({
                 const center = axis === 'x' ? fp.x + fp.width / 2 : fp.y + fp.height / 2;
                 const disp = sign * (center - originCenter);
                 if (disp >= constants.KEYBOARD_RECOMPOSE_MIN_DISPLACEMENT_PX && (!best || disp > best.displacement))
-                    best = { shape, order: ordered.map(w => w.id), displacement: disp, vertical: useVertical };
+                    best = {shape, order: ordered.map(w => w.id), displacement: disp, vertical: useVertical};
             }
         }
         return best;
@@ -721,35 +751,38 @@ export const TilingManager = GObject.registerClass({
     }
 
     checkValidity(monitor, workspace, window, strict) {
-        if (monitor !== null &&
+        return monitor !== null &&
             window.wm_class !== null &&
             isWindowAlive(window) &&
             workspace.list_windows().length !== 0 &&
-            (strict ? !window.is_hidden() : !window.minimized)
-        ) {
-            return true;
-        } else {
-            return false;
-        }
+            (strict ? !window.is_hidden() : !window.minimized);
     }
 
     _createDescriptor(meta_window, monitor, index, reference_window) {
-        if(reference_window)
-            if(meta_window.get_id() === reference_window.get_id())
+        if (reference_window)
+            if (meta_window.get_id() === reference_window.get_id())
                 return new WindowDescriptor(meta_window, index);
 
-        if( this._windowingManager.isExcluded(meta_window) ||
+        if (this._windowingManager.isExcluded(meta_window) ||
             meta_window.get_monitor() !== monitor ||
-            this._windowingManager.isMaximizedOrFullscreen(meta_window))
+            this._nativeStateBlocksLayout(meta_window))
             return false;
         return new WindowDescriptor(meta_window, index);
     }
 
+    _nativeStateBlocksLayout(window) {
+        // A miniature participates only through its compositor presentation;
+        // the real window may legitimately keep native state that would block a
+        // normal tiled window (notably a stacked dominant remaining maximized).
+        return !WindowState.get(window, IS_MINIATURE) &&
+            this._windowingManager.isMaximizedOrFullscreen(window);
+    }
+
     windowsToDescriptors(meta_windows, monitor, reference_window) {
         const descriptors = [];
-        for(let i = 0; i < meta_windows.length; i++) {
+        for (let i = 0; i < meta_windows.length; i++) {
             const descriptor = this._createDescriptor(meta_windows[i], monitor, i, reference_window);
-            if(descriptor)
+            if (descriptor)
                 descriptors.push(descriptor);
         }
         return descriptors;
@@ -812,7 +845,7 @@ export const TilingManager = GObject.registerClass({
                 pairs++;
             }
         }
-        return { maxPair, meanPair: pairs ? sum / pairs : 0 };
+        return {maxPair, meanPair: pairs ? sum / pairs : 0};
     }
 
     // A pool holding anything that fits drops the overflowing ones first, so these only ever
@@ -831,12 +864,14 @@ export const TilingManager = GObject.registerClass({
         }
         if (centers.length === 0) return null;
 
-        const { maxPair, meanPair } = this._pairwiseDensity(centers, workArea);
+        const {maxPair, meanPair} = this._pairwiseDensity(centers, workArea);
 
         let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
         for (const c of centers) {
-            minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
-            minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+            minX = Math.min(minX, c.x);
+            maxX = Math.max(maxX, c.x);
+            minY = Math.min(minY, c.y);
+            maxY = Math.max(maxY, c.y);
         }
         const centerDist = Math.hypot(
             (minX + maxX) / 2 - (workArea.x + workArea.width / 2),
@@ -883,10 +918,12 @@ export const TilingManager = GObject.registerClass({
         for (const w of level.windows) {
             const x = w.targetX ?? level.x;
             const y = w.targetY ?? level.y;
-            x0 = Math.min(x0, x); y0 = Math.min(y0, y);
-            x1 = Math.max(x1, x + w.width); y1 = Math.max(y1, y + w.height);
+            x0 = Math.min(x0, x);
+            y0 = Math.min(y0, y);
+            x1 = Math.max(x1, x + w.width);
+            y1 = Math.max(y1, y + w.height);
         }
-        return { x0, y0, x1, y1 };
+        return {x0, y0, x1, y1};
     }
 
     // Reward a layout that leaves windows near where they already sat, so a retile doesn't
@@ -978,7 +1015,7 @@ export const TilingManager = GObject.registerClass({
         const sameOrder = perm.length === currentIds.length &&
             perm.every((w, i) => w.id === currentIds[i]);
 
-        return { score, position, group, sameOrder, fits };
+        return {score, position, group, sameOrder, fits};
     }
 
     // Whether `windows` is the exact set the last real pass tiled. Orientation is written on
@@ -1034,7 +1071,7 @@ export const TilingManager = GObject.registerClass({
             if (scored.length > 0 &&
                 scored.length + placers.length > constants.LAYOUT_SEARCH_CANDIDATE_BUDGET) break;
             for (const place of placers)
-                scored.push({ perm, place, ...this._scoreOrder(perm, workArea, place, currentIds) });
+                scored.push({perm, place, ...this._scoreOrder(perm, workArea, place, currentIds)});
         }
         return scored;
     }
@@ -1073,16 +1110,16 @@ export const TilingManager = GObject.registerClass({
             for (const place of placers) {
                 scanned++;
                 if (!place.call(this, perm, workArea, constants.WINDOW_SPACING).overflow)
-                    return { order: perm, place };
-                fallback ??= { order: perm, place };
+                    return {order: perm, place};
+                fallback ??= {order: perm, place};
             }
         }
 
-        return fallback ?? { order: windows, place: placers[0] };
+        return fallback ?? {order: windows, place: placers[0]};
     }
 
     _findOptimalLayout(windows, workArea, placers) {
-        if (windows.length <= 1) return { order: windows, place: placers[0] };
+        if (windows.length <= 1) return {order: windows, place: placers[0]};
 
         const startTime = monotonicNow();
         // Preservers go first so a budget cut falls back to the previous order instead of
@@ -1107,7 +1144,7 @@ export const TilingManager = GObject.registerClass({
         const elapsed = Math.round(monotonicNow() - startTime);
         Logger.log(`_findOptimalLayout: ${windows.length} windows, ${orders.length} orders x ${placers.length} placers, ${scored.length} scored, ${settling ? 'settling' : 'packing'}, ${elapsed}ms${this._restoreAnchor ? ` (restore anchor ${this._restoreAnchor.id})` : ''}`);
 
-        return best ? { order: best.perm, place: best.place } : { order: windows, place: placers[0] };
+        return best ? {order: best.perm, place: best.place} : {order: windows, place: placers[0]};
     }
 
     // Order-sensitive hash: different input orders must never share a cache entry.
@@ -1119,7 +1156,7 @@ export const TilingManager = GObject.registerClass({
     }
 
     _tile(windows, work_area, isSimulation = false) {
-        if (!windows || windows.length === 0) return { levels: [], vertical: false, overflow: false };
+        if (!windows || windows.length === 0) return {levels: [], vertical: false, overflow: false};
 
         const hash = this._getLayoutHash(windows, work_area);
         if (this._isTileCacheHit(hash, isSimulation)) {
@@ -1378,10 +1415,10 @@ export const TilingManager = GObject.registerClass({
         return [...this._shelfPlacers(false, windowCount), ...this._shelfPlacers(true, windowCount)];
     }
 
-    _finishColumnLayout({ levels, totalWidth, overflow }, windows, work_area, spacing) {
+    _finishColumnLayout({levels, totalWidth, overflow}, windows, work_area, spacing) {
         const startX = Math.max(work_area.x, (work_area.width - totalWidth) / 2 + work_area.x);
         this._positionColumnWindows(levels, work_area, spacing, startX);
-        return { x: startX, y: work_area.y, overflow, vertical: true, levels, windows };
+        return {x: startX, y: work_area.y, overflow, vertical: true, levels, windows};
     }
 
     _verticalShelvesWith(windows, work_area, spacing, allowRows) {
@@ -1399,9 +1436,9 @@ export const TilingManager = GObject.registerClass({
         let next = 0;
 
         for (const rowSizes of shape) {
-            const col = { rows: [], height: 0, width: 0 };
+            const col = {rows: [], height: 0, width: 0};
             for (const size of rowSizes) {
-                const row = { windows: [], used: 0, height: 0 };
+                const row = {windows: [], used: 0, height: 0};
                 for (let k = 0; k < size; k++) {
                     const w = windows[next++];
                     row.windows.push(w);
@@ -1443,10 +1480,10 @@ export const TilingManager = GObject.registerClass({
             if (this._placeInExistingColumn(columns, w, work_area, spacing, allowRows)) continue;
 
             const totalWidth = columns.reduce((s, c) => s + c.width, 0) +
-                               (columns.length > 0 ? columns.length * spacing : 0) + w.width;
+                (columns.length > 0 ? columns.length * spacing : 0) + w.width;
 
             if (totalWidth <= work_area.width || columns.length === 0) {
-                const col = { rows: [], height: 0, width: 0 };
+                const col = {rows: [], height: 0, width: 0};
                 this._openRow(col, w, spacing);
                 columns.push(col);
             } else {
@@ -1495,7 +1532,7 @@ export const TilingManager = GObject.registerClass({
     _openRow(col, w, spacing) {
         col.height += (col.rows.length > 0 ? spacing : 0) + w.height;
         col.width = Math.max(col.width, w.width);
-        col.rows.push({ windows: [w], used: w.width, height: w.height });
+        col.rows.push({windows: [w], used: w.width, height: w.height});
     }
 
     _forceIntoShortestColumn(columns, w, spacing, allowRows) {
@@ -1520,7 +1557,7 @@ export const TilingManager = GObject.registerClass({
         return this._packingArea(rows) < this._packingArea(plain) ? rows : plain;
     }
 
-    _packingArea({ levels, totalWidth }) {
+    _packingArea({levels, totalWidth}) {
         return totalWidth * levels.reduce((h, lv) => Math.max(h, lv.height), 0);
     }
 
@@ -1560,7 +1597,7 @@ export const TilingManager = GObject.registerClass({
             levels.push(level);
         }
 
-        return { levels, totalWidth, overflow };
+        return {levels, totalWidth, overflow};
     }
 
     // Columns fan in toward each other: the first pulls right, the last pulls left, so the gap
@@ -1746,12 +1783,12 @@ export const TilingManager = GObject.registerClass({
         if (windows.length <= 2) {
             return this._simpleCenteredRow(windows, work_area, spacing);
         }
-        const { windowsPerRow } = this._calculateOptimalGrid(windows, work_area);
+        const {windowsPerRow} = this._calculateOptimalGrid(windows, work_area);
         return this._horizontalShelvesWith(windows, work_area, spacing, windowsPerRow);
     }
 
     _horizontalShelvesWith(windows, work_area, spacing, windowsPerRow) {
-        const { levels, totalHeight, overflow } =
+        const {levels, totalHeight, overflow} =
             this._buildShelfRows(windows, work_area, spacing, windowsPerRow.length, windowsPerRow);
 
         const y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
@@ -1802,7 +1839,7 @@ export const TilingManager = GObject.registerClass({
             levels.push(level);
         }
 
-        return { levels, totalHeight, overflow };
+        return {levels, totalHeight, overflow};
     }
 
     _positionShelfWindows(levels, y, spacing, work_area) {
@@ -1869,7 +1906,7 @@ export const TilingManager = GObject.registerClass({
 
         const y = Math.max(work_area.y, (work_area.height - totalHeight) / 2 + work_area.y);
         this._positionShelfWindows(levels, y, spacing, work_area);
-        return { x: work_area.x, y, overflow, vertical: false, levels, windows };
+        return {x: work_area.x, y, overflow, vertical: false, levels, windows};
     }
 
     _placeVerticalGroups(groups, work_area, spacing, windows) {
@@ -1912,7 +1949,7 @@ export const TilingManager = GObject.registerClass({
         // the group without shrinking it (the column's footprint still follows its widest member).
         this._slideTowardNeighbors(levels.map(lv => [lv.windows]),
             true, work_area, spacing);
-        return { x, y: work_area.y, overflow, vertical: true, levels, windows };
+        return {x, y: work_area.y, overflow, vertical: true, levels, windows};
     }
 
     _simpleCenteredRow(windows, work_area, spacing) {
@@ -1954,9 +1991,9 @@ export const TilingManager = GObject.registerClass({
 
     _calculateOptimalGrid(windows, work_area) {
         const windowCount = windows.length;
-        if (windowCount <= 0) return { rows: 0, windowsPerRow: [] };
-        if (windowCount === 1) return { rows: 1, windowsPerRow: [1] };
-        if (windowCount === 2) return { rows: 1, windowsPerRow: [2] };
+        if (windowCount <= 0) return {rows: 0, windowsPerRow: []};
+        if (windowCount === 1) return {rows: 1, windowsPerRow: [1]};
+        if (windowCount === 2) return {rows: 1, windowsPerRow: [2]};
 
         const spacing = constants.WINDOW_SPACING;
         const workspaceAspect = work_area.width / work_area.height;
@@ -1968,7 +2005,7 @@ export const TilingManager = GObject.registerClass({
         for (let rows = 1; rows <= windowCount; rows++) {
             const cols = Math.ceil(windowCount / rows);
             const windowsPerRow = this._distributeWindowsPerRow(windowCount, rows);
-            const { overflow, layoutWidth, layoutHeight } = this._measureGrid(windows, windowsPerRow, work_area, spacing);
+            const {overflow, layoutWidth, layoutHeight} = this._measureGrid(windows, windowsPerRow, work_area, spacing);
 
             const aspectDiff = Math.abs(layoutWidth / layoutHeight - workspaceAspect);
             const emptySpaces = rows * cols - windowCount;
@@ -1984,7 +2021,7 @@ export const TilingManager = GObject.registerClass({
             }
         }
 
-        return { rows: bestRows, windowsPerRow: this._distributeWindowsPerRow(windowCount, bestRows) };
+        return {rows: bestRows, windowsPerRow: this._distributeWindowsPerRow(windowCount, bestRows)};
     }
 
     // The remainder always sinks to the lower rows, so three windows in two rows can only be
@@ -2006,8 +2043,14 @@ export const TilingManager = GObject.registerClass({
         let left = centerIndex;
         let right = centerIndex;
         while (remainder > 0) {
-            if (left >= 0 && left < rows) { windowsPerRow[left]++; remainder--; }
-            if (remainder > 0 && right !== left && right >= 0 && right < rows) { windowsPerRow[right]++; remainder--; }
+            if (left >= 0 && left < rows) {
+                windowsPerRow[left]++;
+                remainder--;
+            }
+            if (remainder > 0 && right !== left && right >= 0 && right < rows) {
+                windowsPerRow[right]++;
+                remainder--;
+            }
             left--;
             right++;
         }
@@ -2040,7 +2083,7 @@ export const TilingManager = GObject.registerClass({
 
         if (totalHeight > work_area.height + 5) overflow = true;
 
-        return { overflow, layoutWidth: maxRowWidth, layoutHeight: totalHeight };
+        return {overflow, layoutWidth: maxRowWidth, layoutHeight: totalHeight};
     }
 
     // Windows eligible to take part in tiling: on this monitor, not excluded, not still
@@ -2082,7 +2125,7 @@ export const TilingManager = GObject.registerClass({
 
     _getWorkingInfo(workspace, window, _monitor, excludeFromTiling = false) {
         let current_monitor = _monitor;
-        if(current_monitor === undefined)
+        if (current_monitor === undefined)
             current_monitor = window.get_monitor();
 
         const meta_windows = this._eligibleTileWindows(workspace, current_monitor, window, excludeFromTiling);
@@ -2098,7 +2141,7 @@ export const TilingManager = GObject.registerClass({
         const windowsForSwaps = edgeTiledWindows.length > 0 ? nonEdgeTiledMetaWindows : meta_windows;
 
         for (const win of meta_windows) {
-            if (this._windowingManager.isMaximizedOrFullscreen(win))
+            if (this._nativeStateBlocksLayout(win))
                 return false;
         }
 
@@ -2110,11 +2153,11 @@ export const TilingManager = GObject.registerClass({
         this._applyDragLayoutHintOrder(_windows);
 
         const windows = [];
-        for(const w of _windows)
+        for (const w of _windows)
             windows.push(this.getMask(w));
 
         const work_area = this._clampedWorkArea(workspace, current_monitor);
-        if(!work_area) return false;
+        if (!work_area) return false;
 
         return {
             monitor: current_monitor,
@@ -2124,28 +2167,137 @@ export const TilingManager = GObject.registerClass({
         };
     }
 
-    _drawTile(workspace, monitor, tile_info, meta_windows, dryRun = false, slotsOut = null, bounds = null) {
+    _drawTile(workspace, monitor, tile_info, meta_windows,
+        dryRun = false, slotsOut = null, bounds = null, contentOffset = null) {
         const levels = tile_info.levels;
-        const _x = tile_info.x;
-        const _y = tile_info.y;
-        if(!tile_info.vertical) {
+        const {x: dx, y: dy} = normalizeLayoutOffset(contentOffset);
+        const _x = tile_info.x + dx;
+        const _y = tile_info.y + dy;
+        if (!tile_info.vertical) {
             let y = _y;
-            for(const level of levels) {
+            for (const level of levels) {
                 Logger.log(`Drawing horizontal level at y=${y}, width=${level.width}, height=${level.height}`);
-                level.draw_horizontal(workspace, monitor, meta_windows, y, this.masks, this.isDragging, this._drawingManager, dryRun, slotsOut, bounds);
+                level.draw_horizontal(workspace, monitor, meta_windows, y,
+                    this.masks, this.isDragging, this._drawingManager,
+                    dryRun, slotsOut, bounds, dx, dy);
                 y += level.height + constants.WINDOW_SPACING;
             }
         } else {
             let x = _x;
-            for(const level of levels) {
+            for (const level of levels) {
                 Logger.log(`Drawing vertical level at x=${x}, width=${level.width}, height=${level.height}`);
-                level.draw_vertical(workspace, monitor, meta_windows, x, this.masks, this.isDragging, this._drawingManager, dryRun, slotsOut, bounds);
+                level.draw_vertical(workspace, monitor, meta_windows, x,
+                    this.masks, this.isDragging, this._drawingManager,
+                    dryRun, slotsOut, bounds, dx, dy);
                 x += level.width + constants.WINDOW_SPACING;
             }
         }
     }
 
-    _animateTileLayout(workspace, monitor, tile_info, work_area, meta_windows, draggedWindow = null, slotsOut = null, bounds = null) {
+    _tileGeometryIsValid(tileInfo, bounds, label = 'layout', offset = null) {
+        if (!tileInfo || !bounds || bounds.width <= 0 || bounds.height <= 0)
+            return false;
+
+        const rects = this._layoutRects(tileInfo, bounds, offset);
+        const outside = rects.find(rect => !this._rectWithinBounds(rect, bounds));
+        if (outside) {
+            Logger.log(`[LAYOUT VALIDATION] ${label} rejected: ${outside.id} (${outside.width}x${outside.height} at ${outside.x},${outside.y}) exceeds ${bounds.width}x${bounds.height} bounds`);
+            return false;
+        }
+
+        const overlap = this._firstOverlappingPair(rects);
+        if (overlap) {
+            Logger.log(`[LAYOUT VALIDATION] ${label} rejected: ${overlap[0].id} overlaps ${overlap[1].id}`);
+            return false;
+        }
+        return true;
+    }
+
+    _layoutRects(tileInfo, bounds, offset = null) {
+        if (!tileInfo?.levels) return [];
+        const dx = offset?.x ?? 0;
+        const dy = offset?.y ?? 0;
+        return tileInfo.vertical
+            ? this._verticalLayoutRects(tileInfo, bounds, dx, dy)
+            : this._horizontalLayoutRects(tileInfo, bounds, dx, dy);
+    }
+
+    _layoutBounds(tileInfo, bounds) {
+        const rects = this._layoutRects(tileInfo, bounds);
+        if (rects.length === 0) return null;
+
+        const left = Math.min(...rects.map(rect => rect.x));
+        const top = Math.min(...rects.map(rect => rect.y));
+        const right = Math.max(...rects.map(rect => rect.x + rect.width));
+        const bottom = Math.max(...rects.map(rect => rect.y + rect.height));
+        return {x: left, y: top, width: right - left, height: bottom - top};
+    }
+
+    _horizontalLayoutRects(tileInfo, bounds, dx = 0, dy = 0) {
+        const rects = [];
+        let y = tileInfo.y + dy;
+        for (const level of tileInfo.levels) {
+            let x = level.x + dx;
+            for (const window of level.windows) {
+                rects.push(this._layoutRect(window,
+                    (window.targetX ?? (x - dx)) + dx,
+                    (window.targetY ?? (y - dy)) + dy,
+                    bounds));
+                x += window.width + constants.WINDOW_SPACING;
+            }
+            y += level.height + constants.WINDOW_SPACING;
+        }
+        return rects;
+    }
+
+    _verticalLayoutRects(tileInfo, bounds, dx = 0, dy = 0) {
+        const rects = [];
+        let x = tileInfo.x + dx;
+        for (const level of tileInfo.levels) {
+            let y = level.y + dy;
+            for (const window of level.windows) {
+                rects.push(this._layoutRect(window,
+                    (window.targetX ?? (x - dx)) + dx,
+                    (window.targetY ?? (y - dy)) + dy,
+                    bounds));
+                y += window.height + constants.WINDOW_SPACING;
+            }
+            x += level.width + constants.WINDOW_SPACING;
+        }
+        return rects;
+    }
+
+    _layoutRect(window, rawX, rawY, bounds) {
+        const pos = clampToWorkArea(rawX, rawY, window.width, window.height, bounds);
+        return {id: window.id, x: pos.x, y: pos.y, width: window.width, height: window.height};
+    }
+
+    _rectWithinBounds(rect, bounds) {
+        const epsilon = 1;
+        return rect.x >= bounds.x - epsilon && rect.y >= bounds.y - epsilon &&
+            rect.x + rect.width <= bounds.x + bounds.width + epsilon &&
+            rect.y + rect.height <= bounds.y + bounds.height + epsilon;
+    }
+
+    _firstOverlappingPair(rects) {
+        for (let i = 0; i < rects.length; i++) {
+            for (let j = i + 1; j < rects.length; j++) {
+                if (this._rectsOverlap(rects[i], rects[j], 1))
+                    return [rects[i], rects[j]];
+            }
+        }
+        return null;
+    }
+
+    _rectsOverlap(a, b, epsilon) {
+        return a.x < b.x + b.width - epsilon &&
+            b.x < a.x + a.width - epsilon &&
+            a.y < b.y + b.height - epsilon &&
+            b.y < a.y + a.height - epsilon;
+    }
+
+    _animateTileLayout(workspace, monitor, tile_info, work_area, meta_windows,
+        draggedWindow = null, slotsOut = null, bounds = null, contentOffset = null) {
         // Nothing below can place a window without the manager, so let _drawTile do it.
         if (!this._animationsManager) return false;
 
@@ -2158,6 +2310,7 @@ export const TilingManager = GObject.registerClass({
             pendingMiniIds: new Set((this._pendingMiniatureWindows ?? []).map(p => p.window.get_id())),
             slotsOut,
             bounds,
+            contentOffset,
             windowLayouts: [],
             miniLayouts: [],
             workspace,
@@ -2177,12 +2330,14 @@ export const TilingManager = GObject.registerClass({
     }
 
     _placeHorizontalAnimated(tile_info, meta_windows, ctx) {
-        let y = tile_info.y;
+        const dx = ctx.contentOffset?.x ?? 0;
+        const dy = ctx.contentOffset?.y ?? 0;
+        let y = tile_info.y + dy;
         for (const level of tile_info.levels) {
-            let x = level.x;
+            let x = level.x + dx;
             for (const windowDesc of level.windows) {
-                const targetX = windowDesc.targetX !== undefined ? windowDesc.targetX : x;
-                const targetY = windowDesc.targetY !== undefined ? windowDesc.targetY : y;
+                const targetX = (windowDesc.targetX !== undefined ? windowDesc.targetX : x - dx) + dx;
+                const targetY = (windowDesc.targetY !== undefined ? windowDesc.targetY : y - dy) + dy;
 
                 const window = meta_windows.find(w => w.get_id() === windowDesc.id);
                 if (window) this._placeAnimatedWindow(window, windowDesc, targetX, targetY, 'H', ctx);
@@ -2193,12 +2348,14 @@ export const TilingManager = GObject.registerClass({
     }
 
     _placeVerticalAnimated(tile_info, meta_windows, ctx) {
-        let x = tile_info.x;
+        const dx = ctx.contentOffset?.x ?? 0;
+        const dy = ctx.contentOffset?.y ?? 0;
+        let x = tile_info.x + dx;
         for (const level of tile_info.levels) {
-            let y = level.y;
+            let y = level.y + dy;
             for (const windowDesc of level.windows) {
-                const targetX = windowDesc.targetX !== undefined ? windowDesc.targetX : x;
-                const targetY = windowDesc.targetY !== undefined ? windowDesc.targetY : y;
+                const targetX = (windowDesc.targetX !== undefined ? windowDesc.targetX : x - dx) + dx;
+                const targetY = (windowDesc.targetY !== undefined ? windowDesc.targetY : y - dy) + dy;
 
                 const window = meta_windows.find(w => w.get_id() === windowDesc.id);
                 if (window) this._placeAnimatedWindow(window, windowDesc, targetX, targetY, 'V', ctx);
@@ -2214,9 +2371,9 @@ export const TilingManager = GObject.registerClass({
         // The sibling path gets this clamp from Mutter itself, which never honours an out-of-area
         // move_resize_frame. Miniatures ride on an actor transform, which Mutter does not police,
         // so a packed column taller than the work area walks them off the bottom edge.
-        ({ x: tx, y: ty } = clampToWorkArea(tx, ty, windowDesc.width, windowDesc.height, ctx.bounds));
+        ({x: tx, y: ty} = clampToWorkArea(tx, ty, windowDesc.width, windowDesc.height, ctx.bounds));
 
-        const slot = { x: tx, y: ty, width: windowDesc.width, height: windowDesc.height };
+        const slot = {x: tx, y: ty, width: windowDesc.width, height: windowDesc.height};
 
         if (WindowState.get(window, IS_MINIATURE)) {
             this._animateMiniatureSlot(window, tx, ty, slot, orient, ctx);
@@ -2233,16 +2390,16 @@ export const TilingManager = GObject.registerClass({
         if (ctx.pendingMiniIds.has(window.get_id())) {
             // Pending miniature: capture slot, but skip animateReTiling. createMiniature handles
             // all visual animation; a concurrent move_resize_frame would shift the actor mid-animation.
-            ctx.miniLayouts.push({ window, rect: slot });
+            ctx.miniLayouts.push({window, rect: slot});
             Logger.log(`[LAYOUT] ${orient} pending-mini ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`);
         } else if (window.get_id() === this._grabbedWindowId) {
             // Mutter's grab wins every frame, so a move_resize_frame here just yanks the window off
             // the cursor and snaps back. Claim the slot; the drop lands in it.
-            ctx.miniLayouts.push({ window, rect: slot });
+            ctx.miniLayouts.push({window, rect: slot});
             Logger.log(`[LAYOUT] ${orient} grabbed ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`);
         } else {
             Logger.log(`[LAYOUT] ${orient} window ${window.get_id()}: target=(${tx},${ty}) size=${windowDesc.width}x${windowDesc.height}`);
-            ctx.windowLayouts.push({ window, rect: slot });
+            ctx.windowLayouts.push({window, rect: slot});
         }
     }
 
@@ -2264,7 +2421,10 @@ export const TilingManager = GObject.registerClass({
     // ctx carries the workspace/monitor this tile pass is running for, so the model can be
     // flushed later without guessing which workspace a deferred window belongs to.
     _recordSlot(window, slot, ctx) {
-        MosaicModel.setSlot(window, slot, ctx.workspace, ctx.monitor);
+        if (WindowState.get(window, IS_MINIATURE) || ctx.pendingMiniIds.has(window.get_id()))
+            MosaicModel.setPresentationSlot(window, slot, ctx.workspace, ctx.monitor);
+        else
+            MosaicModel.commitNormalSlot(window, slot, ctx.workspace, ctx.monitor);
         if (ctx.slotsOut) ctx.slotsOut.set(window.get_id(), slot);
     }
 
@@ -2309,22 +2469,22 @@ export const TilingManager = GObject.registerClass({
         const OFFSET = 56;
 
         const frames = windows.map(w => w.get_frame_rect());
-        const relPositions = frames.map((f, i) => ({ x: i * OFFSET, y: i * OFFSET, w: f.width, h: f.height }));
+        const relPositions = frames.map((f, i) => ({x: i * OFFSET, y: i * OFFSET, w: f.width, h: f.height}));
 
         const groupW = Math.max(...relPositions.map(p => p.x + p.w));
         const groupH = Math.max(...relPositions.map(p => p.y + p.h));
 
-        const originX = workArea.x + Math.max(0, Math.round((workArea.width  - groupW) / 2));
+        const originX = workArea.x + Math.max(0, Math.round((workArea.width - groupW) / 2));
         const originY = workArea.y + Math.max(0, Math.round((workArea.height - groupH) / 2));
 
         Logger.log(`[CASCADE] workArea=(${workArea.x},${workArea.y} ${workArea.width}x${workArea.height}) group=(${groupW}x${groupH}) origin=(${originX},${originY}) windows=${windows.length}`);
 
         const layouts = windows.map((w, i) => {
             const p = relPositions[i];
-            const x = Math.min(originX + p.x, workArea.x + workArea.width  - p.w);
+            const x = Math.min(originX + p.x, workArea.x + workArea.width - p.w);
             const y = Math.min(originY + p.y, workArea.y + workArea.height - p.h);
             Logger.log(`[CASCADE] w=${w.get_id()} frame=(${frames[i].x},${frames[i].y} ${p.w}x${p.h}) -> (${x},${y})`);
-            return { window: w, rect: { x, y, width: p.w, height: p.h } };
+            return {window: w, rect: {x, y, width: p.w, height: p.h}};
         });
 
         // Raise from largest (back) to smallest (front) to establish visual stacking order.
@@ -2390,97 +2550,20 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    // Decide what to do with an overflowing reference window. Returns { tile_info,
-    // referenceOverflowSkipped }, or { stop: true } when a returning sacred window can't be fit.
-    _handleReferenceOverflow(reference_meta_window, windows, tileArea, workspace, monitor, tile_info) {
-        // Only overflow a window whose arrival is still being placed; this prevents expelling
-        // existing windows during resize retiling.
-        const isNewlyAdded = this._isArrivalPending(reference_meta_window);
-        if (!isNewlyAdded && !WindowState.get(reference_meta_window, 'forceOverflow') && !WindowState.get(reference_meta_window, 'isRestoringSacred')) {
-            Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - not a new window`);
-            return { tile_info, referenceOverflowSkipped: true };
-        }
-
-        if (WindowState.get(reference_meta_window, 'isSmartResizing') || WindowState.get(reference_meta_window, 'isRestoringSacred')) {
-            Logger.log(`Skipping overflow for ${reference_meta_window.get_id()} - smart resize/sacred restore in progress`);
-            // A sacred return must be made to fit even if it squishes everyone; only try once
-            // (guarded by isSmartResizing) to avoid loops.
-            if (WindowState.get(reference_meta_window, 'isRestoringSacred') && !WindowState.get(reference_meta_window, 'isSmartResizing')) {
-                return this._fitReturningSacred(reference_meta_window, workspace, monitor);
-            }
-            return { tile_info, referenceOverflowSkipped: false };
-        }
-
-        this._expelReferenceWindow(reference_meta_window, windows);
-        return { tile_info: this._tile(windows, tileArea), referenceOverflowSkipped: false };
-    }
-
-    _fitReturningSacred(reference_meta_window, workspace, monitor) {
-        Logger.log('Triggering Smart Resize for returning sacred window');
-        const workArea = this.getUsableWorkArea(workspace, monitor);
-        // windows above are descriptors; re-fetch MetaWindows for tryFitWithResize.
-        const realExisting = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => w.get_id() !== reference_meta_window.get_id() && !this._windowingManager.isExcluded(w));
-
-        const resizeResult = this.tryFitWithResize(reference_meta_window, realExisting, workArea, workspace);
-        if (!resizeResult?.success) {
-            Logger.log('Smart resize could not fit sacred window');
-            this._positionSnapshot = null;
-            this._restoreAnchor = null;
-            this._unlockWorkspaceEarlyReturn(workspace);
-            return { stop: true };
-        }
-
-        // Preserve any pending miniatures discovered during this resize pass.
-        if (resizeResult.pendingWindows?.length > 0) {
-            this._pendingMiniatureWindows = resizeResult.pendingWindows;
-        }
-        // Use the tile_info from tryFitWithResize (computed with miniature sizes).
-        return { tile_info: resizeResult.tileInfo, referenceOverflowSkipped: false };
-    }
-
-    // Newest goes, matching the victim the smart-resize rebalance already picks. A drag or live
-    // resize is exempt for the same reason the reference rung is: the drop decides, not the pass
-    // under the cursor.
-    _ejectForSurvivingOverflow(overflow, meta_windows, workspace, monitor) {
-        if (!overflow || this.isDragging || this.isResizing) return false;
-
-        const candidates = meta_windows.filter(w => !this._windowingManager.isExcluded(w));
-        if (candidates.length <= 1) return false;
-
-        const newest = candidates.reduce((n, w) => {
-            const t1 = WindowState.get(w, 'addedTime') || 0;
-            const t2 = WindowState.get(n, 'addedTime') || 0;
-            return t1 > t2 ? w : n;
-        }, candidates[0]);
-
-        Logger.log(`Overflow survived miniaturization, ejecting newest window ${newest.get_id()}`);
-        this._windowingManager.moveOversizedWindow(newest).then(() => {
-            this.invalidateLayoutCache();
-            this.tileWorkspaceWindows(workspace, null, monitor, true);
-        }).catch(e => Logger.error(`Overflow eject failed: ${e}`));
-
-        return true;
-    }
-
-    _expelReferenceWindow(reference_meta_window, windows) {
-        // Match by descriptor id, since descriptor.index drifts after edge-tiled/sacred windows filtered.
-        const id = reference_meta_window.get_id();
-        for (let i = 0; i < windows.length; i++) {
-            if (windows[i].id === id) {
-                windows.splice(i, 1);
-                break;
-            }
-        }
-        this._windowingManager.moveOversizedWindow(reference_meta_window).catch(e =>
-            Logger.error(`Overflow move failed for ref window: ${e}`));
+    // Tiling is deliberately workspace-local. A reference can tell the solver which window
+    // triggered a pass, but it is not permission to change workspace membership. Cross-workspace
+    // overflow belongs to WindowHandler's arrival transaction (or an explicit user move/resize),
+    // never to a generic retile, restore, reconcile, or animation settle pass.
+    _handleReferenceOverflow(reference_meta_window, tile_info) {
+        Logger.log(`Reference ${reference_meta_window.get_id()} overflows current layout; keeping it in-workspace for miniature resolution`);
+        return {tile_info, referenceOverflowSkipped: true};
     }
 
     // Keep where everyone stood before this pass shrinks someone. The restore that undoes it
     // needs that layout to aim at; the shrunken one only exists because of the shrink.
     _rememberLayoutBeforeShrink() {
         if (!this._settledSnapshot()) return;
-        for (const { window: w } of this._pendingMiniatureWindows ?? []) {
+        for (const {window: w} of this._pendingMiniatureWindows ?? []) {
             if (WindowState.get(w, IS_MINIATURE) || WindowState.get(w, 'layoutBeforeShrink'))
                 continue;
             WindowState.set(w, 'layoutBeforeShrink', new Map(this._positionSnapshot));
@@ -2520,7 +2603,7 @@ export const TilingManager = GObject.registerClass({
         this._positionSnapshot = new Map();
         for (const w of meta_windows) {
             const f = w.get_frame_rect();
-            this._positionSnapshot.set(w.get_id(), { cx: f.x + f.width / 2, cy: f.y + f.height / 2 });
+            this._positionSnapshot.set(w.get_id(), {cx: f.x + f.width / 2, cy: f.y + f.height / 2});
         }
 
         this._rememberLayoutBeforeShrink();
@@ -2531,7 +2614,7 @@ export const TilingManager = GObject.registerClass({
         for (const w of meta_windows) {
             const rc = WindowState.get(w, 'restoreAnchorCenter');
             if (rc) {
-                this._restoreAnchor = { id: w.get_id(), cx: rc.cx, cy: rc.cy };
+                this._restoreAnchor = {id: w.get_id(), cx: rc.cx, cy: rc.cy};
                 this._adoptLayoutBeforeShrink(w);
                 break;
             }
@@ -2566,10 +2649,12 @@ export const TilingManager = GObject.registerClass({
         this._pinnedSizesUnchanged = pin.sizes === sizes;
     }
 
-    // A single window never overflows; a maximized/fullscreen sibling always forces it.
+    // A single window never overflows; a native-state-blocking sibling always forces it.
+    // Miniatures are presentations and therefore do not count here even when their
+    // backing MetaWindow remains maximized.
     _determineOverflow(tile_info, workspace_windows) {
         if (workspace_windows.length <= 1) return false;
-        if (workspace_windows.some(w => this._windowingManager.isMaximizedOrFullscreen(w))) return true;
+        if (workspace_windows.some(w => this._nativeStateBlocksLayout(w))) return true;
         return tile_info.overflow;
     }
 
@@ -2586,7 +2671,7 @@ export const TilingManager = GObject.registerClass({
         const remainingSpace = this._edgeTilingManager.calculateRemainingSpace(workspace, monitor);
         if (this.dragRemainingSpace) {
             Logger.log(`Reusing drag remaining space: x=${this.dragRemainingSpace.x}, w=${this.dragRemainingSpace.width}`);
-            return { work_area: this.dragRemainingSpace, meta_windows };
+            return {work_area: this.dragRemainingSpace, meta_windows};
         }
 
         const edgeTiledIds = edgeTiledWindows.map(s => s.window.get_id());
@@ -2597,50 +2682,43 @@ export const TilingManager = GObject.registerClass({
         let filtered = meta_windows.filter(w => !edgeTiledIds.includes(w.get_id()));
         Logger.log(`After filtering edge-tiled: ${filtered.length} windows to tile`);
 
-        // Sacred windows (maximized/fullscreen) never get touched by the mosaic.
+        // Native maximize/fullscreen is transient while DominantManager normalizes it; never
+        // issue mosaic geometry to that transient native state.
         const beforeMaxFilter = filtered.length;
         filtered = filtered.filter(w => !this._windowingManager.isMaximizedOrFullscreen(w));
         if (filtered.length < beforeMaxFilter) {
-            Logger.log(`Filtered ${beforeMaxFilter - filtered.length} maximized/fullscreen (sacred) windows`);
+            Logger.log(`Filtered ${beforeMaxFilter - filtered.length} native maximized/fullscreen windows`);
         }
 
         if (filtered.length === 0) {
             Logger.log('No non-edge-tiled windows to tile');
             this._unlockWorkspaceEarlyReturn(workspace);
-            return { stop: true };
+            return {stop: true};
         }
 
-        return { work_area: remainingSpace, meta_windows: filtered };
+        return {work_area: remainingSpace, meta_windows: filtered};
     }
 
     // Both sides walled off, so the mosaic has no room. Expel the mosaic windows only when an
     // edge tile just completed the wall (or the newcomer is one of them); otherwise leave them.
-    _handleBothSidesEdgeTiled(edgeTiledWindows, workspace, monitor, reference_meta_window) {
+    _handleBothSidesEdgeTiled(edgeTiledWindows, workspace, _monitor, _reference_meta_window) {
         // During a drag only the preview may move; touching frames would fight the grab.
         if (this.isDragging) {
             Logger.log('Both sides edge-tiled - deferring overflow until drag ends');
             this._unlockWorkspaceEarlyReturn(workspace);
-            return { stop: true };
+            return {stop: true};
         }
 
         Logger.log('Both sides edge-tiled - workspace fully occupied');
 
-        const edgeTiledIds = edgeTiledWindows.map(w => w.window.get_id());
-        const isReferenceEdgeTiled = reference_meta_window && edgeTiledIds.includes(reference_meta_window.get_id());
-
-        for (const window of this._edgeTilingManager.getNonEdgeTiledWindows(workspace, monitor)) {
-            const isRef = reference_meta_window && window.get_id() === reference_meta_window.get_id();
-            if ((isRef || isReferenceEdgeTiled) &&
-                !this._windowingManager.isExcluded(window) &&
-                !this._windowingManager.isMaximizedOrFullscreen(window)) {
-                Logger.log(`Expelling non-edge-tiled window ${window.get_id()} (RefEdgeTiled=${isReferenceEdgeTiled}, IsRef=${isRef})`);
-                this._windowingManager.moveOversizedWindow(window).catch(e =>
-                    Logger.error(`Overflow expel failed for ${window.get_id()}: ${e}`));
-            }
-        }
+        // Completing an edge composition must not implicitly rewrite workspace membership.
+        // The edge-tiling interaction owns the edge windows; existing mosaic windows keep
+        // their workspace and their last committed geometry until an explicit admission or
+        // user move gives them a new destination.
+        Logger.log('Both sides edge-tiled - preserving non-edge windows in current workspace');
 
         this._unlockWorkspaceEarlyReturn(workspace);
-        return { stop: true };
+        return {stop: true};
     }
 
     // No monitor and no reference means "tile the whole workspace": recurse once per monitor,
@@ -2665,10 +2743,37 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    tileWorkspaceWindows(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling = false, dryRun = false, isRecursive = false) {
-        if (this._tileRequestBlocked(workspace, _monitor)) {
-            return { overflow: false, layout: null };
-        }
+    tileWorkspaceWindows(workspace, reference_meta_window, _monitor, keep_oversized_windows = false, excludeFromTiling = false, dryRun = false, isRecursive = false) {
+        const preflight = this._tilePreflight(workspace, _monitor, excludeFromTiling, dryRun);
+        if (preflight) return preflight;
+
+        return this._runTileWorkspacePass(
+            workspace, reference_meta_window, _monitor, keep_oversized_windows,
+            excludeFromTiling, dryRun, isRecursive);
+    }
+
+    _tilePreflight(workspace, monitor, excludeFromTiling, dryRun) {
+        if (this._tileRequestBlocked(workspace, monitor))
+            return {overflow: false, layout: null};
+
+        if (dryRun || excludeFromTiling || this.isDragging)
+            return null;
+        if (monitor === null || monitor === undefined)
+            return null;
+
+        return this._dominantTilePreflight(workspace, monitor);
+    }
+
+    _dominantTilePreflight(workspace, monitor) {
+        const dominantManager = this._extension?.dominantManager;
+        if (!dominantManager?.hasIntent(workspace, monitor))
+            return null;
+        return dominantManager.reconcile(workspace, monitor)
+            ? {overflow: false, layout: null}
+            : null;
+    }
+
+    _runTileWorkspacePass(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling, dryRun, isRecursive) {
 
         Logger.log(`tileWorkspaceWindows: Starting for workspace ${workspace.index()} (isRecursive=${isRecursive})`);
 
@@ -2678,19 +2783,30 @@ export const TilingManager = GObject.registerClass({
 
         const ctx = this._buildTileContext(workspace, reference_meta_window, _monitor, excludeFromTiling);
         if (ctx.done) return ctx.result;
-        const { meta_windows, windows, work_area, monitor, workspace_windows, edgeTiledWindows } = ctx;
+        return this._executeUnifiedTilePass(
+            workspace, reference_meta_window, keep_oversized_windows,
+            dryRun, isRecursive, ctx);
+    }
+
+    _executeUnifiedTilePass(workspace, referenceMetaWindow, keepOversizedWindows, dryRun, isRecursive, ctx) {
+        const {meta_windows, windows, work_area, monitor, workspace_windows, edgeTiledWindows} = ctx;
 
         this._preapplyPendingMiniSizes(windows);
 
         // Computed slots from this pass, returned to the caller so it can find
-        // miniature positions without depending on the ComputedLayouts side-channel.
+        // miniature positions without depending on global model lookups.
         const computedSlots = new Map();
 
-        const tileArea = this._effectiveTileArea(work_area);
+        const baseTileArea = this._effectiveTileArea(work_area);
+        let railPlan = this._planUnifiedMiniatureRail(
+            workspace, monitor, meta_windows, windows, baseTileArea);
+        if (!railPlan)
+            return this._abortOverflowTilePass(workspace, isRecursive);
+        let {tileArea, tiledWindows, tiledMetaWindows} = railPlan;
 
         this._prepareTilePass(meta_windows, windows, workspace);
 
-        let tile_info = this._tile(windows, tileArea, dryRun);
+        let tile_info = this._tile(tiledWindows, tileArea, dryRun);
         this._activePinnedShape = null;
         this._activePinnedVertical = null;
         let overflow = this._determineOverflow(tile_info, workspace_windows);
@@ -2698,34 +2814,386 @@ export const TilingManager = GObject.registerClass({
         if (dryRun) return this._dryRunResult(overflow, workspace);
 
         const refPhase = this._maybeEjectReference(
-            overflow, keep_oversized_windows, reference_meta_window, edgeTiledWindows, windows, tileArea, workspace, monitor, tile_info);
-        if (refPhase.stop) return { overflow: true, layout: null };
+            overflow, keepOversizedWindows, referenceMetaWindow, edgeTiledWindows, tile_info);
+        if (refPhase.stop) return {overflow: true, layout: null};
         tile_info = refPhase.tile_info;
 
+        const pendingCountBeforeResolve = this._pendingMiniatureWindows?.length ?? 0;
         const resolved = this._resolveOverflowByMiniature(
-            overflow, reference_meta_window, refPhase.referenceOverflowSkipped, meta_windows, windows, workspace, tileArea, tile_info);
+            overflow, referenceMetaWindow, refPhase.referenceOverflowSkipped,
+            meta_windows, windows, workspace, monitor, baseTileArea, tile_info);
         tile_info = resolved.tile_info;
         overflow = resolved.overflow;
+
+        const refreshed = this._refreshRailAfterMiniaturization({
+            workspace,
+            monitor,
+            metaWindows: meta_windows,
+            windows,
+            baseTileArea,
+            workspaceWindows: workspace_windows,
+            dryRun,
+            pendingCountBeforeResolve,
+            railPlan,
+            tileArea,
+            tiledWindows,
+            tiledMetaWindows,
+            tileInfo: tile_info,
+            overflow,
+        });
+        if (!refreshed) return this._abortOverflowTilePass(workspace, isRecursive);
+        ({railPlan, tileArea, tileInfo: tile_info, overflow} = refreshed);
+
+        // _tile() can return a force-clamped shape when no non-overlapping composition exists.
+        // That shape is diagnostic only: committing it would visibly overlap windows. A pure
+        // retile is not allowed to solve that by moving an arbitrary existing window either.
+        // Keep the last valid geometry and let the admission/user-operation owner decide what
+        // to do next.
+        const placementBounds = this._railPlacementBounds(railPlan, baseTileArea);
+        if (overflow || !this._tileGeometryIsValid(
+            tile_info, placementBounds, 'workspace tile', railPlan.contentOffset))
+            return this._abortOverflowTilePass(workspace, isRecursive);
 
         this._positionSnapshot = null;
         this._restoreAnchor = null;
         this._recordGroupStability(tile_info);
         Logger.log(`Drawing tiles - isDragging: ${this.isDragging}, using tileArea: x=${tileArea.x}, y=${tileArea.y}`);
 
-        // Ejecting and miniaturizing above can both come back still overflowing, and the packer
-        // force-stacks into the work area rather than refusing, so drawing it piles windows up.
-        if (this._ejectForSurvivingOverflow(overflow, meta_windows, workspace, monitor)) {
-            // The miniaturization above still stands; finalize it here too, or the flagged
-            // window never gets its miniature and stays frozen out of every later pass.
-            this._finalizeTilePass(overflow, meta_windows, computedSlots, tileArea, workspace, isRecursive);
-            return { overflow: true, layout: null };
-        }
-
-        this._positionTiledWindows(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots, work_area);
+        this._positionTiledWindows(
+            workspace, monitor, tile_info, tileArea, meta_windows,
+            referenceMetaWindow, computedSlots, placementBounds, railPlan.contentOffset);
+        this._positionUnifiedMiniatureRail(
+            railPlan, meta_windows, workspace, monitor, computedSlots);
+        this._rememberMiniatureRailSide(workspace, monitor, railPlan.side);
 
         this._publishToOverviewIfAvailable(workspace, monitor);
 
         return this._finalizeTilePass(overflow, meta_windows, computedSlots, tileArea, workspace, isRecursive);
+    }
+
+    _railPlacementBounds(railPlan, fallback) {
+        return railPlan.placementBounds || fallback;
+    }
+
+    _refreshRailAfterMiniaturization(state) {
+        const currentPendingCount = this._pendingMiniatureWindows?.length ?? 0;
+        if (currentPendingCount === state.pendingCountBeforeResolve) return state;
+
+        const railPlan = this._planUnifiedMiniatureRail(
+            state.workspace, state.monitor, state.metaWindows, state.windows, state.baseTileArea);
+        if (!railPlan) return null;
+        const tileInfo = this._tile(railPlan.tiledWindows, railPlan.tileArea, state.dryRun);
+        return {
+            ...state,
+            railPlan,
+            tileArea: railPlan.tileArea,
+            tiledWindows: railPlan.tiledWindows,
+            tiledMetaWindows: railPlan.tiledMetaWindows,
+            tileInfo,
+            overflow: this._determineOverflow(tileInfo, state.workspaceWindows),
+        };
+    }
+
+    _planUnifiedMiniatureRail(workspace, monitor, metaWindows, windows, area) {
+        if (!area) return null;
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
+        const partition = this._partitionUnifiedRailWindows(metaWindows, windows, targetSize);
+
+        const previousSide = this._getMiniatureRailSide(workspace, monitor);
+        const requiredSide = this._miniatureRailSideConstraint(workspace, monitor);
+        const solution = solveMiniatureRail({
+            workArea: area,
+            miniatureItems: partition.miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide,
+            requiredSide,
+            contentEvaluator: (contentRect, side) => this._evaluateRailContent(
+                partition.tiledWindows, contentRect, 'unified miniature rail', side),
+        });
+        if (!solution) return null;
+
+        return {
+            side: solution.side,
+            tileArea: solution.contentRect,
+            placementBounds: area,
+            contentOffset: solution.contentOffset ?? {x: 0, y: 0},
+            miniatureSlots: solution.slots,
+            miniatureIds: new Set(partition.miniatureItems.map(item => item.id)),
+            tiledWindows: partition.tiledWindows,
+            tiledMetaWindows: partition.tiledMetaWindows,
+        };
+    }
+
+    _partitionUnifiedRailWindows(metaWindows, windows, targetSize) {
+        const byId = new Map(metaWindows.map(window => [window.get_id(), window]));
+        const pending = new Map((this._pendingMiniatureWindows ?? [])
+            .map(entry => [entry.window.get_id(), entry]));
+        const result = {miniatureItems: [], tiledWindows: [], tiledMetaWindows: []};
+        for (const descriptor of windows)
+            this._partitionUnifiedRailDescriptor(descriptor, byId, pending, targetSize, result);
+        return result;
+    }
+
+    _partitionUnifiedRailDescriptor(descriptor, byId, pending, targetSize, result) {
+        const window = byId.get(descriptor.id);
+        if (!window) return;
+        const pendingEntry = pending.get(descriptor.id);
+        if (!WindowState.get(window, IS_MINIATURE) && !pendingEntry) {
+            result.tiledWindows.push(descriptor);
+            result.tiledMetaWindows.push(window);
+            return;
+        }
+
+        const source = this._miniatureSourceSize(window, pendingEntry);
+        const size = miniatureSizeForSource(source, targetSize);
+        descriptor.width = size.width;
+        descriptor.height = size.height;
+        descriptor.isMiniature = true;
+        result.miniatureItems.push({id: descriptor.id, ...size});
+    }
+
+    _miniatureSourceSize(window, pendingEntry = null) {
+        return pendingEntry?.preSize
+            ?? WindowState.get(window, PRE_MINIATURE_SIZE)
+            ?? WindowState.get(window, 'preferredSize')
+            ?? WindowState.get(window, 'openingSize')
+            ?? window.get_frame_rect();
+    }
+
+    _evaluateRailContent(windows, contentRect, label, side = null) {
+        const tile = this._tile(windows, contentRect, true);
+        const valid = !tile.overflow && this._tileGeometryIsValid(tile, contentRect, label);
+        return {
+            valid,
+            payload: tile,
+            bounds: valid && side ? this._layoutBounds(tile, contentRect) : null,
+        };
+    }
+
+    _positionUnifiedMiniatureRail(plan, metaWindows, workspace, monitor, computedSlots) {
+        if (!plan?.miniatureSlots?.size) return;
+        const byId = new Map(metaWindows.map(window => [window.get_id(), window]));
+        for (const [id, slot] of plan.miniatureSlots)
+            this._commitUnifiedMiniatureSlot(plan.side, byId.get(id), id, slot,
+                workspace, monitor, computedSlots);
+    }
+
+    _commitUnifiedMiniatureSlot(side, window, id, slot, workspace, monitor, computedSlots) {
+        if (!window) return;
+        MosaicModel.setPresentationSlot(window, slot, workspace, monitor);
+        computedSlots?.set(id, slot);
+        if (WindowState.get(window, IS_MINIATURE))
+            this._extension?.miniatureManager?.updateMiniatureLayout(window, slot);
+        Logger.log(`[MINIATURE] Unified rail ${side ?? 'none'}: ${id} at (${slot.x},${slot.y}) ${slot.width}x${slot.height}`);
+    }
+
+    _miniatureRailReservationForMetaWindows(workspace, monitor, metaWindows, area) {
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
+        const miniatureItems = [];
+        for (const window of metaWindows) {
+            if (!WindowState.get(window, IS_MINIATURE)) continue;
+            const source = WindowState.get(window, PRE_MINIATURE_SIZE)
+                ?? WindowState.get(window, 'preferredSize')
+                ?? WindowState.get(window, 'openingSize')
+                ?? window.get_frame_rect();
+            miniatureItems.push({
+                id: window.get_id(),
+                ...miniatureSizeForSource(source, targetSize),
+            });
+        }
+
+        const solution = solveMiniatureRail({
+            workArea: area,
+            miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+        });
+        if (!solution) {
+            Logger.log('[MINIATURE] Existing miniature rail has no legal in-workspace reservation');
+            return null;
+        }
+        return {
+            tileArea: solution.contentRect,
+            miniatureIds: new Set(miniatureItems.map(item => item.id)),
+            side: solution.side,
+        };
+    }
+
+    _getMiniatureRailSide(workspace, monitor) {
+        return this._miniatureRailSides.get(workspace)?.get(monitor) ?? null;
+    }
+
+    getMiniatureRailSide(workspace, monitor) {
+        return this._getMiniatureRailSide(workspace, monitor);
+    }
+
+    _miniatureRailSideConstraint(workspace, monitor) {
+        return this._extension?.dominantManager?.getRailSideConstraint?.(workspace, monitor) ?? null;
+    }
+
+    _miniatureTargetSize(workspace, monitor) {
+        return this._extension?.dominantManager?.getMiniatureTargetSize(workspace, monitor)
+            ?? constants.MINIATURE_TARGET_SIZE_PX;
+    }
+
+    _miniatureTargetSizeForWindow(window) {
+        return this._miniatureTargetSize(window.get_workspace?.(), window.get_monitor?.());
+    }
+
+    // Presentation changes must be proven against what the compositor is drawing now, not
+    // against targetSmartResizeSize/targetRestoredSize. Those targets can lead a Wayland client
+    // by several frames; expanding a miniature rail from 128px to 256px during that gap would
+    // place the rail underneath the still-large normal actor. This is intentionally a pure
+    // feasibility probe: callers commit the profile only after the live geometry fits it.
+    canUseMiniatureTargetSizeFromLiveFrames(workspace, monitor, targetSize) {
+        const workArea = this.getUsableWorkArea(workspace, monitor);
+        if (!workArea || workArea.width <= 0 || workArea.height <= 0) return false;
+
+        const windows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .filter(window => !this._windowingManager.isExcluded(window))
+            .filter(window => !this._edgeTilingManager?.isEdgeTiled?.(window));
+        const miniatureItems = [];
+        const normalItems = [];
+
+        for (const window of windows) {
+            if (WindowState.get(window, IS_MINIATURE)) {
+                const source = this._miniatureSourceSize(window);
+                miniatureItems.push({
+                    id: window.get_id(),
+                    ...miniatureSizeForSource(source, targetSize),
+                });
+                continue;
+            }
+            if (this._windowingManager.isMaximizedOrFullscreen(window)) return false;
+            const frame = window.get_frame_rect();
+            normalItems.push({id: window.get_id(), width: frame.width, height: frame.height});
+        }
+
+        return !!solveMiniatureRail({
+            workArea,
+            miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+            contentEvaluator: contentRect => this._evaluateRailContent(
+                normalItems, contentRect, 'live presentation commit'),
+        });
+    }
+
+    // Prepare the normal side of a presentation-profile transition without touching the
+    // currently visible miniature rail. This is the first half of a two-phase barrier:
+    // normal windows move/shrink into the target profile's content region, then the caller
+    // waits for live Wayland frames before allowing miniature actors to expand into the
+    // space that was just vacated.
+    prepareMiniaturePresentationTransition(workspace, monitor, targetSize) {
+        const participants = this._presentationTransitionParticipants(
+            workspace, monitor, targetSize);
+        if (!participants) return null;
+        const {workArea, miniatureItems, normalData} = participants;
+        const buildSimulated = scale => normalData.map(data => ({
+            id: data.window.get_id(),
+            width: Math.round(data.min.width + (data.ceiling.width - data.min.width) * scale),
+            height: Math.round(data.min.height + (data.ceiling.height - data.min.height) * scale),
+        }));
+        const solve = simulated => solveMiniatureRail({
+            workArea,
+            miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+            contentEvaluator: (contentRect, side) => this._evaluateRailContent(
+                simulated, contentRect, 'presentation transition', side),
+        });
+        const solved = this._solvePresentationTransition(buildSimulated, solve);
+        if (!solved) return null;
+        const {scale, solution} = solved;
+        if (!solution?.payload) return null;
+
+        const rects = this._layoutRects(solution.payload, workArea, solution.contentOffset);
+        const rectById = new Map(rects.map(rect => [rect.id, rect]));
+        for (const data of normalData) {
+            const rect = rectById.get(data.window.get_id());
+            if (!rect) return null;
+            this._applyPresentationNormalTarget(data.window, rect);
+        }
+
+        Logger.log(`[MINIATURE] Prepared ${normalData.length} normal window(s) for ${targetSize}px ${solution.side ?? 'none'} rail at scale ${scale.toFixed(4)}`);
+        return {
+            side: solution.side,
+            miniatureSlots: solution.slots,
+            normalRects: rectById,
+        };
+    }
+
+    _presentationTransitionParticipants(workspace, monitor, targetSize) {
+        const workArea = this.getUsableWorkArea(workspace, monitor);
+        if (!workArea || workArea.width <= 0 || workArea.height <= 0) return null;
+        const windows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .filter(window => !this._windowingManager.isExcluded(window))
+            .filter(window => !this._edgeTilingManager?.isEdgeTiled?.(window));
+        const miniatureItems = windows
+            .filter(window => WindowState.get(window, IS_MINIATURE))
+            .map(window => ({
+                id: window.get_id(),
+                ...miniatureSizeForSource(this._miniatureSourceSize(window), targetSize),
+            }));
+        const normalData = windows
+            .filter(window => !WindowState.get(window, IS_MINIATURE))
+            .filter(window => !this._windowingManager.isMaximizedOrFullscreen(window))
+            .map(window => this._presentationNormalData(window));
+        return normalData.length > 0 ? {workArea, miniatureItems, normalData} : null;
+    }
+
+    _solvePresentationTransition(buildSimulated, solve) {
+        let scale = 1;
+        let solution = solve(buildSimulated(scale));
+        if (solution) return {scale, solution};
+        if (!solve(buildSimulated(0))) {
+            Logger.log('[MINIATURE] Target presentation cannot fit normal windows even at minimum sizes');
+            return null;
+        }
+        scale = this._binarySearchFitScale(buildSimulated, simulated => !!solve(simulated));
+        solution = solve(buildSimulated(scale));
+        return solution ? {scale, solution} : null;
+    }
+
+    _presentationNormalData(window) {
+        const frame = window.get_frame_rect();
+        const requested = WindowState.get(window, 'targetRestoredSize')
+            ?? WindowState.get(window, 'preferredSize')
+            ?? WindowState.get(window, 'openingSize')
+            ?? frame;
+        const minimum = window.allows_resize?.()
+            ? this.getWindowMinimumSize(window)
+            : requested;
+        return {
+            window,
+            ceiling: {
+                width: Math.max(1, requested.width),
+                height: Math.max(1, requested.height),
+            },
+            min: {
+                width: Math.min(Math.max(1, minimum.width), Math.max(1, requested.width)),
+                height: Math.min(Math.max(1, minimum.height), Math.max(1, requested.height)),
+            },
+        };
+    }
+
+    _applyPresentationNormalTarget(window, rect) {
+        WindowState.set(window, 'isConstrainedByMosaic', true);
+        this.setSmartResizeTarget(window, rect);
+        window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+    }
+
+    _rememberMiniatureRailSide(workspace, monitor, side) {
+        if (!workspace || monitor === null || monitor === undefined) return;
+        let monitors = this._miniatureRailSides.get(workspace);
+        if (!monitors) {
+            monitors = new Map();
+            this._miniatureRailSides.set(workspace, monitors);
+        }
+        monitors.set(monitor, side ?? null);
     }
 
     // destroyMasks + lock, then resolve the target monitor (dispatching per-monitor when none given).
@@ -2743,12 +3211,12 @@ export const TilingManager = GObject.registerClass({
         if (_monitor === null || _monitor === undefined) {
             if (!reference_meta_window) {
                 this._tileEachMonitor(workspace, keep_oversized_windows, excludeFromTiling, dryRun);
-                return { done: true, result: { overflow: false, layout: null } };
+                return {done: true, result: {overflow: false, layout: null}};
             }
             _monitor = reference_meta_window.get_monitor();
         }
 
-        return { done: false, monitor: _monitor };
+        return {done: false, monitor: _monitor};
     }
 
     // Working geometry for the pass: descriptors, work area, resolved monitor, edge-tiled slots.
@@ -2761,7 +3229,7 @@ export const TilingManager = GObject.registerClass({
         const working_info = this._getWorkingInfo(workspace, reference_meta_window, _monitor, excludeFromTiling);
         if (!working_info) {
             this._unlockWorkspaceEarlyReturn(workspace);
-            return { done: true, result: { overflow: false, layout: null } };
+            return {done: true, result: {overflow: false, layout: null}};
         }
         let meta_windows = working_info.meta_windows;
         const windows = working_info.windows;
@@ -2779,22 +3247,24 @@ export const TilingManager = GObject.registerClass({
         if (edgeTiledWindows.length > 0) {
             const edgeResult = this._applyEdgeTiledConstraints(
                 edgeTiledWindows, workspace, monitor, reference_meta_window, meta_windows, workspace_windows);
-            if (edgeResult.stop) return { done: true, result: { overflow: false, layout: null } };
+            if (edgeResult.stop) return {done: true, result: {overflow: false, layout: null}};
             meta_windows = edgeResult.meta_windows;
             work_area = edgeResult.work_area;
         }
 
-        return { done: false, meta_windows, windows, work_area, monitor, workspace_windows, edgeTiledWindows };
+        return {done: false, meta_windows, windows, work_area, monitor, workspace_windows, edgeTiledWindows};
     }
 
     // Nothing to eject (no reference, or its expulsion was skipped), so try
     // miniaturizing candidates to reclaim space instead of painting overflow.
-    _resolveOverflowByMiniature(overflow, reference_meta_window, referenceOverflowSkipped, meta_windows, windows, workspace, tileArea, tile_info) {
+    _resolveOverflowByMiniature(overflow, reference_meta_window, referenceOverflowSkipped,
+        meta_windows, windows, workspace, monitor, workArea, tile_info) {
         if (!(overflow && this._noRefMiniaturizeAllowed(reference_meta_window, referenceOverflowSkipped) && this._extension?.miniatureManager))
-            return { tile_info, overflow };
+            return {tile_info, overflow};
 
-        const resolved = this._miniaturizeForNoRefOverflow(meta_windows, windows, workspace, reference_meta_window, tileArea);
-        return resolved ? resolved : { tile_info, overflow };
+        const resolved = this._miniaturizeForNoRefOverflow(
+            meta_windows, windows, workspace, monitor, reference_meta_window, workArea);
+        return resolved ? resolved : {tile_info, overflow};
     }
 
     _finalizeTilePass(overflow, meta_windows, computedSlots, tileArea, workspace, isRecursive) {
@@ -2802,16 +3272,34 @@ export const TilingManager = GObject.registerClass({
             this._createPendingMiniatures(meta_windows, computedSlots, tileArea);
         }
 
-        const result = { overflow, layout: this._cachedTileResult?.windows || null, computedSlots };
+        const result = {overflow, layout: this._cachedTileResult?.windows || null, computedSlots};
         this.emit('mosaic-changed', workspace);
 
         if (!isRecursive) {
-            for (const { window: win } of this._pendingMiniatureWindows ?? [])
+            for (const {window: win} of this._pendingMiniatureWindows ?? [])
                 WindowState.remove(win, PENDING_MINIATURE);
             this._pendingMiniatureWindows = [];
         }
 
         return result;
+    }
+
+    _abortOverflowTilePass(workspace, isRecursive) {
+        Logger.log('[OVERFLOW] Unresolved workspace-local overflow; preserving the last valid layout');
+        this._positionSnapshot = null;
+        this._restoreAnchor = null;
+        this._activePinnedShape = null;
+        this._activePinnedVertical = null;
+        this.invalidateLayoutCache();
+
+        if (!isRecursive) {
+            for (const {window} of this._pendingMiniatureWindows ?? [])
+                WindowState.remove(window, PENDING_MINIATURE);
+            this._pendingMiniatureWindows = [];
+        }
+
+        this._unlockWorkspaceEarlyReturn(workspace);
+        return {overflow: true, layout: null, computedSlots: new Map()};
     }
 
     _publishToOverviewIfAvailable(workspace, monitor) {
@@ -2820,15 +3308,19 @@ export const TilingManager = GObject.registerClass({
 
     // Eject the reference window when it caused the overflow, unless edge-tiling or a drag
     // owns its placement. Returns {stop} to abort, else the possibly-updated tile_info.
-    _maybeEjectReference(overflow, keep_oversized_windows, reference_meta_window, edgeTiledWindows, windows, tileArea, workspace, monitor, tile_info) {
+    _maybeEjectReference(overflow, keep_oversized_windows, reference_meta_window, edgeTiledWindows, tile_info) {
         const canOverflow = this._canExpelReference(reference_meta_window, edgeTiledWindows);
 
         if (!(overflow && !keep_oversized_windows && reference_meta_window && canOverflow && !this.isDragging))
-            return { stop: false, tile_info, referenceOverflowSkipped: false };
+            return {stop: false, tile_info, referenceOverflowSkipped: false};
 
-        const refResult = this._handleReferenceOverflow(reference_meta_window, windows, tileArea, workspace, monitor, tile_info);
-        if (refResult.stop) return { stop: true };
-        return { stop: false, tile_info: refResult.tile_info, referenceOverflowSkipped: refResult.referenceOverflowSkipped };
+        const refResult = this._handleReferenceOverflow(reference_meta_window, tile_info);
+        if (refResult.stop) return {stop: true};
+        return {
+            stop: false,
+            tile_info: refResult.tile_info,
+            referenceOverflowSkipped: refResult.referenceOverflowSkipped
+        };
     }
 
     // Block expulsion if edge-tiled (except a non-edge reference); the edge slot owns its geometry.
@@ -2856,7 +3348,7 @@ export const TilingManager = GObject.registerClass({
         this._positionSnapshot = null;
         this._restoreAnchor = null;
         this._unlockWorkspaceEarlyReturn(workspace);
-        return { overflow, layout: this._cachedTileResult?.windows || null };
+        return {overflow, layout: this._cachedTileResult?.windows || null};
     }
 
     // Pre-apply mini sizes so the initial _tile sees the correct footprint.
@@ -2897,7 +3389,8 @@ export const TilingManager = GObject.registerClass({
         Logger.log(`[GROUP STABILITY] Recorded ${newGroupAssignment.pairs.size} pairs over ${partition}`);
     }
 
-    _positionTiledWindows(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots, work_area) {
+    _positionTiledWindows(workspace, monitor, tile_info, tileArea, meta_windows,
+        reference_meta_window, computedSlots, work_area, contentOffset = null) {
         let animationsHandledPositioning = false;
         if (!this.isDragging && tile_info && tile_info.levels && tile_info.levels.length > 0) {
             if (reference_meta_window && WindowState.get(reference_meta_window, 'justReturnedFromExclusion')) {
@@ -2905,12 +3398,16 @@ export const TilingManager = GObject.registerClass({
                 WindowState.remove(reference_meta_window, 'justReturnedFromExclusion');
             }
 
-            animationsHandledPositioning = this._animateTileLayout(workspace, monitor, tile_info, tileArea, meta_windows, reference_meta_window, computedSlots, work_area);
+            animationsHandledPositioning = this._animateTileLayout(
+                workspace, monitor, tile_info, tileArea, meta_windows,
+                reference_meta_window, computedSlots, work_area, contentOffset);
         }
 
         if (!animationsHandledPositioning) {
             Logger.log('Animations did not handle positioning, calling drawTile');
-            this._drawTile(workspace, monitor, tile_info, meta_windows, false, computedSlots, work_area);
+            this._drawTile(
+                workspace, monitor, tile_info, meta_windows,
+                false, computedSlots, work_area, contentOffset);
             // _animateTileLayout owns the deferred unlock; since it didn't run,
             // release the lock now that positioning is done synchronously.
             this._unlockWorkspaceEarlyReturn(workspace);
@@ -2928,7 +3425,7 @@ export const TilingManager = GObject.registerClass({
         }
 
         if (!(this._pendingMiniatureWindows?.length > 0) || !this._extension?.miniatureManager) return;
-        for (const { window: win, preSize } of this._pendingMiniatureWindows) {
+        for (const {window: win, preSize} of this._pendingMiniatureWindows) {
             // Skip if already miniaturized, since an earlier tile call may have created it first.
             if (WindowState.get(win, IS_MINIATURE)) continue;
             this._createOnePendingMiniature(win, preSize, computedSlots, tileArea);
@@ -2943,7 +3440,12 @@ export const TilingManager = GObject.registerClass({
             this._extension.miniatureManager.createMiniature(win, slot, preSize);
         } else {
             Logger.warn(`[MINIATURE] No computed slot for window ${win.get_id()}, using workArea`);
-            this._extension.miniatureManager.createMiniature(win, { x: tileArea.x, y: tileArea.y, width: tileArea.width, height: tileArea.height }, preSize);
+            this._extension.miniatureManager.createMiniature(win, {
+                x: tileArea.x,
+                y: tileArea.y,
+                width: tileArea.width,
+                height: tileArea.height
+            }, preSize);
         }
     }
 
@@ -2974,10 +3476,10 @@ export const TilingManager = GObject.registerClass({
             (_monitor < 0 || _monitor >= global.display.get_n_monitors());
     }
 
-    // No reference to eject, so reclaim space by miniaturizing MRU-coldest candidates
-    // one at a time until the sim stops overflowing. Returns the resolved
-    // {tile_info, overflow} when it fits, or null to leave the caller's values alone.
-    _miniaturizeForNoRefOverflow(meta_windows, windows, workspace, reference_meta_window, tileArea) {
+    // No reference to eject, so reclaim space by miniaturizing MRU-coldest candidates one at a
+    // time. Role selection uses the same unified rail solver as the final commit; we never mix
+    // miniature footprints back into the normal-window _tile() model to decide who is sacrificed.
+    _miniaturizeForNoRefOverflow(meta_windows, windows, workspace, monitor, reference_meta_window, workArea) {
         const focusedId = global.display.focus_window?.get_id();
         const resizingId = this._animationsManager?.getResizingWindowId();
         const mru = this._windowingManager.getMRUOrder(workspace);
@@ -2986,6 +3488,7 @@ export const TilingManager = GObject.registerClass({
         const overflowCandidates = meta_windows
             .filter(w =>
                 !WindowState.get(w, IS_MINIATURE) &&
+                !WindowState.get(w, PENDING_MINIATURE) &&
                 w.get_id() !== focusedId &&
                 w.get_id() !== resizingId &&
                 w.get_id() !== (this._restoringWindowId ?? null) &&
@@ -2994,54 +3497,82 @@ export const TilingManager = GObject.registerClass({
             )
             .sort((a, b) => rank(b) - rank(a));
 
-        // Accumulate mini sizes across iterations so multiple windows can stack to resolve overflow.
-        const cumulativeSim = new Map(meta_windows.map(w => this._simFootprint(w)));
+        const simulatedMiniIds = new Set();
         const pendingMinis = [];
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
 
         for (const candidate of overflowCandidates) {
             const frame = candidate.get_frame_rect();
-            // Scale from current frame so the visual fills the slot.
-            const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(frame.width, frame.height);
-            const miniW = Math.round(frame.width * scale);
-            const miniH = Math.round(frame.height * scale);
+            const miniSize = miniatureSizeForSource(frame, targetSize);
+            simulatedMiniIds.add(candidate.get_id());
+            pendingMinis.push({candidate, frame, miniSize});
 
-            cumulativeSim.set(candidate.get_id(), { width: miniW, height: miniH });
-            pendingMinis.push({ candidate, frame, miniW, miniH });
-
-            const simSizes = [...cumulativeSim.entries()].map(([id, s]) => ({ id, width: s.width, height: s.height }));
-
-            if (!this._tile(simSizes, tileArea, true).overflow) {
+            if (this._simulateUnifiedRailWithAdditionalMinis(
+                meta_windows, windows, workspace, monitor, workArea, simulatedMiniIds)) {
                 Logger.log(`[OVERFLOW] No-ref overflow resolved by miniaturizing ${pendingMinis.length} window(s)`);
-                return this._commitNoRefMinis(pendingMinis, windows, tileArea);
+                return this._commitNoRefMinis(pendingMinis, windows);
             }
         }
 
-        Logger.log('[OVERFLOW] No-ref overflow: miniaturizing all candidates still overflows, applying clamped positions');
+        Logger.log('[OVERFLOW] No-ref overflow: unified rail still has no legal layout after all candidates');
         return null;
     }
 
-    // Current footprint of a window for the no-ref sim: mini size when miniaturized, frame otherwise.
-    _simFootprint(w) {
-        const f = w.get_frame_rect();
-        if (WindowState.get(w, IS_MINIATURE)) {
-            const ms = getMiniatureSize(w);
-            return [w.get_id(), ms ? { width: ms.width, height: ms.height } : { width: f.width, height: f.height }];
-        }
-        return [w.get_id(), { width: f.width, height: f.height }];
+    _simulateUnifiedRailWithAdditionalMinis(metaWindows, windows, workspace, monitor, workArea, additionalMiniIds) {
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
+        const partition = this._partitionSimulatedRailWindows(
+            metaWindows, windows, additionalMiniIds, targetSize);
+        return solveMiniatureRail({
+            workArea,
+            miniatureItems: partition.miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+            contentEvaluator: contentRect => this._evaluateRailContent(
+                partition.normalItems, contentRect, 'no-ref miniature simulation'),
+        });
     }
 
-    _commitNoRefMinis(pendingMinis, windows, tileArea) {
+    _partitionSimulatedRailWindows(metaWindows, windows, additionalMiniIds, targetSize) {
+        const byId = new Map(metaWindows.map(window => [window.get_id(), window]));
+        const pending = new Map((this._pendingMiniatureWindows ?? [])
+            .map(entry => [entry.window.get_id(), entry]));
+        const result = {miniatureItems: [], normalItems: []};
+        for (const descriptor of windows) {
+            const window = byId.get(descriptor.id);
+            if (!window) continue;
+            const pendingEntry = pending.get(descriptor.id);
+            const isMini = WindowState.get(window, IS_MINIATURE) || pendingEntry ||
+                additionalMiniIds.has(descriptor.id);
+            if (!isMini) {
+                result.normalItems.push({id: descriptor.id, width: descriptor.width, height: descriptor.height});
+                continue;
+            }
+            const source = this._miniatureSourceSize(window, pendingEntry);
+            result.miniatureItems.push({id: descriptor.id, ...miniatureSizeForSource(source, targetSize)});
+        }
+        return result;
+    }
+
+    _commitNoRefMinis(pendingMinis, windows) {
         if (!this._pendingMiniatureWindows) this._pendingMiniatureWindows = [];
-        for (const { candidate: c, frame: f, miniW: mW, miniH: mH } of pendingMinis) {
-            Logger.log(`[OVERFLOW] Miniaturizing ${c.get_id()} (${mW}x${mH})`);
-            this._pendingMiniatureWindows.push({ window: c, preSize: { x: f.x, y: f.y, width: f.width, height: f.height } });
+        for (const {candidate: c, frame: f, miniSize} of pendingMinis) {
+            Logger.log(`[OVERFLOW] Miniaturizing ${c.get_id()} (${miniSize.width}x${miniSize.height})`);
+            this._pendingMiniatureWindows.push({
+                window: c,
+                preSize: {x: f.x, y: f.y, width: f.width, height: f.height},
+                miniSize,
+            });
             WindowState.set(c, PENDING_MINIATURE, true);
             const desc = windows.find(w => w.id === c.get_id());
-            if (desc) { desc.width = mW; desc.height = mH; }
+            if (desc) {
+                desc.width = miniSize.width;
+                desc.height = miniSize.height;
+            }
         }
         this.invalidateLayoutCache();
-        const tile_info = this._tile(windows, tileArea);
-        return { tile_info, overflow: tile_info.overflow };
+        // The caller immediately re-solves the full rail after observing the pending-count change.
+        return {tile_info: null, overflow: false};
     }
 
     canFitWindow(window, workspace, monitor, relaxed = false, overrideSize = null) {
@@ -3052,14 +3583,11 @@ export const TilingManager = GObject.registerClass({
 
         Logger.log(`canFitWindow: Checking if window can fit in workspace ${workspace.index()} (relaxed=${relaxed})`);
 
-        // Excluded windows (Always on Top, Sticky) coexist with sacred windows and don't participating in tiling.
+        // Excluded windows (Always on Top, Sticky) never participate in mosaic fit.
         if (this._windowingManager.isExcluded(window)) {
             Logger.log('canFitWindow: Window is excluded - always fits (not tiled)');
             return true;
         }
-
-        const verdict = this._sacredIsolationVerdict(window, workspace, monitor);
-        if (verdict !== 'continue') return verdict === 'fits';
 
         const working_info = this._getWorkingInfo(workspace, window, monitor);
         if (!working_info) {
@@ -3074,13 +3602,18 @@ export const TilingManager = GObject.registerClass({
         const fit = this._availableFitSpace(window, workspace, monitor, working_info.work_area);
         if (!fit) return false;
 
-        const windows = working_info.windows.filter(w => !fit.edgeTiledIds.includes(w.id));
+        const windows = working_info.windows.filter(w =>
+            !fit.edgeTiledIds.includes(w.id));
         // targetSmartResizeSize takes priority: preferredSize holds the pre-resize original, which would falsely report overflow.
         this._resolveExistingDescriptorSizes(windows, workspace.list_windows());
 
         this._placeCandidateDescriptor(window, windows, overrideSize);
-
-        return !this._tile(windows, fit.space, relaxed).overflow;
+        const metaWindows = working_info.meta_windows
+            .filter(candidate => !fit.edgeTiledIds.includes(candidate.get_id()));
+        if (!metaWindows.some(candidate => candidate.get_id() === window.get_id()))
+            metaWindows.push(window);
+        return !!this._planUnifiedMiniatureRail(
+            workspace, monitor, metaWindows, windows, fit.space);
     }
 
     _placeCandidateDescriptor(window, windows, overrideSize) {
@@ -3092,30 +3625,8 @@ export const TilingManager = GObject.registerClass({
         }
     }
 
-    // Symmetric isolation: a sacred (maximized/fullscreen) incoming window only fits an empty
-    // workspace; a normal one only fits a workspace with no sacred window. 'continue' otherwise.
-    _sacredIsolationVerdict(window, workspace, monitor) {
-        const otherWindows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !WindowState.get(w, 'pendingInQueue') && w.get_id() !== window.get_id());
-
-        if (this._windowingManager.isMaximizedOrFullscreen(window)) {
-            if (otherWindows.length > 0) {
-                Logger.log(`canFitWindow: Incoming window is sacred but workspace ${workspace.index()} is occupied - blocked`);
-                return 'blocked';
-            }
-            Logger.log('canFitWindow: Window is sacred and workspace is empty - fits');
-            return 'fits';
-        }
-
-        if (otherWindows.some(w => this._windowingManager.isMaximizedOrFullscreen(w))) {
-            Logger.log(`canFitWindow: Incoming normal window blocked - workspace ${workspace.index()} has a sacred window`);
-            return 'blocked';
-        }
-        return 'continue';
-    }
-
     _hasMaximizedWindow(metaWindows) {
-        return metaWindows.some(w => this._windowingManager.isMaximizedOrFullscreen(w));
+        return metaWindows.some(w => this._nativeStateBlocksLayout(w));
     }
 
     // Space left for the incoming window after existing edge tiles, plus the ids to exclude
@@ -3125,7 +3636,7 @@ export const TilingManager = GObject.registerClass({
             ? this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor) : [];
         const edgeTiledIds = edgeTiledWindows.map(s => s.window.get_id());
 
-        if (edgeTiledWindows.length === 0) return { space: workArea, edgeTiledIds };
+        if (edgeTiledWindows.length === 0) return {space: workArea, edgeTiledIds};
 
         const sides = new Set(
             edgeTiledWindows
@@ -3139,7 +3650,7 @@ export const TilingManager = GObject.registerClass({
 
         const space = this._edgeTilingManager.calculateRemainingSpace(workspace, monitor);
         Logger.log(`canFitWindow: Using remaining space after snap: ${space.width}x${space.height}`);
-        return { space, edgeTiledIds };
+        return {space, edgeTiledIds};
     }
 
     // Descriptors carry the pre-tiling size; correct them to what each window will actually
@@ -3155,12 +3666,14 @@ export const TilingManager = GObject.registerClass({
     }
 
     _descriptorSizeForExisting(realWindow) {
-        const restoredSize = WindowState.get(realWindow, 'targetRestoredSize');
-        if (restoredSize) return restoredSize;
-
-        // Resize still pending, target not reached yet.
+        // A fresh smart-resize target supersedes an older restore-settle bridge.
+        // This matters during miniature restore: the live frame is still the pre-restore
+        // size while Smart Resize may already have found a smaller in-workspace target.
         const smartResizeSize = WindowState.get(realWindow, 'targetSmartResizeSize');
         if (smartResizeSize) return smartResizeSize;
+
+        const restoredSize = WindowState.get(realWindow, 'targetRestoredSize');
+        if (restoredSize) return restoredSize;
 
         // targetSmartResizeSize gets cleared once the frame settles, so use the actual frame
         // here instead of preferredSize.
@@ -3172,7 +3685,7 @@ export const TilingManager = GObject.registerClass({
     }
 
     _appendNewWindowDescriptor(window, windows, overrideSize) {
-        const { width, height } = this._sizeForNewWindow(window, overrideSize);
+        const {width, height} = this._sizeForNewWindow(window, overrideSize);
         Logger.log(`canFitWindow: Window not in workspace - adding with size ${width}x${height} (preferred=${!!overrideSize || !!WindowState.get(window, 'preferredSize')})`);
 
         const descriptor = new WindowDescriptor(window, windows.length);
@@ -3184,11 +3697,11 @@ export const TilingManager = GObject.registerClass({
     _sizeForNewWindow(window, overrideSize) {
         if (overrideSize) {
             Logger.log(`canFitWindow: Using overrideSize ${overrideSize.width}x${overrideSize.height}`);
-            return { width: overrideSize.width, height: overrideSize.height };
+            return {width: overrideSize.width, height: overrideSize.height};
         }
 
         const smartResizeSize = WindowState.get(window, 'targetSmartResizeSize');
-        if (smartResizeSize) return { width: smartResizeSize.width, height: smartResizeSize.height };
+        if (smartResizeSize) return {width: smartResizeSize.width, height: smartResizeSize.height};
 
         // Use the actual frame dimensions instead of a hardcoded fallback.
         const preferredSize = WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
@@ -3224,7 +3737,7 @@ export const TilingManager = GObject.registerClass({
         if (!window) return;
 
         const preferredSize = WindowState.get(window, 'preferredSize') ||
-                              WindowState.get(window, 'openingSize');
+            WindowState.get(window, 'openingSize');
 
         if (preferredSize) {
             Logger.log(`restorePreferredSize: Restoring window ${window.get_id()} to ${preferredSize.width}x${preferredSize.height}`);
@@ -3241,7 +3754,7 @@ export const TilingManager = GObject.registerClass({
     saveOriginalSize(window) {
         if (!WindowState.has(window, 'originalSize')) {
             const frame = window.get_frame_rect();
-            WindowState.set(window, 'originalSize', { width: frame.width, height: frame.height });
+            WindowState.set(window, 'originalSize', {width: frame.width, height: frame.height});
             Logger.log(`saveOriginalSize: Saved ${window.get_id()} as ${frame.width}x${frame.height}`);
         }
     }
@@ -3250,7 +3763,7 @@ export const TilingManager = GObject.registerClass({
         if (this._preferredSaveBlocked(window)) return;
 
         const frame = window.get_frame_rect();
-        const size = { width: frame.width, height: frame.height };
+        const size = {width: frame.width, height: frame.height};
         if (this._isMonitorSizedSave(window, size)) return;
 
         if (!(size.width > 10 && size.height > 10)) {
@@ -3258,16 +3771,11 @@ export const TilingManager = GObject.registerClass({
             return;
         }
 
-        if (WindowState.get(window, 'isEnteringSacred')) {
-            Logger.log(`savePreferredSize: Save blocked by sacred transition flag for ${window.get_id()}`);
-            return;
-        }
-
         this._commitPreferredSize(window, size);
     }
 
-    // States that own preferredSize themselves (smart resize, mosaic constraint) or shouldn't
-    // record a transient frame (sacred/born-maximized) block the save.
+    // States that own preferredSize themselves, plus transient native maximize/fullscreen,
+    // block recording a frame that does not represent normal window intent.
     _preferredSaveBlocked(window) {
         if (WindowState.get(window, 'isSmartResizing') || WindowState.get(window, 'isReverseSmartResizing')) {
             Logger.log(`savePreferredSize: Skipping for ${window.get_id()} - during (reverse) smart resize`);
@@ -3278,7 +3786,7 @@ export const TilingManager = GObject.registerClass({
             return true;
         }
         if (this._windowingManager.isMaximizedOrFullscreen(window)) {
-            Logger.log(`savePreferredSize: Skipping for ${window.get_id()} - sacred window (managed by maximizedUndoInfo)`);
+            Logger.log(`savePreferredSize: Skipping for ${window.get_id()} - native maximize/fullscreen transition`);
             return true;
         }
         if (WindowState.get(window, 'openedMaximized')) {
@@ -3334,12 +3842,11 @@ export const TilingManager = GObject.registerClass({
         return WindowState.get(window, 'preferredSize') || null;
     }
 
-    // Mirrors tryFitWithResize's binary search + miniature-threshold heuristic. A plain
-    // "fits at minimum size" check isn't enough, since Smart Resize's real pass also
-    // re-miniaturizes anything landing below half its min/max range even if it
-    // geometrically fits. A looser gate here just restores it and watches Smart Resize
-    // mini it right back (visible as a blink).
-    canRestoreMiniature(candidateMini, remainingWindows, workArea) {
+    // Probe whether a miniature can rejoin this workspace. Explicit user restores only need a
+    // legal minimum-size layout: the real Smart Resize pass protects the chosen window and may
+    // sacrifice a sibling. Passive auto/hover recovery additionally requires the candidate to
+    // remain above the miniature threshold, avoiding restore-then-miniature visual churn.
+    canRestoreMiniature(candidateMini, remainingWindows, workArea, {requireStableNormal = false} = {}) {
         // A shrink request can't win against the pointer, so simulate the grabbed window as fixed
         const resizingWindowId = this._animationsManager?.getResizingWindowId();
         const isResizable = w => w.get_id() !== resizingWindowId && w.allows_resize && w.allows_resize();
@@ -3349,9 +3856,9 @@ export const TilingManager = GObject.registerClass({
                 if (ms) return ms;
             }
             const pref = WindowState.get(w, 'preferredSize') || WindowState.get(w, 'openingSize');
-            if (pref) return { width: pref.width, height: pref.height };
+            if (pref) return {width: pref.width, height: pref.height};
             const frame = w.get_frame_rect();
-            return { width: frame.width, height: frame.height };
+            return {width: frame.width, height: frame.height};
         };
 
         const descriptors = remainingWindows.map(w => {
@@ -3359,24 +3866,27 @@ export const TilingManager = GObject.registerClass({
             const fixed = w !== candidateMini && WindowState.get(w, IS_MINIATURE);
             const resizable = !fixed && isResizable(w);
             const rawMin = resizable ? this.getWindowMinimumSize(w) : current;
-            const min = { width: Math.min(rawMin.width, current.width), height: Math.min(rawMin.height, current.height) };
-            return { window: w, current, min, resizable };
+            const min = {width: Math.min(rawMin.width, current.width), height: Math.min(rawMin.height, current.height)};
+            return {window: w, current, min, resizable};
         });
 
         const sizeAt = (d, t) => d.resizable
-            ? { width: Math.round(d.min.width + (d.current.width - d.min.width) * t),
-                height: Math.round(d.min.height + (d.current.height - d.min.height) * t) }
+            ? {
+                width: Math.round(d.min.width + (d.current.width - d.min.width) * t),
+                height: Math.round(d.min.height + (d.current.height - d.min.height) * t)
+            }
             : d.current;
 
         const buildSim = (t) => descriptors.map(d => {
             const size = sizeAt(d, t);
-            return { id: d.window.get_id(), width: size.width, height: size.height };
+            return {id: d.window.get_id(), width: size.width, height: size.height};
         });
 
         const preferredSim = buildSim(1.0);
-        const result = this._tile(preferredSim, workArea, true);
-        Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()}, sim=${preferredSim.map(s => `${s.id}:${s.width}x${s.height}`).join(', ')}, overflow=${result.overflow}`);
-        if (!result.overflow) return true;
+        const preferredSolution = this._solveRestoreSimulationRail(
+            candidateMini, descriptors, preferredSim, workArea);
+        Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()}, sim=${preferredSim.map(s => `${s.id}:${s.width}x${s.height}`).join(', ')}, overflow=${!preferredSolution}`);
+        if (preferredSolution) return true;
 
         // Mid-grab a shrink-assisted fit flaps: the next drag event overflows it
         // again and re-minis the window we just restored, so require a full-size fit
@@ -3385,40 +3895,97 @@ export const TilingManager = GObject.registerClass({
             return false;
         }
 
-        if (this._tile(buildSim(0.0), workArea, true).overflow) {
+        if (!this._solveRestoreSimulationRail(
+            candidateMini, descriptors, buildSim(0.0), workArea)) {
             Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()} doesn't fit even at minimum sizes`);
             return false;
         }
 
-        // It fits somewhere between min and preferred; restore only if the best-fit scale keeps
-        // it visibly larger than a miniature, otherwise it would read as a slightly-bigger mini.
-        return !this._wouldStayMiniAtBestFit(candidateMini, descriptors, buildSim, sizeAt, workArea);
+        // Explicit restore is user intent. Once a legal in-workspace layout exists at minimum
+        // sizes, let the real Smart Resize pass decide which *other* window must shrink or become
+        // miniature. Passive recovery still requires a stable normal result so it cannot blink.
+        if (!requireStableNormal) {
+            Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()} fits with resize; allowing explicit restore`);
+            return true;
+        }
+
+        return !this._wouldStayMiniAtBestFit(
+            candidateMini, descriptors, buildSim, sizeAt, workArea);
     }
 
     _wouldStayMiniAtBestFit(candidateMini, descriptors, buildSim, sizeAt, workArea) {
         let lo = 0.0, hi = 1.0;
         for (let i = 0; i < 15; i++) {
             const mid = (lo + hi) / 2;
-            if (!this._tile(buildSim(mid), workArea, true).overflow) lo = mid;
+            if (this._solveRestoreSimulationRail(
+                candidateMini, descriptors, buildSim(mid), workArea)) lo = mid;
             else hi = mid;
         }
 
         const candidateDesc = descriptors.find(d => d.window === candidateMini);
         const simAtLo = sizeAt(candidateDesc, lo);
-        const maxSize = this.getWindowMaximumSize(candidateMini);
-        const thresholdW = (candidateDesc.min.width + (maxSize?.width || workArea.width)) / 2;
-        const thresholdH = (candidateDesc.min.height + (maxSize?.height || workArea.height)) / 2;
+        const {thresholdW, thresholdH} = this._miniatureThreshold(candidateMini, workArea);
         const wouldStayMini = simAtLo.width < thresholdW || simAtLo.height < thresholdH;
 
         Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()} doesn't fit at preferred size, optimal scale=${lo.toFixed(4)} → ${simAtLo.width}x${simAtLo.height} (threshold ${Math.round(thresholdW)}x${Math.round(thresholdH)}), wouldStayMini=${wouldStayMini}`);
         return wouldStayMini;
     }
 
+    _solveRestoreSimulationRail(candidateMini, descriptors, simulated, workArea) {
+        const workspace = candidateMini.get_workspace?.();
+        const monitor = candidateMini.get_monitor?.();
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
+        const {miniatureItems, normalItems} = this._partitionRestoreSimulation(
+            candidateMini, descriptors, simulated, targetSize);
+
+        return solveMiniatureRail({
+            workArea,
+            miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+            contentEvaluator: contentRect => this._evaluateRailContent(
+                normalItems, contentRect, 'miniature restore simulation'),
+        });
+    }
+
+    _partitionRestoreSimulation(candidateMini, descriptors, simulated, targetSize) {
+        const byId = new Map(simulated.map(item => [item.id, item]));
+        const result = {miniatureItems: [], normalItems: []};
+        for (const descriptor of descriptors)
+            this._partitionRestoreDescriptor(candidateMini, descriptor, byId, targetSize, result);
+        return result;
+    }
+
+    _partitionRestoreDescriptor(candidateMini, descriptor, byId, targetSize, result) {
+        const window = descriptor.window;
+        const item = byId.get(window.get_id());
+        if (!item) return;
+        if (window === candidateMini || !WindowState.get(window, IS_MINIATURE)) {
+            result.normalItems.push(item);
+            return;
+        }
+
+        const source = WindowState.get(window, PRE_MINIATURE_SIZE) ?? window.get_frame_rect();
+        result.miniatureItems.push({
+            id: item.id,
+            ...miniatureSizeForSource(source, targetSize),
+        });
+    }
+
     tryRestoreWindowSizes(windows, workArea, _freedWidth, _freedHeight, _workspace, _monitor) {
-        const shrunkWindows = this._collectShrunkWindows(windows);
+        const reservation = this._miniatureRailReservationForMetaWindows(
+            _workspace, _monitor, windows, workArea);
+        if (!reservation) {
+            Logger.log('tryRestoreWindowSizes: miniature rail itself does not fit; preserving current geometry');
+            return false;
+        }
+        const layoutWindows = windows.filter(window =>
+            !reservation.miniatureIds.has(window.get_id()));
+        const shrunkWindows = this._collectShrunkWindows(layoutWindows);
 
         if (shrunkWindows.length === 0) {
-            Logger.log(`tryRestoreWindowSizes: No shrunk windows to restore (0/${windows.length} windows had deficits > 2px)`);
+            Logger.log(`tryRestoreWindowSizes: No shrunk windows to restore (0/${layoutWindows.length} windows had deficits > 2px)`);
             return false;
         }
 
@@ -3434,17 +4001,17 @@ export const TilingManager = GObject.registerClass({
             return false;
         }
 
-        const result = this.findBestRestorationGain(windows, shrunkWindows, workArea);
+        const result = this.findBestRestorationGain(layoutWindows, shrunkWindows, reservation.tileArea);
         if (!result) {
             Logger.log('tryRestoreWindowSizes: Restoration would cause overflow even at 10% - waiting');
-            for (const w of windows) {
+            for (const w of layoutWindows) {
                 WindowState.remove(w, 'isReverseSmartResizing');
             }
             return false;
         }
 
         Logger.log(`tryRestoreWindowSizes: Applying ${Math.round(result.gain * 100)}% restoration`);
-        this._applyRestoration(windows, shrunkWindows, result.layout);
+        this._applyRestoration(layoutWindows, shrunkWindows, result.layout);
         return true;
     }
 
@@ -3488,7 +4055,7 @@ export const TilingManager = GObject.registerClass({
             const frame = w.get_frame_rect();
             this._animateResize(w, frame, sim.width, sim.height);
             // Wayland hasn't acked the resize yet when the settle retile runs, so stash the target here.
-            WindowState.set(w, 'targetRestoredSize', { width: sim.width, height: sim.height });
+            WindowState.set(w, 'targetRestoredSize', {width: sim.width, height: sim.height});
 
             const shrunk = shrunkWindows.find(sw => sw.id === w.get_id());
             if (!shrunk) continue;
@@ -3499,10 +4066,11 @@ export const TilingManager = GObject.registerClass({
                 WindowState.set(w, 'isConstrainedByMosaic', false);
                 WindowState.set(w, 'targetSmartResizeSize', null);
             } else {
-                this._setSmartResizeTarget(w, sim);
+                this.setSmartResizeTarget(w, sim);
             }
         }
     }
+
     getWindowAreaRatio(frame, workArea) {
         const windowArea = frame.width * frame.height;
         const workspaceArea = workArea.width * workArea.height;
@@ -3517,7 +4085,7 @@ export const TilingManager = GObject.registerClass({
         const maxW = geom.x + geom.width - area.x;
         const maxH = geom.y + geom.height - area.y;
         if (area.width <= maxW && area.height <= maxH) return area;
-        return { x: area.x, y: area.y, width: Math.min(area.width, maxW), height: Math.min(area.height, maxH) };
+        return {x: area.x, y: area.y, width: Math.min(area.width, maxW), height: Math.min(area.height, maxH)};
     }
 
     getUsableWorkArea(workspace, monitor) {
@@ -3530,7 +4098,7 @@ export const TilingManager = GObject.registerClass({
                 const hasRight = zones.some(z => [TileZone.RIGHT_FULL, TileZone.TOP_RIGHT, TileZone.BOTTOM_RIGHT].includes(z));
 
                 if (hasLeft && hasRight) {
-                    return { x: 0, y: 0, width: 0, height: 0 };
+                    return {x: 0, y: 0, width: 0, height: 0};
                 }
 
                 return this._edgeTilingManager.calculateRemainingSpace(workspace, monitor);
@@ -3542,7 +4110,7 @@ export const TilingManager = GObject.registerClass({
     tryFitWithResize(newWindow, windows, workArea, workspace, focusedWindowOverride = null) {
         if (this._isSmartResizingBlocked) {
             Logger.log('[SMART RESIZE] tryFitWithResize BLOCKED by _isSmartResizingBlocked');
-            return { success: false };
+            return {success: false};
         }
         this._isSmartResizingBlocked = true;
 
@@ -3552,23 +4120,23 @@ export const TilingManager = GObject.registerClass({
         const resizingWindowId = this._animationsManager?.getResizingWindowId();
 
         try {
-            const { allWindows, allResizable, windowData } =
-                this._collectResizeParticipants(windows, newWindow, resizingWindowId);
+            const context = this._prepareSmartResizeContext(
+                newWindow, windows, workArea, workspace, resizingWindowId);
+            if (!context) return {success: false};
+            const {resizeArea, fixedMiniatureItems, monitor, allWindows, allResizable, windowData} = context;
 
-            if (allResizable.length === 0) return { success: false };
-
-            this._logResizeParticipants(allWindows, allResizable, windowData, workArea, workspace);
+            this._logResizeParticipants(allWindows, allResizable, windowData, resizeArea, workspace);
 
             // Interpolate between min and current sizes at factor t (1=current, 0=min); a window
             // marked pendingMiniature uses its miniature size instead of the interpolated one.
             const buildSimulated = (t) => allWindows.map(w => {
                 const d = windowData.get(w.get_id());
                 if (!d.isResizable)
-                    return { id: w.get_id(), width: d.current.width, height: d.current.height };
+                    return {id: w.get_id(), width: d.current.width, height: d.current.height};
 
                 if (d.pendingMiniature && d.miniSize) {
                     Logger.log(`[SMART RESIZE] buildSimulated: ${w.get_id()} using MINI SIZE ${d.miniSize.width}x${d.miniSize.height}`);
-                    return { id: w.get_id(), width: d.miniSize.width, height: d.miniSize.height };
+                    return {id: w.get_id(), width: d.miniSize.width, height: d.miniSize.height};
                 }
 
                 const effMinW = Math.min(d.min.width, d.current.width);
@@ -3580,34 +4148,117 @@ export const TilingManager = GObject.registerClass({
                 };
             });
 
-            if (!this._tile(buildSimulated(1.0), workArea, true).overflow) {
+            const solveSimulated = simulated => this._smartResizeRailSolution(
+                simulated, windowData, fixedMiniatureItems, workArea, workspace, monitor);
+            const fitsSimulated = simulated => !!solveSimulated(simulated);
+
+            if (fitsSimulated(buildSimulated(1.0))) {
                 Logger.log('[SMART RESIZE] Natural fit, no resize needed');
-                return { success: true, tileInfo: null, pendingWindows: [] };
+                return {success: true, tileInfo: null, pendingWindows: []};
             }
 
-            if (this._tile(buildSimulated(0.0), workArea, true).overflow) {
+            if (!fitsSimulated(buildSimulated(0.0))) {
                 Logger.log('[SMART RESIZE] Overflow inevitable, windows don\'t fit even at minimums');
-                this._sacrificeUntilMinFits(allWindows, windowData, buildSimulated, workArea, workspace, focusedWindowOverride, resizingWindowId);
+                this._sacrificeUntilMinFits(
+                    allWindows, windowData, buildSimulated, fitsSimulated,
+                    workspace, focusedWindowOverride, resizingWindowId);
 
-                if (this._tile(buildSimulated(0.0), workArea, true).overflow) {
+                if (!fitsSimulated(buildSimulated(0.0))) {
                     Logger.log('[SMART RESIZE] Still overflow after miniaturization, applying overflow logic');
-                    return { success: false, tileInfo: null, pendingWindows: [] };
+                    return {success: false, tileInfo: null, pendingWindows: []};
                 }
             }
 
-            let lo = this._binarySearchFitScale(buildSimulated, workArea);
+            let lo = this._binarySearchFitScale(buildSimulated, fitsSimulated);
             Logger.log(`[SMART RESIZE] Optimal scale factor: ${lo.toFixed(4)}`);
-            lo = this._miniaturizeBelowThreshold(allWindows, allResizable, windowData, buildSimulated, workArea, workspace, focusedWindowOverride, resizingWindowId, lo);
-
-            const { pendingWindows, grownWindows } = this._applyFitResults(buildSimulated(lo), windowData);
-            this._scheduleGrowSettle(grownWindows);
-
-            const finalTileInfo = this._tile(windows, workArea);
-            Logger.log(`[TRYFIT] Returning pendingWindows len=${pendingWindows.length}`);
-            return { success: true, tileInfo: finalTileInfo, pendingWindows };
+            lo = this._miniaturizeBelowThreshold(
+                allWindows, allResizable, windowData, buildSimulated, fitsSimulated,
+                resizeArea, workspace, focusedWindowOverride, resizingWindowId, lo);
+            const finalSizes = buildSimulated(lo);
+            return this._finalizeSmartResizePlan(
+                finalSizes, windowData, solveSimulated(finalSizes));
         } finally {
             this._isSmartResizingBlocked = false;
         }
+    }
+
+    _prepareSmartResizeContext(newWindow, windows, workArea, workspace, resizingWindowId) {
+        const reservation = this._smartResizeReservation(
+            newWindow, windows, workArea, workspace);
+        if (!reservation) {
+            Logger.log('[SMART RESIZE] Existing miniature rail cannot be reserved; rejecting fit plan');
+            return null;
+        }
+        const participants = this._collectResizeParticipants(
+            reservation.resizeWindows, newWindow, resizingWindowId);
+        if (participants.allResizable.length === 0) return null;
+        return {...reservation, ...participants};
+    }
+
+    _finalizeSmartResizePlan(finalSizes, windowData, railSolution) {
+        if (!railSolution) {
+            Logger.log('[SMART RESIZE] Final geometry validation failed; discarding tentative miniature/resize plan');
+            return {success: false, tileInfo: null, pendingWindows: []};
+        }
+
+        const {pendingWindows, grownWindows} = this._applyFitResults(finalSizes, windowData);
+        this._scheduleGrowSettle(grownWindows);
+        Logger.log(`[TRYFIT] Returning pendingWindows len=${pendingWindows.length}`);
+        return {success: true, tileInfo: railSolution.payload ?? null, pendingWindows};
+    }
+
+    _smartResizeReservation(newWindow, windows, workArea, workspace) {
+        const reservationMetaWindows = [...windows, newWindow].filter((window, index, all) =>
+            all.findIndex(candidate => candidate.get_id() === window.get_id()) === index);
+        const reservation = this._miniatureRailReservationForMetaWindows(
+            workspace, newWindow.get_monitor(), reservationMetaWindows, workArea);
+        if (!reservation) return null;
+        const targetSize = this._miniatureTargetSize(workspace, newWindow.get_monitor());
+        const fixedMiniatureItems = reservationMetaWindows
+            .filter(window => reservation.miniatureIds.has(window.get_id()))
+            .map(window => {
+                const source = WindowState.get(window, PRE_MINIATURE_SIZE)
+                    ?? window.get_frame_rect();
+                return {id: window.get_id(), ...miniatureSizeForSource(source, targetSize)};
+            });
+        return {
+            resizeWindows: windows.filter(window => !reservation.miniatureIds.has(window.get_id())),
+            resizeArea: reservation.tileArea,
+            fixedMiniatureItems,
+            monitor: newWindow.get_monitor(),
+        };
+    }
+
+    _smartResizeRailSolution(simulated, windowData, fixedMiniatureItems, workArea, workspace, monitor) {
+        const targetSize = this._miniatureTargetSize(workspace, monitor);
+        const miniatureItems = [...fixedMiniatureItems];
+        const normalItems = [];
+
+        for (const item of simulated) {
+            const data = windowData.get(item.id);
+            if (data?.pendingMiniature) {
+                const source = data.pendingPreSize ?? data.current;
+                miniatureItems.push({id: item.id, ...miniatureSizeForSource(source, targetSize)});
+            } else {
+                normalItems.push(item);
+            }
+        }
+
+        return solveMiniatureRail({
+            workArea,
+            miniatureItems,
+            spacing: constants.WINDOW_SPACING,
+            previousSide: this._getMiniatureRailSide(workspace, monitor),
+            requiredSide: this._miniatureRailSideConstraint(workspace, monitor),
+            contentEvaluator: contentRect => {
+                const tile = this._tile(normalItems, contentRect, true);
+                return {
+                    valid: !tile.overflow &&
+                        this._tileGeometryIsValid(tile, contentRect, 'smart resize rail'),
+                    payload: tile,
+                };
+            },
+        });
     }
 
     _isUninitializedForResize(w, newWindow) {
@@ -3633,7 +4284,7 @@ export const TilingManager = GObject.registerClass({
         if (WindowState.get(w, IS_MINIATURE)) {
             const ms = getMiniatureSize(w);
             if (!ms) return null;
-            return { window: w, current: ms, min: ms, isResizable: false };
+            return {window: w, current: ms, min: ms, isResizable: false};
         }
 
         if (this._isUninitializedForResize(w, newWindow)) {
@@ -3644,7 +4295,7 @@ export const TilingManager = GObject.registerClass({
         const preferred = WindowState.get(w, 'preferredSize') || WindowState.get(w, 'openingSize');
         const current = preferred || this.getEffectiveWindowSize(w);
         const min = this.getWindowMinimumSize(w);
-        return { window: w, current, preferred, min, isResizable: this._isResizableParticipant(w, resizingWindowId) };
+        return {window: w, current, preferred, min, isResizable: this._isResizableParticipant(w, resizingWindowId)};
     }
 
     // The window under an active manual resize grab is fixed (its size can't lose to the pointer).
@@ -3667,7 +4318,7 @@ export const TilingManager = GObject.registerClass({
             if (data.isResizable) allResizable.push(w);
         }
 
-        return { allWindows, allResizable, windowData };
+        return {allWindows, allResizable, windowData};
     }
 
     _logResizeParticipants(allWindows, allResizable, windowData, workArea, workspace) {
@@ -3680,7 +4331,7 @@ export const TilingManager = GObject.registerClass({
 
     // A probe that overflows scans the whole candidate space to prove no order fits, so stop as
     // soon as the scale stops meaning anything: one pixel of the widest range. lo must already fit.
-    _binarySearchFitScale(buildSimulated, workArea, lo = 0.0) {
+    _binarySearchFitScale(buildSimulated, fitsSimulated, lo = 0.0) {
         let hi = 1.0;
         const atMin = buildSimulated(0.0), atMax = buildSimulated(1.0);
         const span = Math.max(1, ...atMax.map((w, i) =>
@@ -3689,7 +4340,7 @@ export const TilingManager = GObject.registerClass({
 
         for (let i = 0; i < steps; i++) {
             const mid = (lo + hi) / 2;
-            if (!this._tile(buildSimulated(mid), workArea, true).overflow)
+            if (fitsSimulated(buildSimulated(mid)))
                 lo = mid;
             else
                 hi = mid;
@@ -3724,16 +4375,19 @@ export const TilingManager = GObject.registerClass({
     // fills the mini slot), and return the computed miniSize.
     _markPendingMiniature(d) {
         const frame = d.window.get_frame_rect();
-        const scale = constants.MINIATURE_TARGET_SIZE_PX / Math.max(frame.width, frame.height);
+        const miniSize = miniatureSizeForSource(frame, this._miniatureTargetSizeForWindow(d.window));
+        const scale = Math.min(
+            miniSize.width / Math.max(1, frame.width),
+            miniSize.height / Math.max(1, frame.height));
         d.pendingMiniature = true;
-        d.miniSize = { width: Math.round(frame.width * scale), height: Math.round(frame.height * scale) };
-        d.pendingPreSize = { x: frame.x, y: frame.y, width: frame.width, height: frame.height };
-        return { miniSize: d.miniSize, scale };
+        d.miniSize = miniSize;
+        d.pendingPreSize = {x: frame.x, y: frame.y, width: frame.width, height: frame.height};
+        return {miniSize: d.miniSize, scale};
     }
 
     // Windows don't fit even at minimum size: miniaturize least-recently-used ones (never the
     // last visible one) until the min-size layout fits.
-    _sacrificeUntilMinFits(allWindows, windowData, buildSimulated, workArea, workspace, focusedWindowOverride, resizingWindowId) {
+    _sacrificeUntilMinFits(allWindows, windowData, buildSimulated, fitsSimulated, workspace, focusedWindowOverride, resizingWindowId) {
         if (!this._extension?.miniatureManager) return;
 
         const focusedId = this._resizeFocusedId(focusedWindowOverride);
@@ -3748,16 +4402,16 @@ export const TilingManager = GObject.registerClass({
             if (!this._isMiniaturizationCandidate(w, d, focusedId, resizingWindowId)) continue;
             if (this._nonMiniatureCount(allWindows, windowData) <= 1) break;
 
-            const { miniSize } = this._markPendingMiniature(d);
+            const {miniSize} = this._markPendingMiniature(d);
             Logger.log(`[SMART RESIZE] ${w.get_id()}: miniaturizing to make room (${miniSize.width}x${miniSize.height})`);
 
-            if (!this._tile(buildSimulated(0.0), workArea, true).overflow) break;
+            if (fitsSimulated(buildSimulated(0.0))) break;
         }
     }
 
     // After the fit scale is known, miniaturize windows the scale pushed below half their size
     // range, least-recently-used first, re-searching the scale after each so freed space is reclaimed.
-    _miniaturizeBelowThreshold(allWindows, allResizable, windowData, buildSimulated, workArea, workspace, focusedWindowOverride, resizingWindowId, lo) {
+    _miniaturizeBelowThreshold(allWindows, allResizable, windowData, buildSimulated, fitsSimulated, workArea, workspace, focusedWindowOverride, resizingWindowId, lo) {
         if (!this._extension?.miniatureManager) return lo;
 
         const focusedId = this._resizeFocusedId(focusedWindowOverride);
@@ -3770,7 +4424,7 @@ export const TilingManager = GObject.registerClass({
                 if (!this._isMiniaturizationCandidate(d?.window, d, focusedId, resizingWindowId)) return false;
                 // The threshold falls back to the work area, so a window still at its preferred size trips it.
                 if (sim.width >= d.current.width && sim.height >= d.current.height) return false;
-                const { thresholdW, thresholdH } = this._miniatureThreshold(d.window, workArea);
+                const {thresholdW, thresholdH} = this._miniatureThreshold(d.window, workArea);
                 return sim.width < thresholdW || sim.height < thresholdH;
             });
             if (candidates.length === 0) break;
@@ -3786,7 +4440,7 @@ export const TilingManager = GObject.registerClass({
 
             candidateData.miniatureTargetSlot = null;
             const natural = candidateData.preferred || candidateData.current;
-            const { miniSize, scale } = this._markPendingMiniature(candidateData);
+            const {miniSize, scale} = this._markPendingMiniature(candidateData);
             Logger.log(`[MINIATURE] Marking ${candidates[0].id}(${candidateData.window.get_wm_class()}) as PENDING miniature (will be created after layout)`);
             Logger.log(`[MINIATURE] ${candidates[0].id} PENDING at frame=${candidateData.pendingPreSize.width}x${candidateData.pendingPreSize.height} restore=${natural.width}x${natural.height} → miniSize: ${miniSize.width}x${miniSize.height} scale: ${scale}`);
 
@@ -3794,13 +4448,13 @@ export const TilingManager = GObject.registerClass({
 
             // Lock lo at 1.0 so the final pass applies preferred sizes; otherwise lo would stay
             // at the pre-mini scale and the freed space wouldn't be reclaimed by the siblings.
-            if (!this._tile(buildSimulated(1.0), workArea, true).overflow) {
+            if (fitsSimulated(buildSimulated(1.0))) {
                 return 1.0;
             }
             // Marking only frees space, so last round's scale still fits and the search can resume
             // there. The exception is a mini size bigger than the window's own minimum.
-            const floor = this._tile(buildSimulated(lo), workArea, true).overflow ? 0.0 : lo;
-            lo = this._binarySearchFitScale(buildSimulated, workArea, floor);
+            const floor = fitsSimulated(buildSimulated(lo)) ? lo : 0.0;
+            lo = this._binarySearchFitScale(buildSimulated, fitsSimulated, floor);
         }
         return lo;
     }
@@ -3808,8 +4462,10 @@ export const TilingManager = GObject.registerClass({
     _miniatureThreshold(w, workArea) {
         const min = this.getWindowMinimumSize(w);
         const maxSize = this.getWindowMaximumSize(w);
-        const effectiveMaxW = maxSize?.width || workArea.width;
-        const effectiveMaxH = maxSize?.height || workArea.height;
+        // Firefox and some Wayland clients expose protocol "unbounded" max hints as large
+        // finite integers. A threshold is about usable screen space, not that sentinel value.
+        const effectiveMaxW = Math.max(min.width, Math.min(maxSize?.width ?? workArea.width, workArea.width));
+        const effectiveMaxH = Math.max(min.height, Math.min(maxSize?.height ?? workArea.height, workArea.height));
         return {
             thresholdW: (min.width + effectiveMaxW) / 2,
             thresholdH: (min.height + effectiveMaxH) / 2,
@@ -3834,7 +4490,7 @@ export const TilingManager = GObject.registerClass({
                 if (frame.width < d.current.width - 2 || frame.height < d.current.height - 2) {
                     WindowState.set(w, 'isConstrainedByMosaic', false);
                     WindowState.set(w, 'targetSmartResizeSize', null);
-                    WindowState.set(w, 'targetRestoredSize', { width: d.current.width, height: d.current.height });
+                    WindowState.set(w, 'targetRestoredSize', {width: d.current.width, height: d.current.height});
                     this._animateResize(w, frame, d.current.width, d.current.height, true);
                     grownWindows.push(w);
                     Logger.log(`[SMART RESIZE] ${sim.id}: grow back ${frame.width}×${frame.height} → ${d.current.width}×${d.current.height}`);
@@ -3843,14 +4499,14 @@ export const TilingManager = GObject.registerClass({
             }
 
             if (!WindowState.has(w, 'preferredSize'))
-                WindowState.set(w, 'preferredSize', { width: d.current.width, height: d.current.height });
-            WindowState.set(w, 'originalSize', { width: d.current.width, height: d.current.height });
+                WindowState.set(w, 'preferredSize', {width: d.current.width, height: d.current.height});
+            WindowState.set(w, 'originalSize', {width: d.current.width, height: d.current.height});
             WindowState.set(w, 'isConstrainedByMosaic', true);
-            this._setSmartResizeTarget(w, sim);
+            this.setSmartResizeTarget(w, sim);
 
             if (d.pendingMiniature) {
                 const storedPreSize = d.pendingPreSize || d.current;
-                pendingWindows.push({ window: w, miniSize: d.miniSize, preSize: storedPreSize });
+                pendingWindows.push({window: w, miniSize: d.miniSize, preSize: storedPreSize});
                 // Stamped here rather than in _markPendingMiniature because the fit search calls
                 // that one speculatively; an abort would leave the flag on and draw() would skip
                 // the window forever.
@@ -3862,7 +4518,7 @@ export const TilingManager = GObject.registerClass({
             Logger.log(`[SMART RESIZE] ${sim.id}: ${d.current.width}×${d.current.height} → ${sim.width}×${sim.height}`);
         }
 
-        return { pendingWindows, grownWindows };
+        return {pendingWindows, grownWindows};
     }
 
     // WindowDescriptor reads targetRestoredSize instead of the stale frame, so dropping it before
@@ -3914,12 +4570,12 @@ export const TilingManager = GObject.registerClass({
             const resizingWindowId = this._animationsManager?.getResizingWindowId();
             const allWindows = this._windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
                 .filter(w => !WindowState.get(w, 'pendingInQueue') &&
-                             !this._edgeTilingManager?.isEdgeTiled(w) &&
-                             !this._windowingManager.isMaximizedOrFullscreen(w));
+                    !this._edgeTilingManager?.isEdgeTiled(w) &&
+                    !this._windowingManager.isMaximizedOrFullscreen(w));
 
             if (allWindows.length === 0) return;
 
-            const { windowData, allResizable } = this._buildRebalanceData(allWindows, resizingWindowId);
+            const {windowData, allResizable} = this._buildRebalanceData(allWindows, resizingWindowId);
             if (allResizable.length === 0) return;
 
             Logger.log(`[SMART RESIZE] Rebalancing ${allWindows.length} windows, workArea: ${workArea.width}×${workArea.height}`);
@@ -3930,7 +4586,7 @@ export const TilingManager = GObject.registerClass({
             const buildSimulated = (t) => allWindows.map(w => {
                 const d = windowData.get(w.get_id());
                 if (!d.isResizable)
-                    return { id: w.get_id(), width: d.current.width, height: d.current.height };
+                    return {id: w.get_id(), width: d.current.width, height: d.current.height};
                 const effMinW = Math.min(d.min.width, d.current.width);
                 const effMinH = Math.min(d.min.height, d.current.height);
                 return {
@@ -3946,7 +4602,9 @@ export const TilingManager = GObject.registerClass({
             }
 
             if (this._tile(buildSimulated(0.0), workArea, true).overflow) {
-                this._ejectNewestOnRebalance(allWindows, workspace, monitor, resizingWindowId);
+                Logger.log('[SMART RESIZE] Rebalance: minimum sizes still overflow; resolving in-workspace only');
+                this.invalidateLayoutCache();
+                this.tileWorkspaceWindows(workspace, null, monitor, true);
                 return;
             }
 
@@ -3967,11 +4625,11 @@ export const TilingManager = GObject.registerClass({
             // A shrink request can't win against the pointer, so the grabbed window is fixed
             const isResizable = w.get_id() !== resizingWindowId && w.allows_resize?.();
 
-            windowData.set(w.get_id(), { window: w, current, min, isResizable });
+            windowData.set(w.get_id(), {window: w, current, min, isResizable});
             if (isResizable) allResizable.push(w);
         }
 
-        return { windowData, allResizable };
+        return {windowData, allResizable};
     }
 
     // Everything fits at full size, so drop the constraints and ease each window back.
@@ -3989,34 +4647,6 @@ export const TilingManager = GObject.registerClass({
         }
         this.invalidateLayoutCache();
         this.tileWorkspaceWindows(workspace, null, monitor, true);
-    }
-
-    // Doesn't fit even at minimum sizes, so move the newest window out to a fresh workspace.
-    _ejectNewestOnRebalance(allWindows, workspace, monitor, resizingWindowId) {
-        Logger.log('[SMART RESIZE] Rebalance: overflow inevitable at corrected minimums');
-
-        // Ghost mode already flags this during a live grab; the release path decides
-        if (allWindows.some(w => w.get_id() === resizingWindowId)) {
-            Logger.log('[SMART RESIZE] Rebalance: resize grab active, deferring overflow to release');
-            return;
-        }
-
-        for (const w of allWindows) {
-            WindowState.set(w, 'targetSmartResizeSize', null);
-            WindowState.set(w, 'isConstrainedByMosaic', false);
-        }
-
-        const newest = allWindows.reduce((n, w) => {
-            const t1 = WindowState.get(w, 'addedTime') || 0;
-            const t2 = WindowState.get(n, 'addedTime') || 0;
-            return t1 > t2 ? w : n;
-        }, allWindows[0]);
-
-        Logger.log(`[SMART RESIZE] Overflowing newest window ${newest.get_id()}`);
-        this._windowingManager.moveOversizedWindow(newest).then(() => {
-            this.invalidateLayoutCache();
-            this.tileWorkspaceWindows(workspace, null, monitor, true);
-        }).catch(e => Logger.error(`Rebalance overflow failed: ${e}`));
     }
 
     // Fits somewhere between min and preferred, so binary-search the largest scale that fits
@@ -4041,7 +4671,7 @@ export const TilingManager = GObject.registerClass({
 
             const w = d.window;
             const frame = w.get_frame_rect();
-            this._setSmartResizeTarget(w, sim);
+            this.setSmartResizeTarget(w, sim);
             WindowState.set(w, 'isConstrainedByMosaic', true);
 
             this._animateResize(w, frame, sim.width, sim.height, true);
@@ -4057,7 +4687,7 @@ export const TilingManager = GObject.registerClass({
 
     destroy() {
         this.destroyMasks();
-        ComputedLayouts.clear();
+        MosaicModel.clear();
         this._isSmartResizingBlocked = false;
         this._restoringWindowId = null;
         this._lastTiledOrder = null;
@@ -4068,6 +4698,7 @@ export const TilingManager = GObject.registerClass({
         this._pinnedComposition = null;
         this._activePinnedShape = null;
         this._activePinnedVertical = null;
+        this._miniatureRailSides = null;
         this._edgeTilingManager = null;
         this._drawingManager = null;
         this._animationsManager = null;
@@ -4079,6 +4710,7 @@ export const TilingManager = GObject.registerClass({
 class WindowDescriptor {
     constructor(meta_window, index) {
         const frame = meta_window.get_frame_rect();
+        const committedSlot = MosaicModel.normalSlotFor(meta_window);
 
         this.index = index;
         this.x = frame.x;
@@ -4088,30 +4720,55 @@ class WindowDescriptor {
         const miniSize = getMiniatureSize(meta_window);
         this.isMiniature = !!miniSize;
         if (miniSize) {
-            this.width  = miniSize.width;
+            this.width = miniSize.width;
             this.height = miniSize.height;
             Logger.log(`WindowDescriptor: Using miniatureSize ${this.width}x${this.height} for ${meta_window.get_id()}`);
         } else {
-            // Use target dimensions if unmaximizing, as physical frame might still be maximized.
-            const targetSize = WindowState.get(meta_window, 'targetRestoredSize');
-            // Use smart resize target dims if move_resize_frame hasn't completed yet.
-            const smartResizeSize = WindowState.get(meta_window, 'targetSmartResizeSize');
-
-            if (targetSize) {
-                this.width = targetSize.width;
-                this.height = targetSize.height;
-                Logger.log(`WindowDescriptor: Using targetRestoredSize ${this.width}x${this.height} for ${meta_window.get_id()}`);
-            } else if (smartResizeSize) {
-                this.width = smartResizeSize.width;
-                this.height = smartResizeSize.height;
-                Logger.log(`WindowDescriptor: Using targetSmartResizeSize ${this.width}x${this.height} for ${meta_window.get_id()}`);
-            } else {
-                this.width = frame.width > 0 ? frame.width : 1;
-                this.height = frame.height > 0 ? frame.height : 1;
-            }
+            const size = this._normalSize(meta_window, frame, committedSlot);
+            this.width = size.width;
+            this.height = size.height;
         }
 
         this.id = meta_window.get_id();
+    }
+
+    _normalSize(meta_window, frame, committedSlot) {
+        // Use smart resize target dims if move_resize_frame hasn't completed yet.
+        const smartResizeSize = WindowState.get(meta_window, 'targetSmartResizeSize');
+        if (smartResizeSize) {
+            Logger.log(`WindowDescriptor: Using targetSmartResizeSize ${smartResizeSize.width}x${smartResizeSize.height} for ${meta_window.get_id()}`);
+            return smartResizeSize;
+        }
+
+        // Restore-settle is only a bridge over stale live geometry. Once Smart Resize
+        // computes a newer target (notably while restoring a miniature), that target owns
+        // the descriptor so we do not recreate overflow from the stale restored size.
+        const targetSize = WindowState.get(meta_window, 'targetRestoredSize');
+        if (targetSize) {
+            Logger.log(`WindowDescriptor: Using targetRestoredSize ${targetSize.width}x${targetSize.height} for ${meta_window.get_id()}`);
+            return targetSize;
+        }
+
+        if (WindowState.get(meta_window, 'isConstrainedByMosaic') &&
+            committedSlot?.width > 0 && committedSlot?.height > 0) {
+            // targetSmartResizeSize is a configure-in-flight bridge, not the lifetime of
+            // Mosaic's size ownership. A Wayland client can acknowledge the requested size
+            // and then publish another startup/session-restore size a frame later (Firefox
+            // does this on cold launch). Once the first ack clears the bridge, falling back
+            // to that transient live frame makes a constrained window become its own layout
+            // input and can overwrite a still-valid miniature rail.
+            //
+            // isConstrainedByMosaic is the durable ownership bit, and MosaicModel is the
+            // durable committed geometry. Keep using the committed slot until an explicit
+            // user resize clears the constraint and teaches the model a new intent.
+            Logger.log(`WindowDescriptor: Using constrained model slot ${committedSlot.width}x${committedSlot.height} for ${meta_window.get_id()} (live=${frame.width}x${frame.height})`);
+            return committedSlot;
+        }
+
+        return {
+            width: frame.width > 0 ? frame.width : 1,
+            height: frame.height > 0 ? frame.height : 1,
+        };
     }
 
     draw(meta_windows, x, y, masks, isDragging, drawingManager, dryRun = false) {
@@ -4260,7 +4917,7 @@ class WindowDescriptor {
         if (!WindowState.get(window, ANIMATING_MINIATURE)) {
             applyMiniatureActorState(windowActor, sc, extL, extT, x, y);
         }
-        WindowState.set(window, MINIATURE_TARGET_POS, { x, y });
+        WindowState.set(window, MINIATURE_TARGET_POS, {x, y});
         WindowState.get(window, MINIATURE_OVERLAY)?.updatePosition();
         Logger.log(`[MINIATURE] draw ${window.get_id()}: target=(${x},${y}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${this.width}x${this.height}`);
     }
@@ -4297,35 +4954,41 @@ class Level {
 
     // Clamp to the work area, record the computed slot, and hand off to the window's own draw.
     _placeWindow(workspace, monitor, window, meta_windows, rawX, rawY, masks, isDragging, drawingManager, dryRun, slotsOut, bounds) {
-        const { x: drawX, y: drawY } = clampToWorkArea(rawX, rawY, window.width, window.height, bounds);
+        const {x: drawX, y: drawY} = clampToWorkArea(rawX, rawY, window.width, window.height, bounds);
 
         if (!dryRun)
             Logger.log(`Window ${window.id} target: ${drawX},${drawY} (${window.width}x${window.height})`);
 
         if (window.metaWindow) {
-            const slot = { x: drawX, y: drawY, width: window.width, height: window.height };
-            MosaicModel.setSlot(window.metaWindow, slot, workspace, monitor);
+            const slot = {x: drawX, y: drawY, width: window.width, height: window.height};
+            if (WindowState.get(window.metaWindow, IS_MINIATURE) ||
+                WindowState.get(window.metaWindow, PENDING_MINIATURE))
+                MosaicModel.setPresentationSlot(window.metaWindow, slot, workspace, monitor);
+            else
+                MosaicModel.commitNormalSlot(window.metaWindow, slot, workspace, monitor);
             if (slotsOut) slotsOut.set(window.metaWindow.get_id(), slot);
         }
 
         window.draw(meta_windows, drawX, drawY, masks, isDragging, drawingManager, dryRun);
     }
 
-    draw_horizontal(workspace, monitor, meta_windows, y, masks, isDragging, drawingManager, dryRun = false, slotsOut = null, bounds = null) {
-        let x = this.x;
-        for(const window of this.windows) {
-            const rawX = window.targetX !== undefined ? window.targetX : x;
-            const rawY = window.targetY !== undefined ? window.targetY : y;
+    draw_horizontal(workspace, monitor, meta_windows, y, masks, isDragging,
+        drawingManager, dryRun = false, slotsOut = null, bounds = null, dx = 0, dy = 0) {
+        let x = this.x + dx;
+        for (const window of this.windows) {
+            const rawX = (window.targetX !== undefined ? window.targetX : x - dx) + dx;
+            const rawY = (window.targetY !== undefined ? window.targetY : y - dy) + dy;
             this._placeWindow(workspace, monitor, window, meta_windows, rawX, rawY, masks, isDragging, drawingManager, dryRun, slotsOut, bounds);
             x += window.width + constants.WINDOW_SPACING;
         }
     }
 
-    draw_vertical(workspace, monitor, meta_windows, x, masks, isDragging, drawingManager, dryRun = false, slotsOut = null, bounds = null) {
-        let y = this.y;
-        for(const window of this.windows) {
-            const rawX = window.targetX !== undefined ? window.targetX : x;
-            const rawY = window.targetY !== undefined ? window.targetY : y;
+    draw_vertical(workspace, monitor, meta_windows, x, masks, isDragging,
+        drawingManager, dryRun = false, slotsOut = null, bounds = null, dx = 0, dy = 0) {
+        let y = this.y + dy;
+        for (const window of this.windows) {
+            const rawX = (window.targetX !== undefined ? window.targetX : x - dx) + dx;
+            const rawY = (window.targetY !== undefined ? window.targetY : y - dy) + dy;
             this._placeWindow(workspace, monitor, window, meta_windows, rawX, rawY, masks, isDragging, drawingManager, dryRun, slotsOut, bounds);
             y += window.height + constants.WINDOW_SPACING;
         }
@@ -4341,6 +5004,7 @@ class Mask {
         this.width = window.width;
         this.height = window.height;
     }
+
     draw(_, x, y, _masks, _isDragging, drawingManager) {
         if (drawingManager) {
             // Don't clear boxes here; destroyMasks() already did it once at the start of tiling.
@@ -4348,4 +5012,3 @@ class Mask {
         }
     }
 }
-

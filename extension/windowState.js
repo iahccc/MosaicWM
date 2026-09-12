@@ -46,6 +46,7 @@ export const MINIATURE_TARGET_POS = 'miniatureTargetPos';
 export const MINIATURE_EXT_LEFT = 'miniatureExtLeft';
 export const MINIATURE_EXT_TOP = 'miniatureExtTop';
 export const MINIATURE_SCREENSHOT_PAUSE = 'miniatureScreenshotPause';
+export const MINIATURE_FULLSCREEN_PAUSE = 'miniatureFullscreenPause';
 export const ANIMATING_MINIATURE = 'animatingMiniature';
 export const MINIATURE_OVERLAY = 'miniatureOverlay';
 export const MINIATURE_ANIM_KIND = 'miniatureAnimKind';
@@ -53,3 +54,11 @@ export const MINIATURE_ANIM_KIND = 'miniatureAnimKind';
 // that positions windows has to leave these alone: their descriptor already carries the mini's size,
 // so a move_resize_frame would shrink the real frame and the scale would compound on top of it.
 export const PENDING_MINIATURE = 'pendingMiniature';
+export const IS_DOMINANT = 'isDominant';
+export const DOMINANT_KEEP_NORMAL = 'dominantKeepNormal';
+export const DOMINANT_APPLYING_LAYOUT = 'dominantApplyingLayout';
+export const DOMINANT_FORCED_MINIATURE = 'dominantForcedMiniature';
+export const DOMINANT_RESTORE_IN_PROGRESS = 'dominantRestoreInProgress';
+export const MOSAIC_FULLSCREEN = 'mosaicFullscreen';
+export const MOSAIC_FULLSCREEN_KIND = 'mosaicFullscreenKind';
+export const DOMINANT_SUSPENDED_FOR_FULLSCREEN = 'dominantSuspendedForFullscreen';

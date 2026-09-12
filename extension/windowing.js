@@ -216,7 +216,6 @@ export const WindowingManager = GObject.registerClass({
 
             Logger.log(`moveOversizedWindow: origin=${currentIndex}`);
 
-            const isSacred = this.isMaximizedOrFullscreen(window);
             const nextIndex = currentIndex + 1;
             const totalWorkspaces = workspaceManager.get_n_workspaces();
             let target_workspace = null;
@@ -224,18 +223,13 @@ export const WindowingManager = GObject.registerClass({
             // GNOME's dynamic workspaces might not have a workspace at nextIndex yet
             const nextWorkspace = nextIndex < totalWorkspaces ? workspaceManager.get_workspace_by_index(nextIndex) : null;
 
-            if (isSacred) {
-                Logger.log(`[PLACEMENT] Sacred window detected - targeting strictly WS-${nextIndex} for isolation`);
-                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
+            Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
+            if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
+                Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
+                target_workspace = nextWorkspace;
             } else {
-                Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
-                if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
-                    Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
-                    target_workspace = nextWorkspace;
-                } else {
-                    Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
-                    target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
-                }
+                Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
+                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
             }
 
             const previous_workspace = window.get_workspace();
@@ -481,37 +475,12 @@ export const WindowingManager = GObject.registerClass({
     }
 
     isMaximizedOrFullscreen(window) {
-        return window.is_maximized() || window.is_fullscreen() || this._looksNativelyFullscreen(window);
+        return window.is_maximized() || this.isFullscreenLike(window);
     }
 
-    // Some game engines (Unity's borderless "Fullscreen Window" mode) resize to the monitor's
-    // resolution without setting the WM's real maximize/fullscreen state, so nothing marks
-    // them sacred and mosaic shrinks then miniaturizes them like any oversized window. Catch
-    // the shape instead: no preferred/opening size captured yet, and the frame already covers
-    // the whole physical monitor, which normal placement (even maximized) never reaches.
-    _looksNativelyFullscreen(window) {
-        if (WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize'))
-            return false;
-
-        const monitor = window.get_monitor();
-        if (monitor === null || monitor === undefined || monitor < 0) return false;
-
-        const geom = global.display.get_monitor_geometry(monitor);
-        if (!geom) return false;
-
-        const frame = window.get_frame_rect();
-        return frame.width >= geom.width && frame.height >= geom.height;
-    }
-
-    hasSacredWindow(workspace, monitor, excludeWindowId = null) {
-        if (!workspace || monitor === null || monitor === undefined)
-            return false;
-
-        const windows = this.getMonitorWorkspaceWindows(workspace, monitor);
-        return windows.some(w =>
-            (!excludeWindowId || w.get_id() !== excludeWindowId) &&
-            this.isMaximizedOrFullscreen(w)
-        );
+    isFullscreenLike(window) {
+        return !!window && (WindowState.get(window, WindowState.MOSAIC_FULLSCREEN) ||
+            window.is_fullscreen?.());
     }
 
     renavigate(workspace, condition, lastVisitedIndex = null, monitorIndex = -1) {
@@ -519,6 +488,11 @@ export const WindowingManager = GObject.registerClass({
 
         // Queue in idle with low priority to let GNOME settle its dynamic workspace states
         this._timeoutRegistry.addIdle(() => {
+            if (global.workspace_manager.get_active_workspace() !== workspace) {
+                Logger.log('[RENAVIGATE] Workspace is no longer active; dropping stale navigation request');
+                return GLib.SOURCE_REMOVE;
+            }
+
             const currentIndex = this._indexOfWorkspace(workspace);
             if (currentIndex < 0) return GLib.SOURCE_REMOVE;
 

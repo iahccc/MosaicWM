@@ -3,9 +3,10 @@
 
 set -e
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UUID="mosaicwm@cleomenezesjr.github.io"
-SRCDIR="extension"
-ZIPFILE="$UUID.zip"
+SRCDIR="$ROOT_DIR/extension"
+ZIPFILE="$ROOT_DIR/$UUID.zip"
 
 usage() {
     echo "Usage: $0 [OPTION]"
@@ -19,11 +20,13 @@ usage() {
 
 build() {
     echo "Building extension..."
-    
+
+    "$ROOT_DIR/scripts/build-native.sh"
+
     # Remove compiled schemas
     rm -f "$SRCDIR/schemas/gschemas.compiled"
-    (cd "$SRCDIR" && zip -r "../$ZIPFILE" .)
-    
+    (cd "$SRCDIR" && zip -r "$ZIPFILE" .)
+
     echo "Build complete: $ZIPFILE"
 }
 

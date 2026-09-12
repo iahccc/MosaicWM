@@ -1,16 +1,16 @@
 // Copyright 2025-2026 Cleo Menezes Jr.
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Window resize operations and maximize undo
+// Window resize operations
 
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import * as Logger from './logger.js';
-import { afterWorkspaceSwitch, afterAnimations, monotonicNow } from './timing.js';
+import { afterAnimations, monotonicNow } from './timing.js';
 import * as WindowState from './windowState.js';
 import * as constants from './constants.js';
 import { TileZone } from './constants.js';
 import { isResizeGrabOp } from './grabOps.js';
-import { isWorkspaceAlive, isWindowAlive } from './liveness.js';
+import { isWindowAlive } from './liveness.js';
 import { MosaicModel } from './mosaicModel.js';
 
 import GObject from 'gi://GObject';
@@ -29,6 +29,11 @@ export const ResizeHandler = GObject.registerClass({
         this._resizeDebounceTimeout = null;
         this._lastResizeWindow = null;
         this._lastResizeTime = 0;
+        // A constrained window can publish a client-owned size while its arrival/layout
+        // transaction is still locked. Those events are presentation drift, not new layout
+        // intent. Keep one condition-driven reconcile per window instead of either dropping
+        // the event or recursively invoking the solver inside the still-active transaction.
+        this._constrainedReconciles = new Map();
     }
 
     get windowingManager() { return this._ext.windowingManager; }
@@ -70,6 +75,32 @@ export const ResizeHandler = GObject.registerClass({
         this._constraintRebalanceCount = 0;
     }
 
+    revokeNormalResizeContract(window, reason = 'role-change', {clearRestoreBridge = false} = {}) {
+        if (!window) return;
+        this._cancelConstrainedReconcile(window);
+        const hadTarget = WindowState.get(window, 'targetSmartResizeSize') !== null &&
+            WindowState.get(window, 'targetSmartResizeSize') !== undefined;
+        const hadVerify = WindowState.get(window, 'clampVerifyId') !== undefined;
+        this._disarmClampVerification(window);
+        WindowState.set(window, 'targetSmartResizeSize', null);
+        WindowState.remove(window, 'targetSmartResizeSetAt');
+        if (clearRestoreBridge)
+            WindowState.remove(window, 'targetRestoredSize');
+        if (hadTarget || hadVerify)
+            Logger.log(`[SMART RESIZE] Revoked normal resize contract for ${window.get_id()} (${reason})`);
+    }
+
+    _roleOwnsLiveGeometry(window) {
+        if (!window) return false;
+        return !!(
+            WindowState.get(window, WindowState.IS_MINIATURE) ||
+            WindowState.get(window, WindowState.IS_DOMINANT) ||
+            WindowState.get(window, WindowState.DOMINANT_APPLYING_LAYOUT) ||
+            this._ext.dominantManager?.isReleaseSettling(window) ||
+            this.windowingManager.isMaximizedOrFullscreen(window)
+        );
+    }
+
     // Once the client had its chance, a frame still above target is a genuine minimum.
     _commitClampedSize(window, pendingSmartSize, rect) {
         Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamped: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height}`);
@@ -84,7 +115,12 @@ export const ResizeHandler = GObject.registerClass({
         // Rebalancing right away races the tiling pass that's still settling
         // it and can kick it right back out, so give it a moment first.
         const now = monotonicNow();
-        if (!this._resizeGracePeriod || (now - this._resizeGracePeriod) >= constants.REVERSE_RESIZE_PROTECTION_MS) {
+        if (WindowState.get(window, 'pendingFirstPlacement')) {
+            // A hidden entrant whose client rejected the planned size needs a fresh layout
+            // target before its visibility transaction can complete. Never leave this to the
+            // normal grace suppression or the stale target would keep the actor hidden.
+            this._queueConstraintRebalance(window);
+        } else if (!this._resizeGracePeriod || (now - this._resizeGracePeriod) >= constants.REVERSE_RESIZE_PROTECTION_MS) {
             this._queueConstraintRebalance(window);
         } else {
             Logger.log(`[SMART RESIZE] Window ${window.get_id()} clamp rebalance skipped; within grace period`);
@@ -111,23 +147,58 @@ export const ResizeHandler = GObject.registerClass({
 
         const verifyId = this._timeoutRegistry.add(constants.RESIZE_CLAMP_VERIFY_DELAY_MS, () => {
             WindowState.remove(window, 'clampVerifyId');
-            if (!isWindowAlive(window)) return GLib.SOURCE_REMOVE;
-
-            // Whatever resolved or replaced this target meanwhile owns the state now.
-            const current = WindowState.get(window, 'targetSmartResizeSize');
-            if (!current || current.width !== pendingSmartSize.width || current.height !== pendingSmartSize.height)
-                return GLib.SOURCE_REMOVE;
-
-            const rect = window.get_frame_rect();
-            if (rect.width > pendingSmartSize.width + 2 || rect.height > pendingSmartSize.height + 2) {
-                Logger.log(`[SMART RESIZE] Window ${window.get_id()} never applied ${pendingSmartSize.width}×${pendingSmartSize.height}; committing frame ${rect.width}×${rect.height}`);
-                this._commitClampedSize(window, pendingSmartSize, rect);
-            } else {
-                WindowState.set(window, 'targetSmartResizeSize', null);
-            }
+            this._verifyClampTarget(window, pendingSmartSize);
             return GLib.SOURCE_REMOVE;
         }, 'resizeHandler_clampVerify');
         WindowState.set(window, 'clampVerifyId', verifyId);
+    }
+
+    _verifyClampTarget(window, pendingSmartSize) {
+        if (!isWindowAlive(window)) return;
+        if (this._clampOwnerChanged(window)) return;
+        if (!this._sameSmartResizeTarget(window, pendingSmartSize)) return;
+
+        const rect = window.get_frame_rect();
+        if (!this._frameExceedsTarget(rect, pendingSmartSize)) {
+            WindowState.set(window, 'targetSmartResizeSize', null);
+            return;
+        }
+        if (this._shouldDeferClampCommit(window)) {
+            Logger.log(`[SMART RESIZE] Window ${window.get_id()} still settling toward ${pendingSmartSize.width}×${pendingSmartSize.height}; extending clamp verification`);
+            this._armClampVerification(window, pendingSmartSize);
+            return;
+        }
+        if (this._consumeReleaseClamp(window, pendingSmartSize)) return;
+
+        Logger.log(`[SMART RESIZE] Window ${window.get_id()} never applied ${pendingSmartSize.width}×${pendingSmartSize.height}; committing frame ${rect.width}×${rect.height}`);
+        this._commitClampedSize(window, pendingSmartSize, rect);
+    }
+
+    _clampOwnerChanged(window) {
+        if (!this._roleOwnsLiveGeometry(window) ||
+            this._ext.dominantManager?.isReleaseSettling(window)) return false;
+        this.revokeNormalResizeContract(window, 'clamp-owner-changed', {clearRestoreBridge: true});
+        return true;
+    }
+
+    _sameSmartResizeTarget(window, target) {
+        const current = WindowState.get(window, 'targetSmartResizeSize');
+        return !!current && current.width === target.width && current.height === target.height;
+    }
+
+    _frameExceedsTarget(rect, target) {
+        return rect.width > target.width + 2 || rect.height > target.height + 2;
+    }
+
+    _consumeReleaseClamp(window, target) {
+        if (!this._ext.dominantManager?.isReleaseSettling(window)) return false;
+        Logger.log(`[DOMINANT] Release target ${target.width}×${target.height} not committed by ${window.get_id()}; preserving compact presentation without learning a minimum`);
+        WindowState.set(window, 'targetSmartResizeSize', null);
+        WindowState.remove(window, 'targetSmartResizeSetAt');
+        // This only rejects the observed configure as proof of a client minimum. The
+        // release transaction still owns its normal-role restoration goal; dropping that
+        // goal here would strand the compact presentation with no target left to retry.
+        return true;
     }
 
     _disarmClampVerification(window) {
@@ -138,6 +209,7 @@ export const ResizeHandler = GObject.registerClass({
     }
 
     onResizeBegin(window, grabpo) {
+        this._cancelConstrainedReconcile(window);
         this._resizeInOverflow = false;
         this._lastResizeTileTime = 0;
         this.tilingManager.isResizing = true;
@@ -225,129 +297,19 @@ export const ResizeHandler = GObject.registerClass({
 
     onSizeChange = (_, win, mode) => {
         const window = win.meta_window;
-        if (!this.windowingManager.isExcluded(window)) {
-            if (mode === Meta.SizeChange.FULLSCREEN || mode === Meta.SizeChange.MAXIMIZE) {
-                this.tryEnterSacred(window);
-            } else if (mode === Meta.SizeChange.UNMAXIMIZE || mode === Meta.SizeChange.UNFULLSCREEN) {
-                this.tryExitSacred(window);
-            }
+        if (this.windowingManager.isExcluded(window)) return;
+
+        if (mode === Meta.SizeChange.MAXIMIZE) {
+            // MAXIMIZE transfers geometry ownership away from the normal Smart Resize
+            // contract. A pending normal target must die before Mutter exposes the native
+            // maximized frame, otherwise the clamp verifier can mistake that role-change
+            // frame for an application-enforced minimum.
+            this.revokeNormalResizeContract(window, 'native-maximize', {clearRestoreBridge: true});
+            this._ext.dominantManager?.handleNativeEnter(window, 'manual-maximize');
+        } else if (mode === Meta.SizeChange.UNMAXIMIZE) {
+            this._ext.dominantManager?.handleNativeExit(window, 'unmaximize');
         }
     };
-
-    // Isolates a maximized/fullscreen window to its own workspace, after a short
-    // debounce so a quick toggle back never even starts the move. Some apps'
-    // fullscreen doesn't reliably trigger window_manager's size-change signal, so
-    // this is also called from windowHandler's notify::fullscreen as a backup -
-    // the pending flag below makes calling it twice for the same transition safe.
-    // size-change fires BEFORE window-created for new windows, so a window with no
-    // preferredSize/openingSize hasn't been through onWindowCreated yet; if it's already
-    // maximized it was born that way and skips isolation.
-    _detectBornMaximized(window) {
-        if (!WindowState.get(window, 'preferredSize') &&
-            !WindowState.get(window, 'openingSize') &&
-            this.windowingManager.isMaximizedOrFullscreen(window)) {
-            WindowState.set(window, 'openedMaximized', true);
-            Logger.log(`tryEnterSacred: Detected born-maximized window ${window.get_id()} - skipping isolation`);
-            return true;
-        }
-        return false;
-    }
-
-    tryEnterSacred(window) {
-        if (this._detectBornMaximized(window)) return;
-
-        // Born-maximized guard (from onWindowCreated, for subsequent maximize events)
-        if (WindowState.get(window, 'openedMaximized')) {
-            return;
-        }
-        if (WindowState.get(window, 'sacredEnterPending')) {
-            return;
-        }
-
-        const workspace = window.get_workspace();
-        const monitor = window.get_monitor();
-
-        // LOCK: Set flag to block onSizeChanged from saving giant dimensions
-        WindowState.set(window, 'isEnteringSacred', true);
-
-        if (this._ext && !this._ext.isMosaicEnabledForWorkspace(workspace)) {
-            Logger.log('User entering sacred state, but mosaic is disabled - skipping isolation');
-            return;
-        }
-        if (!this.windowingManager.isMaximizedOrFullscreen(window) ||
-            this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor).length <= 1) {
-            return;
-        }
-
-        Logger.log('[SACRED-ENTER] User entering sacred state - debouncing before moving to new workspace');
-        WindowState.set(window, 'sacredEnterPending', true);
-        const preMaxSize = WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
-
-        this._timeoutRegistry.add(constants.SACRED_ENTER_DEBOUNCE_MS, () => {
-            WindowState.remove(window, 'sacredEnterPending');
-
-            if (!isWindowAlive(window) || !this.windowingManager.isMaximizedOrFullscreen(window)) {
-                Logger.log(`[SACRED-ENTER] Window ${window.get_id()} already left sacred state - skipping isolation`);
-                return GLib.SOURCE_REMOVE;
-            }
-
-            const currentWorkspace = window.get_workspace();
-            const currentMonitor = window.get_monitor();
-            if (!currentWorkspace || this.windowingManager.getMonitorWorkspaceWindows(currentWorkspace, currentMonitor).length <= 1) {
-                Logger.log(`[SACRED-ENTER] Window ${window.get_id()} workspace no longer occupied - skipping isolation`);
-                return GLib.SOURCE_REMOVE;
-            }
-
-            Logger.log('[SACRED-ENTER] Still in sacred state after debounce - moving to new workspace');
-            const originalWorkspaceIndex = currentWorkspace.index();
-
-            this.windowingManager.moveOversizedWindow(window).then((newWorkspace) => {
-                if (newWorkspace) {
-                    WindowState.set(window, 'maximizedUndoInfo', {
-                        originalWorkspace: originalWorkspaceIndex,
-                        currentWorkspace: newWorkspace.index(),
-                        monitor: currentMonitor,
-                        preMaxSize: preMaxSize
-                    });
-                    // The companion only holds that half because this window was tiled beside it.
-                    this.edgeTilingManager.releaseAutoTileDependents(window);
-                    this.edgeTilingManager.expandQuarterPartner(window);
-                    this.tilingManager.tileWorkspaceWindows(currentWorkspace, null, currentMonitor, false);
-                }
-            }).catch(e => Logger.error(`Sacred isolation failed: ${e}`));
-            return GLib.SOURCE_REMOVE;
-        }, 'resizeHandler_sacredEnterDebounce');
-    }
-
-    // Mirrors tryEnterSacred: also called from windowHandler's notify::fullscreen
-    // as a backup, in case the size-change signal didn't fire for this exit either.
-    // maximizedUndoInfo gets removed right after use, so calling this twice for the
-    // same exit is safe; the second call just finds nothing left to undo.
-    tryExitSacred(window) {
-        // Born-maximized windows: don't set unmaximizing flag or try undo
-        if (WindowState.get(window, 'openedMaximized')) {
-            return;
-        }
-        WindowState.set(window, 'unmaximizing', true);
-        const maxInfo = WindowState.get(window, 'maximizedUndoInfo');
-        if (maxInfo) {
-            Logger.log(`[SACRED-EXIT] Window ${window.get_id()} was unmaximized - attempting undo`);
-            this.handleUnmaximizeUndo(window, maxInfo);
-            WindowState.remove(window, 'maximizedUndoInfo');
-        } else {
-            // Window was never isolated (it was alone in its workspace), so there's
-            // nothing to undo; just let the transition flags clear after it settles.
-            const preferredSize = WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
-            if (preferredSize) {
-                WindowState.set(window, 'targetRestoredSize', preferredSize);
-            }
-            this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
-                WindowState.remove(window, 'unmaximizing');
-                WindowState.remove(window, 'targetRestoredSize');
-                return GLib.SOURCE_REMOVE;
-            }, 'resizeHandler_settleSoloUnmaximize');
-        }
-    }
 
     onSizeChanged = (_, win) => {
         const window = win.meta_window;
@@ -355,25 +317,60 @@ export const ResizeHandler = GObject.registerClass({
         if (this._sizeChanged || this.windowingManager.isExcluded(window)) return;
 
         const rect = window.get_frame_rect();
+        const roleOwnedAtEntry = this._roleOwnsLiveGeometry(window);
+        // First-placement visibility is gated on the client committing Mosaic's planned
+        // geometry. Smart-resize configure acks are intentionally consumed below, so retry
+        // the deferred entrance before any of those guards can swallow this size event.
+        this.animationsManager?.runDeferredEntrance(window);
+        // Dominant release uses the same rule at workspace scale: compact miniatures stay in
+        // place until the compositor's live normal frames can safely coexist with the full-size
+        // miniature rail. Notify before resize guards consume the configure ack.
+        this._ext.dominantManager?.notifyGeometryChanged(window);
+        if (this._consumeRoleOwnedSizeChange(window, rect, roleOwnedAtEntry)) return;
         if (this._ignoreSizeChange(window, rect)) return;
 
         if (this._handleClampAfterResize(window, rect)) return;
-        if (this._handleSacredResizePhase(window)) return;
-        if (this._handleMaxUnmaxResize(window)) return;
+
+        // isConstrainedByMosaic is durable size ownership; targetSmartResizeSize only exists
+        // while one Wayland configure is in flight. Firefox can acknowledge that configure and
+        // then publish its startup/session-restored size again a frame later. Feeding that late
+        // live frame back into canFitWindow turns presentation drift into new layout input and
+        // can invalidate a perfectly valid miniature rail. Reconcile the presentation to the
+        // committed model instead; if arrival/tiling is still active, defer until it is safe.
+        if (this._handleConstrainedModelDrift(window, rect)) return;
 
         this._liftStaleMinConstraint(window, rect);
 
         const ctx = this._computeResizeContext(window, rect);
         this._updatePreferredSizeFromResize(window, rect, ctx);
-        WindowState.remove(window, 'isEnteringSacred');
 
         if (this._shouldSkipRetileAfterResize(window, ctx)) return;
 
         this._retileAfterSizeChange(window);
     };
 
+    _consumeRoleOwnedSizeChange(window, rect, roleOwnedAtEntry) {
+        if (!roleOwnedAtEntry) return false;
+        // Release settling may still carry a fresh normal target whose ack needs to be
+        // consumed, but no role-owned frame may reach the normal preferred/minimum
+        // learners or generic resize retile path.
+        if (this._ext.dominantManager?.isReleaseSettling(window))
+            this._handleClampAfterResize(window, rect);
+        else
+            this.revokeNormalResizeContract(window, 'role-owned-geometry', {clearRestoreBridge: true});
+        this._sizeChanged = false;
+        return true;
+    }
+
     _ignoreSizeChange(window, rect) {
         if (!this.windowingManager.isRelated(window)) return true;
+        // A miniature's MetaWindow frame is only the backing surface being scaled by
+        // MiniatureManager. Clients may settle that backing frame while the visible
+        // miniature stays in its slot; those configure echoes are not layout intent.
+        if (WindowState.get(window, WindowState.IS_MINIATURE)) {
+            this._sizeChanged = false;
+            return true;
+        }
         // Windows pending in the evaluation queue haven't been processed yet, so ignore size changes
         if (WindowState.get(window, 'pendingInQueue')) return true;
         if (rect.width <= constants.ANIMATION_DIFF_THRESHOLD || rect.height <= constants.ANIMATION_DIFF_THRESHOLD) return true;
@@ -386,8 +383,7 @@ export const ResizeHandler = GObject.registerClass({
         return false;
     }
 
-    // Detect client-side clamping after smart resize. Returns true when the event is consumed
-    // here; false lets it fall through (no pending target, or a sacred restore still waiting).
+    // Detect client-side clamping after smart resize. Returns true when the event is consumed.
     _handleClampAfterResize(window, rect) {
         const pendingSmartSize = WindowState.get(window, 'targetSmartResizeSize');
         if (!pendingSmartSize) return false;
@@ -399,6 +395,11 @@ export const ResizeHandler = GObject.registerClass({
                 // rather than a real minimum; the verification settles it.
                 Logger.log(`[SMART RESIZE] Window ${window.get_id()} above target while settling: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height}; deferring to verification`);
                 this._armClampVerification(window, pendingSmartSize);
+                this._sizeChanged = false;
+                return true;
+            }
+
+            if (this._consumeReleaseClamp(window, pendingSmartSize)) {
                 this._sizeChanged = false;
                 return true;
             }
@@ -416,41 +417,123 @@ export const ResizeHandler = GObject.registerClass({
             this._disarmClampVerification(window);
         }
 
-        // A sacred restore waits on this same size-changed, and the resize that just
-        // landed is the one it ordered itself. Returning here would strand it until
-        // the safety timeout.
-        if (WindowState.get(window, 'isRestoringSacred') === undefined) {
-            this._sizeChanged = false;
-            return true;
-        }
-        return false;
-    }
-
-    _handleSacredResizePhase(window) {
-        const originWorkspaceIndex = WindowState.get(window, 'isRestoringSacred');
-        if (originWorkspaceIndex === undefined) return false;
-
-        // No longer sacred (unmaximized) means it finished resizing in place; otherwise it's
-        // still maximized but moving. Either way we block further size handling here.
-        if (!this.windowingManager.isMaximizedOrFullscreen(window)) {
-            this.completeSacredReturn(window, originWorkspaceIndex);
-        }
         this._sizeChanged = false;
         return true;
     }
 
-    _handleMaxUnmaxResize(window) {
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) {
-            WindowState.remove(window, 'isEnteringSacred');
-            this._sizeChanged = false;
-            return true;
+    _handleConstrainedModelDrift(window, rect) {
+        if (!WindowState.get(window, 'isConstrainedByMosaic')) return false;
+        if (this._currentGrabOp && isResizeGrabOp(this._currentGrabOp)) return false;
+
+        const slot = MosaicModel.normalSlotFor(window);
+        if (!slot || !this._sizeDiffers(rect, slot)) return false;
+
+        Logger.log(`[MODEL RECONCILE] Constrained window ${window.get_id()} drifted from committed ${slot.width}x${slot.height} to live ${rect.width}x${rect.height}; deferring presentation reconcile`);
+        this._queueConstrainedReconcile(window);
+        this._sizeChanged = false;
+        return true;
+    }
+
+    _sizeDiffers(actual, target) {
+        return Math.abs(actual.width - target.width) > constants.ANIMATION_DIFF_THRESHOLD ||
+            Math.abs(actual.height - target.height) > constants.ANIMATION_DIFF_THRESHOLD;
+    }
+
+    _queueConstrainedReconcile(window) {
+        const id = window.get_id();
+        if (this._constrainedReconciles.has(id)) return;
+
+        const pending = {window, timeoutId: null};
+        this._constrainedReconciles.set(id, pending);
+        this._tryConstrainedReconcile(pending);
+    }
+
+    _tryConstrainedReconcile(pending) {
+        const {window} = pending;
+        const id = window?.get_id?.();
+        if (id === undefined || this._constrainedReconciles.get(id) !== pending) return;
+
+        if (!this._canKeepConstrainedReconcile(window)) {
+            this._cancelConstrainedReconcile(window);
+            return;
         }
 
-        if (WindowState.get(window, 'unmaximizing')) {
-            this._sizeChanged = false;
-            return true;
+        const slot = MosaicModel.normalSlotFor(window);
+        const frame = window.get_frame_rect();
+        if (!slot || !this._sizeDiffers(frame, slot)) {
+            this._cancelConstrainedReconcile(window);
+            return;
         }
-        return false;
+
+        if (this._constrainedReconcileBlocked(window)) {
+            this._scheduleConstrainedReconcileRetry(pending);
+            return;
+        }
+
+        // Renew the transient configure bridge so normal clamp detection still works if the
+        // client genuinely can no longer satisfy the committed slot. The model remains the
+        // durable intent; this request only reconciles Mutter's live presentation to it.
+        this._constrainedReconciles.delete(id);
+        this.tilingManager.setSmartResizeTarget(window, slot);
+        Logger.log(`[MODEL RECONCILE] Reasserting committed slot for ${id}: live=${frame.width}x${frame.height} → ${slot.width}x${slot.height}`);
+
+        // Suppress a synchronous configure echo from recursively entering this same handler.
+        this._sizeChanged = true;
+        try {
+            this.animationsManager.animateWindow(window, slot, {subtle: true});
+        } finally {
+            this._sizeChanged = false;
+        }
+    }
+
+    _canKeepConstrainedReconcile(window) {
+        if (!isWindowAlive(window) || !this._ext || this.windowingManager.isExcluded(window)) return false;
+        if (!WindowState.get(window, 'isConstrainedByMosaic')) return false;
+        if (this._roleOwnsLiveGeometry(window)) return false;
+        const workspace = window.get_workspace();
+        const monitor = window.get_monitor();
+        return !!workspace && workspace.index() >= 0 && monitor !== null && monitor >= 0;
+    }
+
+    _constrainedReconcileBlocked(window) {
+        const workspace = window.get_workspace();
+        return this._constrainedReconcileTransactionBusy(window, workspace) ||
+            this._constrainedReconcileInteractionBusy();
+    }
+
+    _constrainedReconcileTransactionBusy(window, workspace) {
+        return this._ext.windowHandler?.isWorkspaceLocked(workspace) ||
+            this._ext.windowHandler?.isEvaluatingQueue ||
+            WindowState.get(window, 'arrivalPending') ||
+            WindowState.get(window, 'pendingInQueue') ||
+            WindowState.get(window, 'pendingFirstPlacement') ||
+            WindowState.get(window, 'isMosaicResizing');
+    }
+
+    _constrainedReconcileInteractionBusy() {
+        return this.tilingManager._isSmartResizingBlocked ||
+            this.tilingManager.isDragging ||
+            this.tilingManager.isResizing ||
+            this._isEdgeTileRestoreSettling(monotonicNow());
+    }
+
+    _scheduleConstrainedReconcileRetry(pending) {
+        if (pending.timeoutId || !this._timeoutRegistry) return;
+        pending.timeoutId = this._timeoutRegistry.add(constants.POLL_INTERVAL_MS, () => {
+            pending.timeoutId = null;
+            this._tryConstrainedReconcile(pending);
+            return GLib.SOURCE_REMOVE;
+        }, 'resizeHandler_constrainedModelReconcile');
+    }
+
+    _cancelConstrainedReconcile(window) {
+        const id = window?.get_id?.();
+        if (id === undefined) return;
+        const pending = this._constrainedReconciles?.get(id);
+        if (!pending) return;
+        if (pending.timeoutId && this._timeoutRegistry)
+            this._timeoutRegistry.remove(pending.timeoutId);
+        this._constrainedReconciles.delete(id);
     }
 
     // A frame well above a recorded minimum disproves it (the window clearly can go bigger).
@@ -510,6 +593,16 @@ export const ResizeHandler = GObject.registerClass({
     }
 
     _updatePreferredSizeFromResize(window, rect, { isConstrained, userForcedResize, isMonitorSized, clientOwnedSize }) {
+        // A dominant-release frame is owned by the transition until the live geometry solver
+        // commits the normal presentation. The client may echo the old dominant/native size
+        // while targetRestoredSize is already the real normal intent; learning that echo as
+        // preferredSize would make later restores chase the dominant frame forever. An active
+        // user resize still wins and is allowed to replace the intent explicitly.
+        if (this._ext.dominantManager?.isReleaseSettling(window) && !userForcedResize) {
+            Logger.log(`[DOMINANT] Preserving preferred size for ${window.get_id()} while release geometry settles`);
+            return;
+        }
+
         const edgeState = this.edgeTilingManager.getWindowState(window);
         const isEdgeTiledNow = edgeState && edgeState.zone !== TileZone.NONE;
 
@@ -560,11 +653,7 @@ export const ResizeHandler = GObject.registerClass({
     }
 
     _inResizeTransition(window, clientOwnedSize) {
-        return WindowState.get(window, 'isEnteringSacred') ||
-            WindowState.get(window, 'unmaximizing') ||
-            WindowState.get(window, 'isRestoringSacred') ||
-            WindowState.get(window, 'openedMaximized') ||
-            (WindowState.get(window, 'isMosaicResizing') && !clientOwnedSize);
+        return WindowState.get(window, 'isMosaicResizing') && !clientOwnedSize;
     }
 
     _shouldSkipRetileAfterResize(window, ctx) {
@@ -697,10 +786,6 @@ export const ResizeHandler = GObject.registerClass({
             return true;
         }
 
-        if (this._resolveSettledOverflow(window, workspace, monitor, canFit)) {
-            return true;
-        }
-
         // Throttle to avoid excessive calculations during smooth resizing
         if (canFit && this._lastTileTime && (now - this._lastTileTime < 30)) {
             this._sizeChanged = false;
@@ -708,24 +793,6 @@ export const ResizeHandler = GObject.registerClass({
         }
         if (canFit) this._lastTileTime = now;
 
-        return false;
-    }
-
-    // Returns true when it ejected the window (caller stops). A window that no longer fits
-    // and isn't the last one gets moved out; one that recovered clears its overflow claim.
-    _resolveSettledOverflow(window, workspace, monitor, canFit) {
-        const mosaicWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !this.edgeTilingManager.isEdgeTiled(w) && !this.windowingManager.isExcluded(w));
-        const isSolo = mosaicWindows.length <= 1;
-
-        if (!canFit && !isSolo) {
-            if (this._resizeOverflowWindow !== window &&
-                this._ejectOversizedOnResize(window, workspace, monitor)) {
-                return true;
-            }
-        } else if (canFit && this._resizeOverflowWindow === window) {
-            this._resizeOverflowWindow = null;
-        }
         return false;
     }
 
@@ -758,31 +825,13 @@ export const ResizeHandler = GObject.registerClass({
             this.edgeTilingManager.isRestoringFromEdgeTile(now);
     }
 
-    // Returns true when the window was ejected (or the attempt was aborted), so the caller stops.
-    _ejectOversizedOnResize(window, workspace, monitor) {
-        if (WindowState.get(window, 'waitingForGeometry') || !WindowState.get(window, 'geometryReady')) {
-            this._sizeChanged = false;
-            return true;
-        }
-
-        if (this._ext.windowHandler && this._ext.windowHandler.isWorkspaceLocked(workspace)) {
-            this._sizeChanged = false;
-            return true;
-        }
-
-        this._resizeOverflowWindow = window;
-        const oldWorkspace = workspace;
-        this.windowingManager.moveOversizedWindow(window).then(newWorkspace => {
-            if (newWorkspace) {
-                this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, false);
-            }
-        });
-        this._resizeOverflowWindow = null;
-        this._sizeChanged = false;
-        return true;
-    }
 
     destroy() {
+        for (const pending of this._constrainedReconciles?.values() ?? []) {
+            if (pending.timeoutId && this._timeoutRegistry)
+                this._timeoutRegistry.remove(pending.timeoutId);
+        }
+        this._constrainedReconciles?.clear();
         if (this._resizeDebounceTimeout) {
             this._timeoutRegistry.remove(this._resizeDebounceTimeout);
             this._resizeDebounceTimeout = null;
@@ -797,189 +846,5 @@ export const ResizeHandler = GObject.registerClass({
         this._constraintRebalanceQueued = false;
         this._constraintRebalanceCount = 0;
         this._ext = null;
-    }
-
-    // Mutter can skip firing size-changed on a fast toggle, leaving the window
-    // stuck on the isolated workspace if nothing else nudges it.
-    scheduleSacredRestoreSafety(window, originWorkspaceIndex) {
-        this._timeoutRegistry.add(constants.SACRED_RESTORE_SAFETY_TIMEOUT_MS, () => {
-            if (WindowState.get(window, 'isRestoringSacred') === originWorkspaceIndex) {
-                Logger.log(`[SACRED-TIMEOUT] Window ${window.get_id()} never confirmed unmaximize - forcing deferred move`);
-                this.completeSacredReturn(window, originWorkspaceIndex);
-            }
-            return GLib.SOURCE_REMOVE;
-        }, 'resizeHandler_sacredRestoreSafety');
-    }
-
-    // Clearing the flag below makes this safe to call twice, since the real
-    // signal and the timeout above can both end up calling it.
-    completeSacredReturn(window, originWorkspaceIndex) {
-        if (WindowState.get(window, 'isRestoringSacred') !== originWorkspaceIndex) return;
-
-        Logger.log(`[SACRED-MOVE] Window ${window.get_id()} finished in-place resize. Moving to origin workspace ${originWorkspaceIndex}.`);
-
-        const workspaceManager = global.workspace_manager;
-        if (originWorkspaceIndex < 0 || originWorkspaceIndex >= workspaceManager.get_n_workspaces()) {
-            WindowState.remove(window, 'isRestoringSacred');
-            WindowState.remove(window, 'sacredFitConfirmed');
-            WindowState.remove(window, 'pendingMiniaturesForReturn');
-            return;
-        }
-
-        const originWS = workspaceManager.get_workspace_by_index(originWorkspaceIndex);
-        const monitor = window.get_monitor();
-        const oldWorkspace = window.get_workspace();
-        // handleUnmaximizeUndo sets this once it already checked the window
-        // fits, so the tile pass below doesn't second-guess it as overflow.
-        const fitConfirmed = WindowState.get(window, 'sacredFitConfirmed') === true;
-        const pendingMiniatures = WindowState.get(window, 'pendingMiniaturesForReturn') || [];
-
-        window.change_workspace(originWS);
-        originWS.activate(global.get_current_time());
-        this.windowingManager.showWorkspaceSwitcher(originWS, monitor);
-
-        // prevent double-move
-        WindowState.remove(window, 'isRestoringSacred');
-        WindowState.remove(window, 'sacredFitConfirmed');
-        WindowState.remove(window, 'pendingMiniaturesForReturn');
-
-        afterWorkspaceSwitch(() => {
-            Logger.log(`Triggering tiling in destination workspace ${originWorkspaceIndex}`);
-            this.tilingManager._isSmartResizingBlocked = true;
-            try {
-                this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
-                this.tilingManager.tileWorkspaceWindows(originWS, window, monitor, fitConfirmed);
-            } finally {
-                this.tilingManager._isSmartResizingBlocked = false;
-            }
-            if (isWorkspaceAlive(oldWorkspace, workspaceManager)) {
-                this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, true);
-            }
-
-            // The exile dissolved whatever this window was paired with, so reclaiming
-            // its half (or its quarter) has to put that pairing back together.
-            this.edgeTilingManager.tryPairMosaicIntoOppositeHalf(window);
-            this.edgeTilingManager.tryRestoreQuarterPartner(window);
-
-            // Same clamp protection as above, so this window doesn't get
-            // rebalanced right after it just landed.
-            this._resizeGracePeriod = monotonicNow();
-
-            this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
-                WindowState.remove(window, 'unmaximizing');
-                WindowState.remove(window, 'isConstrainedByMosaic');
-                WindowState.remove(window, 'targetRestoredSize');
-                WindowState.remove(window, 'openedMaximized');
-                return GLib.SOURCE_REMOVE;
-            }, 'resizeHandler_settleRestoreSacred');
-        }, this._timeoutRegistry);
-    }
-
-    async handleUnmaximizeUndo(window, maxInfo) {
-        const { originalWorkspace: origIndex, monitor, preMaxSize } = maxInfo;
-        const currentWorkspace = window.get_workspace();
-        const workspaceManager = global.workspace_manager;
-        const windowId = window.get_id();
-
-        if (preMaxSize) {
-            WindowState.set(window, 'openingSize', preMaxSize);
-        }
-
-        if (origIndex >= workspaceManager.get_n_workspaces()) {
-            this.tilingManager.tileWorkspaceWindows(currentWorkspace, window, monitor);
-            return;
-        }
-
-        const targetWorkspace = workspaceManager.get_workspace_by_index(origIndex);
-        if (currentWorkspace.index() === origIndex) {
-            this._undoOnSameWorkspace(window, currentWorkspace, monitor, preMaxSize);
-            return;
-        }
-
-        if (preMaxSize) {
-            WindowState.set(window, 'preferredSize', preMaxSize);
-        }
-
-        // Its zone is reserved, so the fit below would shrink the neighbours for room it never takes.
-        if (this.edgeTilingManager.getWindowState(window)?.zone) {
-            this._deferSacredReturn(window, origIndex, preMaxSize, false, []);
-            return;
-        }
-
-        const { canFit, resizeNeeded, pendingMiniatures } =
-            this._tryFitForUndo(window, targetWorkspace, monitor, preMaxSize);
-
-        if (!canFit) {
-            Logger.log(`[SACRED-STAY] handleUnmaximizeUndo: Window ${windowId} unable to fit even with Smart Resize - staying in current workspace`);
-            this.tilingManager.tileWorkspaceWindows(currentWorkspace, window, monitor);
-            return;
-        }
-
-        this._deferSacredReturn(window, origIndex, preMaxSize, resizeNeeded, pendingMiniatures);
-    }
-
-    _undoOnSameWorkspace(window, currentWorkspace, monitor, preMaxSize) {
-        Logger.log(`handleUnmaximizeUndo: Window ${window.get_id()} unmaximized on SAME workspace - tiling immediately`);
-        WindowState.set(window, 'unmaximizing', true);
-        if (preMaxSize) {
-            WindowState.set(window, 'targetRestoredSize', preMaxSize);
-        }
-
-        this.tilingManager.tileWorkspaceWindows(currentWorkspace, window, monitor, true);
-
-        this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS + 100, () => {
-            WindowState.remove(window, 'unmaximizing');
-            WindowState.remove(window, 'targetRestoredSize');
-            return GLib.SOURCE_REMOVE;
-        }, 'resizeHandler_settleUnmaximizeSame');
-    }
-
-    // Natural fit first, then Smart Resize as a fallback. On success the pending miniatures
-    // are stashed early because intermediate tile passes need to treat them as pending too.
-    _tryFitForUndo(window, targetWorkspace, monitor, preMaxSize) {
-        if (this.tilingManager.canFitWindow(window, targetWorkspace, monitor, true, preMaxSize)) {
-            return { canFit: true, resizeNeeded: false, pendingMiniatures: [] };
-        }
-
-        Logger.log(`handleUnmaximizeUndo: Window ${window.get_id()} doesn't fit normally - attempting Smart Resize fit`);
-        const existingWindows = targetWorkspace.list_windows().filter(w => !this.windowingManager.isExcluded(w));
-        // Pass window as focused override: preMaxSize is its ceiling, so it won't be miniaturized.
-        const fitResult = this.tilingManager.tryFitWithResize(window, existingWindows, this.tilingManager.getUsableWorkArea(targetWorkspace, monitor), targetWorkspace, window);
-        if (!(fitResult?.success ?? false)) {
-            return { canFit: false, resizeNeeded: false, pendingMiniatures: [] };
-        }
-
-        // Pending minis MUST reach the tile pass, since skipping leaves siblings at miniature size with no real miniature.
-        const pendingMiniatures = fitResult.pendingWindows ?? [];
-        // Set early: intermediate tile calls treat these as pending-mini; afterWorkspaceSwitch re-sets before final pass.
-        this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
-        return { canFit: true, resizeNeeded: true, pendingMiniatures };
-    }
-
-    _deferSacredReturn(window, origIndex, preMaxSize, resizeNeeded, pendingMiniatures) {
-        if (resizeNeeded) {
-            Logger.log(`handleUnmaximizeUndo: Smart Resize applied successfully for return of ${window.get_id()}`);
-        }
-
-        window.unmaximize();
-        WindowState.set(window, 'unmaximizing', true);
-        WindowState.set(window, 'isConstrainedByMosaic', true);
-
-        if (preMaxSize) {
-            WindowState.set(window, 'targetRestoredSize', preMaxSize);
-            WindowState.set(window, 'openingSize', preMaxSize);
-            WindowState.set(window, 'preferredSize', preMaxSize);
-        }
-
-        // Wait for the real size-changed confirmation instead of guessing with
-        // a timer; a fixed delay could move the window before it's actually
-        // done resizing, and it'd show up at the destination still huge.
-        WindowState.set(window, 'isRestoringSacred', origIndex);
-        WindowState.set(window, 'sacredFitConfirmed', true);
-        if (pendingMiniatures.length > 0) {
-            WindowState.set(window, 'pendingMiniaturesForReturn', pendingMiniatures);
-        }
-        this.scheduleSacredRestoreSafety(window, origIndex);
-        Logger.log(`[SACRED-DEFER] Window ${window.get_id()} resizing in place before deferred move to WS ${origIndex}`);
     }
 } );

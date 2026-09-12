@@ -18,7 +18,7 @@ import {
     MINIATURE_TARGET_POS,
     PRE_MINIATURE_SIZE,
 } from './windowState.js';
-import { ComputedLayouts } from './mosaicModel.js';
+import { MosaicModel } from './mosaicModel.js';
 import { afterWorkspaceSwitch } from './timing.js';
 
 // Key events can carry virtual SUPER; global.get_pointer() reports physical MOD4.
@@ -497,7 +497,7 @@ export class KeyboardNavigatorManager {
             return false;
 
         if (WindowState.get(window, IS_MINIATURE) &&
-            this._ext.miniatureManager?.restoreMiniature(window, null)) {
+            this._ext.miniatureManager?.restoreMiniature(window, null, { reason: 'keyboard' })) {
             Logger.log(`[NAV] Restored selected miniature ${window.get_id()} on session finish`);
             return true;
         }
@@ -790,7 +790,7 @@ export class KeyboardNavigatorManager {
         if (miniatureRect)
             return miniatureRect;
 
-        const computedRect = ComputedLayouts.get(window);
+        const computedRect = MosaicModel.presentationSlotFor(window);
         if (computedRect)
             return { ...computedRect };
 

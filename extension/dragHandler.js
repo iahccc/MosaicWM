@@ -72,7 +72,10 @@ export const DragHandler = GObject.registerClass({
             for (const win of this._previewMiniaturizedWindows) {
                 if (!miniatureManager || !WindowState.get(win, WindowState.IS_MINIATURE)) continue;
                 Logger.log(`Edge preview cancelled - restoring miniature ${win.get_id()}`);
-                miniatureManager.restoreMiniature(win, null, { activate: false });
+                miniatureManager.restoreMiniature(win, null, {
+                    activate: false,
+                    dominantBypass: true,
+                });
             }
         } finally {
             this._suppressRestoreRetile = false;
@@ -84,7 +87,7 @@ export const DragHandler = GObject.registerClass({
         // Keyboard-driven grabs (Alt+F8 resize, Alt+Tab+move) bypass the click overlay
         // entirely, so a miniature would otherwise be manipulable without ever restoring.
         if (WindowState.get(window, WindowState.IS_MINIATURE)) {
-            this._ext.miniatureManager?.restoreMiniature(window, null);
+            this._ext.miniatureManager?.restoreMiniature(window, null, { reason: 'drag' });
         }
 
         this._currentGrabOp = grabpo;
