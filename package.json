@@ -4,7 +4,11 @@
   "scripts": {
     "lint": "eslint extension/",
     "lint:fix": "eslint extension/ --fix",
-    "shexli": "shexli extension/"
+    "shexli": "shexli extension/",
+    "test:unit": "node scripts/test-layout-solver.js && node scripts/test-maximized-layout-planner.js && node scripts/test-window-state-generation.js && node scripts/test-mosaic-model-scope.js && node scripts/test-tile-lock-ledger.js",
+    "test:headless": "bash scripts/test-headless.sh",
+    "test:headless:all": "bash scripts/test-headless.sh all",
+    "test": "npm run lint && npm run test:unit"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

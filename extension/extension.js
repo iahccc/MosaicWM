@@ -36,7 +36,14 @@ import { ResizeHandler } from './resizeHandler.js';
 import { MiniatureManager } from './miniature.js';
 import { KeyboardNavigatorManager } from './keyboardNavigator.js';
 import * as WindowState from './windowState.js';
-import { IS_MINIATURE, MINIATURE_SCALE, MINIATURE_EXT_LEFT, MINIATURE_EXT_TOP, MINIATURE_TARGET_POS, MINIATURE_OVERLAY } from './windowState.js';
+import {
+    IS_MINIATURE,
+    MINIATURE_SCALE,
+    MINIATURE_EXT_LEFT,
+    MINIATURE_EXT_TOP,
+    MINIATURE_TARGET_POS,
+    MINIATURE_OVERLAY
+} from './windowState.js';
 import { MosaicIndicator } from './quickSettings.js';
 
 export default class WindowMosaicExtension extends Extension {
@@ -117,6 +124,7 @@ export default class WindowMosaicExtension extends Extension {
 
     disableWorkspaceMosaic(workspace) {
         if (!workspace) return;
+        this.tilingManager?.maximizedLayout.clearWorkspace(workspace);
 
         if (this.miniatureManager)
             this.miniatureManager.restoreWorkspaceMiniatures(workspace);
@@ -183,6 +191,14 @@ export default class WindowMosaicExtension extends Extension {
         }
     }
 
+    _prepareWorkspacePresentations() {
+        for (let i = 0; i < global.workspace_manager.n_workspaces; i++) {
+            const workspace = global.workspace_manager.get_workspace_by_index(i);
+            for (let monitor = 0; monitor < global.display.get_n_monitors(); monitor++)
+                this.tilingManager.maximizedLayout.prepareWorkspace(workspace, monitor);
+        }
+    }
+
     _workspaceSwitchedHandler = () => {
         const newWorkspace = this._workspaceManager.get_active_workspace();
         const newIndex = newWorkspace.index();
@@ -193,6 +209,8 @@ export default class WindowMosaicExtension extends Extension {
         }
 
         this._currentWorkspaceIndex = newIndex;
+        for (let monitor = 0; monitor < global.display.get_n_monitors(); monitor++)
+            this.tilingManager.maximizedLayout.prepareWorkspace(newWorkspace, monitor);
 
         // Tiling while the switch animation runs races it; wait until it finishes.
         afterAnimations(this.animationsManager, () => {
@@ -253,8 +271,12 @@ export default class WindowMosaicExtension extends Extension {
         this.windowingManager.setTilingManager(this.tilingManager);
         this.windowingManager.setTimeoutRegistry(this._timeoutRegistry);
         this.windowingManager.setOverflowCallbacks(
-            () => { this._overflowInProgress = true; },
-            () => { this._overflowInProgress = false; }
+            () => {
+                this._overflowInProgress = true;
+            },
+            () => {
+                this._overflowInProgress = false;
+            }
         );
 
         this.tilingManager.setEdgeTilingManager(this.edgeTilingManager);
@@ -285,7 +307,11 @@ export default class WindowMosaicExtension extends Extension {
         this.miniatureManager = new MiniatureManager();
         this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this.miniatureManager.setAnimationsManager(this.animationsManager);
+        this.miniatureManager.setResizeContractRevoker((window, reason, options) =>
+            this.resizeHandler.revokeNormalResizeContract(window, reason, options));
         this.edgeTilingManager.setMiniatureManager(this.miniatureManager);
+        this.miniatureManager.setRestoreGate((window, options) =>
+            this.tilingManager.maximizedLayout.restore(window, options));
         this.keyboardNavigator = new KeyboardNavigatorManager(this);
         this._miniatureCascadeIds = new Set();
         this._lastFocusedWindowId = null;
@@ -349,6 +375,9 @@ export default class WindowMosaicExtension extends Extension {
         const origInit = this._origMonitorGroupInit;
         const extension = this;
         WorkspaceAnimation.MonitorGroup.prototype._init = function (monitor, workspaceIndices, movingWindow) {
+            for (const index of workspaceIndices)
+                extension.tilingManager.maximizedLayout.prepareWorkspace(
+                    global.workspace_manager.get_workspace_by_index(index), monitor.index);
             origInit.call(this, monitor, workspaceIndices, movingWindow);
 
             // After original _init, all WorkspaceGroups and their clones are created;
@@ -524,18 +553,22 @@ export default class WindowMosaicExtension extends Extension {
         this._wmEventIds.push(global.window_manager.connect('size-changed', (wm, win) => this.resizeHandler.onSizeChanged(wm, win)));
         this._displayEventIds.push(global.display.connect('window-created', (_, window) => this.windowHandler.onWindowCreated(window)));
         this._wmEventIds.push(global.window_manager.connect('destroy', (_, win) => this.windowHandler.onWindowDestroyed(win.meta_window)));
-        this._displayEventIds.push(global.display.connect('grab-op-begin', (display, window, grabpo) => this.dragHandler._grabOpBeginHandler(display, window, grabpo)));
+        this._displayEventIds.push(global.display.connect('grab-op-begin', (display, window, grabpo) => {
+            this.dragHandler._grabOpBeginHandler(display, window, grabpo);
+        }));
         this._displayEventIds.push(global.display.connect('grab-op-end', (display, window, grabpo) => this.dragHandler._grabOpEndHandler(display, window, grabpo)));
         this._displayEventIds.push(global.display.connect('window-left-monitor', (_, monitor, window) => this.windowHandler.onWindowLeftMonitor(monitor, window)));
         this._displayEventIds.push(global.display.connect('window-entered-monitor', (_, monitor, window) => this.windowHandler.onWindowEnteredMonitor(monitor, window)));
         this._displayEventIds.push(global.display.connect('restacked', () => this.miniatureManager?.syncOverlayStacking()));
         this._onOverviewShowingId = Main.overview.connect('showing', () => {
+            this._prepareWorkspacePresentations();
             this.animationsManager.setOverviewActive(true);
             this.miniatureManager?.setOverviewActive(true);
         });
         // Mutter already accepts move_resize_frame here, so real windows are in place
         // before the closing animation finishes and nothing flashes untiled.
         this._onOverviewHidingId = Main.overview.connect('hiding', () => {
+            this._prepareWorkspacePresentations();
             Logger.log('[FLUSH] triggered by hiding');
             this._flushMosaicToWindows();
         });
@@ -573,6 +606,12 @@ export default class WindowMosaicExtension extends Extension {
                 // Exclusion can flip later (always-on-top toggled off, unstuck from all
                 // workspaces), and unmanaged has to fire regardless for cleanup either way,
                 // so an excluded window still needs to be wired up now.
+                //
+                // Sample the fullscreen role first: _captureBornFullscreen only runs from the
+                // created-window paths, so a window that was already fullscreen at enable time
+                // would have no role recorded and its later exit would hit _leaveFullscreen's
+                // guard, skipping the entire return-to-layout handoff.
+                this.windowHandler._sampleInitialWindowMode(window);
                 this.windowHandler.connectWindowSignals(window);
             }
         }
@@ -715,15 +754,35 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _onFocusWindowChanged() {
+        // MRU order *is* the focus history, so a focus change invalidates the cached one
+        // (getMRUOrder is versioned against this same cache). Before the early return below:
+        // losing focus is itself a change to that history, and leaving the old ordering cached
+        // makes getMRUOrder rank every window added since as coldest.
+        this.windowingManager.invalidateWindowsCache();
+
         const window = global.display.focus_window;
         if (!window) return;
 
         const prevFocusedId = this._lastFocusedWindowId;
         this._lastFocusedWindowId = window.get_id();
 
-        const isMiniature = WindowState.get(window, IS_MINIATURE);
-        if (this._shouldSkipMiniatureFocusRestore(window, isMiniature)) return;
+        // Virtual Super-hjkl selection is intentionally geometry-neutral. Once the navigator
+        // commits real focus (or focus changes normally), the maximized profile may switch
+        // between standard and compact miniature presentation.
+        if (!this.keyboardNavigator?.isTransitionActive())
+            this.tilingManager.maximizedLayout.onFocusChanged(window);
 
+        const isMiniature = WindowState.get(window, IS_MINIATURE);
+        // Native maximized miniatures are presentation choices owned by MaximizedLayout.
+        // Let its queued reconcile switch the displayed maximized window rather than racing
+        // the generic miniature restore pipeline against the same focus change.
+        if (isMiniature && window.is_maximized()) return;
+        if (this._shouldSkipMiniatureFocusRestore(window, isMiniature, prevFocusedId)) return;
+
+        this._restoreFocusedMiniature(window, prevFocusedId);
+    }
+
+    _restoreFocusedMiniature(window, prevFocusedId) {
         const windowId = window.get_id();
         Logger.log(`[FOCUS] Miniature focused ${windowId} (prev=${prevFocusedId}) cascade=${this._miniatureCascadeIds?.has(windowId)}`);
 
@@ -735,14 +794,30 @@ export default class WindowMosaicExtension extends Extension {
 
         Logger.log(`[FOCUS] Triggering restore ${windowId}`);
         this._miniatureCascadeIds.clear();
-        this.tilingManager._isSmartResizingBlocked = true;
         WindowState.set(window, 'restoringFromMiniature', true);
 
-        this.miniatureManager.restoreMiniature(window, null);
-        // 'miniature-restored' signal fires synchronously → _onMiniatureRestored runs next
+        // Focus can transfer to a miniature synchronously from MetaWindow::unmanaged while
+        // the old focus window is still present in Mutter's tab/MRU list. Restoring here used
+        // to enter Smart Resize immediately, whose MRU query then asked Mutter whether that
+        // half-unmanaged window was focusable (`meta_window_is_focusable` assertion). Let the
+        // current signal dispatch finish first, then revalidate both liveness and user intent.
+        this._timeoutRegistry.addIdle(() => {
+            if (!isWindowAlive(window) || global.display.focus_window !== window ||
+                !WindowState.get(window, IS_MINIATURE)) {
+                WindowState.remove(window, 'restoringFromMiniature');
+                return GLib.SOURCE_REMOVE;
+            }
+
+            const restored = this.miniatureManager.restoreMiniature(window, null, {reason: 'focus'});
+            // A restore gate may reject synchronously. In that case no miniature-restored
+            // signal fires, so this caller must undo its own transition marker.
+            if (!restored)
+                WindowState.remove(window, 'restoringFromMiniature');
+            return GLib.SOURCE_REMOVE;
+        }, `focusMiniatureRestore-${windowId}`);
     }
 
-    _shouldSkipMiniatureFocusRestore(window, isMiniature) {
+    _shouldSkipMiniatureFocusRestore(window, isMiniature, prevFocusedId) {
         if (!this.windowingManager.isNavigable(window) || !isMiniature)
             return true;
 
@@ -752,7 +827,8 @@ export default class WindowMosaicExtension extends Extension {
         }
 
         if (WindowState.get(window, 'justMiniaturized')) {
-            Logger.log(`[FOCUS] Skip restore ${window.get_id()}: justMiniaturized`);
+            Logger.log(`[FOCUS] Deferring restore ${window.get_id()}: justMiniaturized`);
+            this._deferFreshMiniatureFocusRestore(window, prevFocusedId);
             return true;
         }
 
@@ -762,6 +838,32 @@ export default class WindowMosaicExtension extends Extension {
         }
 
         return false;
+    }
+
+    _deferFreshMiniatureFocusRestore(window, prevFocusedId) {
+        if (WindowState.get(window, 'deferredMiniatureFocusRestoreId')) return;
+
+        const timeoutId = this._timeoutRegistry.add(constants.MINIATURE_FOCUS_GUARD_MS + 20, () => {
+            WindowState.remove(window, 'deferredMiniatureFocusRestoreId');
+            if (!isWindowAlive(window) ||
+                global.display.focus_window !== window ||
+                !WindowState.get(window, IS_MINIATURE)) {
+                return GLib.SOURCE_REMOVE;
+            }
+
+            if (this.keyboardNavigator?.isTransitionActive())
+                return GLib.SOURCE_REMOVE;
+
+            if (WindowState.get(window, 'justMiniaturized') || this.tilingManager._isSmartResizingBlocked) {
+                this._deferFreshMiniatureFocusRestore(window, prevFocusedId);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            Logger.log(`[FOCUS] Running deferred fresh-miniature restore ${window.get_id()}`);
+            this._restoreFocusedMiniature(window, prevFocusedId);
+            return GLib.SOURCE_REMOVE;
+        }, 'miniature_deferredFocusRestore');
+        WindowState.set(window, 'deferredMiniatureFocusRestoreId', timeoutId);
     }
 
     // Returns true to let the restore proceed (deliberate re-focus), false when it was an
@@ -789,7 +891,10 @@ export default class WindowMosaicExtension extends Extension {
         }
         Logger.log(`[FOCUS] _onMiniatureRestored ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): running smart resize`);
         WindowState.remove(window, 'restoringFromMiniature');
-        this.tilingManager._isSmartResizingBlocked = false;
+        if (this.tilingManager.maximizedLayout.applying) {
+            Logger.log(`[MAXIMIZED] Suppressing generic restore pipeline for ${window.get_id()}`);
+            return;
+        }
 
         const workspace = window.get_workspace();
         if (!workspace) return;
@@ -813,6 +918,10 @@ export default class WindowMosaicExtension extends Extension {
                 !this.windowingManager.isMaximizedOrFullscreen(w)
             );
 
+        this._retileAfterMiniatureRestore(window, workspace, monitor, workArea, existingWindows);
+    }
+
+    _retileAfterMiniatureRestore(window, workspace, monitor, workArea, existingWindows) {
         // Treat the restored window as the user-focused one, since Mutter's focus
         // hasn't shifted yet (window.activate runs after the 250ms animation),
         // so the previously-focused sibling would otherwise be excluded from
@@ -821,13 +930,14 @@ export default class WindowMosaicExtension extends Extension {
 
         const doTile = () => {
             if (resizeResult?.success) {
-                this.tilingManager._isSmartResizingBlocked = true;
                 this.tilingManager._restoringWindowId = window.get_id();
                 try {
-                    this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                    this.tilingManager.withSmartResizeBlock(() => {
+                        this.tilingManager.stagePendingMiniatures(
+                            resizeResult.pendingWindows ?? [], workspace, monitor);
+                        this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                    });
                 } finally {
-                    this.tilingManager._isSmartResizingBlocked = false;
                     this.tilingManager._restoringWindowId = null;
                 }
             } else {
@@ -854,7 +964,10 @@ export default class WindowMosaicExtension extends Extension {
             }
         };
 
-        doTile();
+        // A restore re-enters the tile pass synchronously, so the whole tail runs inside the
+        // handler's exception net: if any pass throws, the workspace lock it took is released
+        // instead of leaking and silently disabling constrained reconciliation.
+        this.windowHandler?.guardTilePass(doTile);
     }
 
     // One restore can leave enough room for the next MRU miniature too; restoreMiniature
@@ -1160,7 +1273,11 @@ export default class WindowMosaicExtension extends Extension {
             this._onOverviewHiddenId = 0;
         }
 
-        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+        // NORMAL_ALL, not NORMAL: connectWindowSignals wires up excluded windows too
+        // (skip-taskbar, always-on-top, transient), and those are exactly the ones NORMAL
+        // omits. Leaving them connected lets their handlers fire after the managers are
+        // nulled below, and skips MosaicModel.forget() for them.
+        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
         allWindows.forEach(w => {
             if (this.windowHandler) this.windowHandler.disconnectWindowSignals(w);
         });
@@ -1174,25 +1291,35 @@ export default class WindowMosaicExtension extends Extension {
     _destroyManagersAndClearRefs() {
         // Clean up handler classes before nulling shared refs, since their destroy()
         // reaches the timeout registry through the extension reference.
+        this._destroyInteractionManagers();
+        this._destroyLayoutManagers();
+        this._clearManagerRefs();
+    }
+
+    _destroyInteractionManagers() {
         if (this.resizeHandler) this.resizeHandler.destroy();
         if (this.dragHandler) this.dragHandler.destroy();
         if (this.windowHandler?.destroy) this.windowHandler.destroy();
-        this.windowHandler = null;
-        this.dragHandler = null;
-        this.resizeHandler = null;
+    }
 
+    _destroyLayoutManagers() {
         if (this.tilingManager) this.tilingManager.destroy();
         if (this.reorderingManager) this.reorderingManager.destroy();
         if (this.swappingManager) this.swappingManager.destroy();
         if (this.windowingManager) this.windowingManager.destroy();
+        this.mosaicRenderer?.destroy();
+    }
 
+    _clearManagerRefs() {
+        this.windowHandler = null;
+        this.dragHandler = null;
+        this.resizeHandler = null;
         this.tilingManager = null;
         this.edgeTilingManager = null;
         this.reorderingManager = null;
         this.swappingManager = null;
         this.drawingManager = null;
         this.animationsManager = null;
-        this.mosaicRenderer?.destroy();
         this.mosaicRenderer = null;
         this.windowingManager = null;
         this._timeoutRegistry = null;
