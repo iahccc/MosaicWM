@@ -11,7 +11,7 @@ import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
 
 import { DrawingManager } from '../extension/drawing.js';
 import { KeyboardNavigatorManager } from '../extension/keyboardNavigator.js';
-import { ComputedLayouts } from '../extension/mosaicModel.js';
+import { MosaicModel } from '../extension/mosaicModel.js';
 
 function assert(condition, message) {
     if (!condition)
@@ -177,7 +177,8 @@ export async function run() {
             candidate.activate(global.get_current_time());
             await Scripting.sleep(100);
             // Simulate stale layout targets and a later compositor resize/move.
-            ComputedLayouts.set(candidate, { x: 1, y: 1, width: 20, height: 20 });
+            MosaicModel.setPresentationSlot(candidate, { x: 1, y: 1, width: 20, height: 20 },
+                candidate.get_workspace(), candidate.get_monitor());
             candidate.move_resize_frame(false, 70 + index * 80, 80 + index * 50, 450, 330);
             await Scripting.sleep(200);
             checkFrame(candidate);
@@ -193,7 +194,7 @@ export async function run() {
                 mode: Clutter.AnimationMode.LINEAR });
             await Scripting.sleep(350);
             checkFrame(candidate);
-            ComputedLayouts.delete(candidate);
+            MosaicModel.forget(candidate);
         }
 
         const startWindow = created[0];

@@ -34,7 +34,7 @@ The consistent principle behind both: nothing should require the user to think a
 - Overflow to another workspace for windows that cannot shrink any further
 - Edge tiling to halves and quarters by dragging to a screen edge, with the remaining windows adapting to what is left
 - Window swapping by dragging one window onto another, or by keyboard shortcut
-- Dedicated workspaces for maximized and fullscreen windows
+- Native maximized windows fill the available mosaic region; fullscreen stays native on the current workspace
 - Windows grow back toward their preferred size when neighbours close or miniaturize
 - Quick Settings toggles for mosaic per workspace and globally, with a top bar indicator
 - Miniatures keep their scale and position across the Overview
@@ -68,6 +68,10 @@ Roughly in priority order.
 
 ## Installation
 
+Building requires a C compiler, pkg-config, GObject Introspection tools, and the
+GNOME 50 Mutter development package (`libmutter-18`). On Fedora 44, install
+`gcc pkgconf-pkg-config gobject-introspection-devel mutter-devel glib2-devel zip`.
+
 ```bash
 git clone https://github.com/CleoMenezesJr/MosaicWM.git
 cd MosaicWM
@@ -80,7 +84,7 @@ Then log out, log back in, and enable it:
 gnome-extensions enable mosaicwm@cleomenezesjr.github.io
 ```
 
-For everyday use rather than development, set `const DEBUG = false;` in `extension/logger.js` before installing. It defaults to `true`, which logs verbosely and costs CPU.
+Debug logging is disabled by default. For development, set `DEBUG = true` in `extension/logger.js`; verbose compositor-path logging is intentionally opt-in because it costs CPU.
 
 ## Usage
 
@@ -89,7 +93,8 @@ There is nothing to configure. Once enabled:
 - Opening a window tiles it into the mosaic.
 - Dragging a window reorders it, or tiles it to a half or quarter if you drag to an edge.
 - Dragging a window onto another swaps the two.
-- Maximizing or going fullscreen moves the window to its own workspace.
+- Maximizing fills the available region on the current workspace; other windows coexist or become miniatures. Fullscreen stays on the current workspace.
+- Miniatures use a compact 128px size while a maximized window is focused, and 256px otherwise. Switching workspaces preserves their presentation.
 - Minimizing takes a window out of the mosaic.
 - When the workspace is full, the least recently used window becomes a thumbnail. Click it to bring it back.
 
@@ -107,6 +112,8 @@ npm install            # the pre-commit hook shells out to npx eslint
 ./scripts/build.sh -i        # build and install
 ./scripts/run-gnome-shell.sh # nested GNOME Shell session for testing
 npm run lint
+npm run test:unit
+bash scripts/test-headless.sh # private GNOME Shell session; needs the native bridge built
 ```
 
 Keep `DEBUG = true` in `extension/logger.js` while developing. Logs go to the journal:

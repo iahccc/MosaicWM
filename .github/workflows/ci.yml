@@ -17,6 +17,7 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run lint
+      - run: npm run test:unit
 
   shexli:
     name: Shexli
@@ -31,8 +32,22 @@ jobs:
       - run: shexli ${{ github.workspace }}/extension/
 
   build:
-    name: Build
+    name: GNOME 50 build and regression
     runs-on: ubuntu-latest
+    container: fedora:44
     steps:
       - uses: actions/checkout@v4
+      - run: dnf install -y gcc pkgconf-pkg-config gobject-introspection-devel mutter-devel glib2-devel zip gnome-shell dbus-daemon mesa-dri-drivers alacritty
       - run: bash scripts/build.sh -b
+      - run: bash scripts/test-headless.sh
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+      - run: bash scripts/test-headless.sh test-miniature-restore.js
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+      - run: bash scripts/test-headless.sh test-maximized-admission-fit.js
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+      - run: bash scripts/test-headless.sh test-maximized-layout-queue.js
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
