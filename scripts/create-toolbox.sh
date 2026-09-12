@@ -12,6 +12,12 @@ PACKAGES=(
   gnome-shell
   mutter
   mutter-devkit
+  gcc
+  pkgconf-pkg-config
+  gobject-introspection-devel
+  mutter-devel
+  glib2-devel
+  zip
   flatpak
   dbus-daemon
 )

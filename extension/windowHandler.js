@@ -12,8 +12,8 @@ import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import { TileZone } from './constants.js';
 import * as WindowState from './windowState.js';
-import { IS_MINIATURE } from './windowState.js';
-import { ComputedLayouts } from './mosaicModel.js';
+import { IS_MINIATURE, PENDING_MINIATURE, MOSAIC_FULLSCREEN, MOSAIC_FULLSCREEN_KIND } from './windowState.js';
+import { MosaicModel } from './mosaicModel.js';
 import { isWindowAlive } from './liveness.js';
 import { afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow } from './timing.js';
 
@@ -28,7 +28,6 @@ export const WindowHandler = GObject.registerClass({
         this._evaluationQueue = [];
         this._isEvaluatingQueue = false;
 
-        this._overflowInProgress = false;
         this._windowSignals = new WeakMap(); // WeakMap so signal IDs are released when the window is GC'd
         this._readinessWaiters = new Set();
     }
@@ -68,7 +67,7 @@ export const WindowHandler = GObject.registerClass({
 
     // Claiming the entrance hides the actor and cancels Mutter's open animation,
     // betting the tile pass eases it in. Whoever the tile pass won't touch (disabled
-    // workspace, sacred, opening alone) can't take that bet: the failsafe a full
+    // workspace or opening alone) can't take that bet: the failsafe a full
     // second later would be their only way back to visible.
     shouldSkipSlideIn(window) {
         return WindowState.get(window, 'movedByOverflow') || this._ext._overflowInProgress
@@ -143,70 +142,17 @@ export const WindowHandler = GObject.registerClass({
             this.disconnectWindowSignals(win);
         }));
 
-        // Have two signals that fires when (un)maximize, so we coalesce it via idle.
-        let pendingMaximizeCheck = false;
-        ['notify::maximized-horizontally', 'notify::maximized-vertically'].forEach(signal => {
-            ids.push(window.connect(signal, (win) => {
-                if (pendingMaximizeCheck) return;
-                pendingMaximizeCheck = true;
-                this._timeoutRegistry.addIdle(() => {
-                    pendingMaximizeCheck = false;
-                    if (!isWindowAlive(win)) return GLib.SOURCE_REMOVE;
-
-                    // Entering/exiting sacred state is owned by resizeHandler, normally
-                    // driven by the WM size-change signal. This property notify is a
-                    // backup for apps where that signal doesn't fire reliably; calling
-                    // these twice for the same transition is safe (see resizeHandler.js).
-                    if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                        if (!WindowState.get(win, 'openedMaximized')) {
-                            this._ext.resizeHandler.tryEnterSacred(win);
-                        }
-                    } else if (WindowState.get(win, 'openedMaximized')) {
-                        Logger.log(`Window ${win.get_id()} born maximized - skipping sacred exit, treating as normal unmaximize`);
-                        WindowState.remove(win, 'openedMaximized');
-                        WindowState.remove(win, 'unmaximizing');
-                        WindowState.remove(win, 'isEnteringSacred');
-                        this._settleBornSacredExit(win, 'unmaximize');
-                    } else {
-                        this._ext.resizeHandler.tryExitSacred(win);
-                    }
-                    return GLib.SOURCE_REMOVE;
-                });
-            }));
-        });
-
-        // Detect Fullscreen changes, same backup pattern as maximize above.
+        // Fullscreen transitions are not guaranteed to emit Mutter's size-change signal
+        // (notably MetaWindow.make_fullscreen()), so fullscreen has one dedicated owner here.
+        ids.push(window.connect('notify::maximized-horizontally', win =>
+            this.tilingManager.maximizedLayout.nativeStateChanged(win)));
+        ids.push(window.connect('notify::maximized-vertically', win =>
+            this.tilingManager.maximizedLayout.nativeStateChanged(win)));
         ids.push(window.connect('notify::fullscreen', (win) => {
-            if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                if (!WindowState.get(win, 'openedMaximized')) {
-                    this._ext.resizeHandler.tryEnterSacred(win);
-                }
-            } else if (WindowState.get(win, 'openedMaximized')) {
-                Logger.log(`Window ${win.get_id()} born fullscreen - skipping sacred exit, treating as normal`);
-                WindowState.remove(win, 'openedMaximized');
-                WindowState.remove(win, 'unmaximizing');
-                WindowState.remove(win, 'isEnteringSacred');
-                this._settleBornSacredExit(win, 'unfullscreen');
-            } else {
-                this._ext.resizeHandler.tryExitSacred(win);
-            }
-        }));
-
-        ids.push(window.connect('size-changed', (win) => {
-            ComputedLayouts.delete(win);
-            if (WindowState.get(win, 'isSmartResizing') || WindowState.get(win, 'isReverseSmartResizing')) {
-                // During queue evaluation, skip all processing so target sizes stay
-                // consistent for subsequent canFitWindow/tryFitWithResize calls
-                if (this._isEvaluatingQueue) return;
-                const target = WindowState.get(win, 'targetSmartResizeSize');
-                if (target)
-                    WindowState.set(win, 'targetSmartResizeSize', null);
-                this.tilingManager.tileWorkspaceWindows(win.get_workspace(), null, win.get_monitor());
-            }
-        }));
-
-        ids.push(window.connect('position-changed', (win) => {
-            ComputedLayouts.delete(win);
+            if (win.is_fullscreen())
+                this._enterFullscreen(win, 'native', false);
+            else
+                this._leaveFullscreen(win);
         }));
 
         ids.push(window.connect('notify::above', (win) => this.handleExclusionStateChange(win)));
@@ -224,6 +170,121 @@ export const WindowHandler = GObject.registerClass({
         }
     }
 
+    _captureBornFullscreen(window) {
+        if (WindowState.get(window, MOSAIC_FULLSCREEN)) return true;
+        // Fullscreen is a compositor/window-state role, not a geometry shape. Normal clients
+        // can legitimately restore a frame that fills the monitor/work area (WPS, Settings,
+        // browsers, etc.); treating that shape as fullscreen bypasses Mosaic admission and
+        // lets the client cover the existing layout. PR118 made the same distinction in its
+        // fullscreen admission paths: only Mutter's native fullscreen state creates the role.
+        if (!window.is_fullscreen?.()) return false;
+        // Initial mode can arrive as maximize first, fullscreen a few configure cycles later.
+        // Fullscreen wins that startup race: it is not a latent maximize/maximized request.
+        this._enterFullscreen(window, 'native', true);
+        return true;
+    }
+
+    _sampleInitialWindowMode(window) {
+        this._captureBornFullscreen(window);
+    }
+
+    _enterFullscreen(window, source, born) {
+        if (!window || WindowState.get(window, MOSAIC_FULLSCREEN)) return false;
+
+        const role = born ? 'born' : WindowState.get(window, IS_MINIATURE) ? 'miniature' : 'normal';
+
+        WindowState.set(window, MOSAIC_FULLSCREEN, true);
+        WindowState.set(window, MOSAIC_FULLSCREEN_KIND, { source, role });
+        this.tilingManager.maximizedLayout.forget(window);
+        this._ext.miniatureManager?.pauseForFullscreen(window);
+        this.revealPendingEntrance(window);
+        Logger.log(`[FULLSCREEN] ${window.get_id()} entered ${source} fullscreen from ${role}; workspace membership preserved`);
+        return true;
+    }
+
+    _leaveFullscreen(window) {
+        const state = WindowState.get(window, MOSAIC_FULLSCREEN_KIND);
+        if (!WindowState.get(window, MOSAIC_FULLSCREEN) || !state) return false;
+
+        WindowState.remove(window, MOSAIC_FULLSCREEN);
+        WindowState.remove(window, MOSAIC_FULLSCREEN_KIND);
+        this._ext.miniatureManager?.resumeFromFullscreen(window);
+
+        Logger.log(`[FULLSCREEN] ${window.get_id()} left ${state.source} fullscreen; restoring ${state.role} role in-place`);
+        this._restoreFullscreenRole(window, state.role);
+        return true;
+    }
+
+    _restoreFullscreenRole(window, role) {
+        if (window.is_maximized() || role === 'miniature') {
+            this.tilingManager.maximizedLayout.queue(window);
+            return;
+        }
+        this.settleReturnedWindow(window);
+    }
+
+    // A window leaving a role that owned its geometry (fullscreen, native maximize) must
+    // re-fit the mosaic at its preferred size. Smart Resize first, because the preferred
+    // frame can exceed the work area and a plain retile would just overflow and abort.
+    // Returns false when there is nothing to settle (dead window, disabled workspace).
+    settleReturnedWindow(window) {
+        const context = this._returnContext(window);
+        if (!context) return false;
+        const { workspace, monitor, workArea, siblings } = context;
+
+        const size = WindowState.get(window, 'preferredSize') ?? WindowState.get(window, 'openingSize');
+        if (size) {
+            const target = {width: size.width, height: size.height};
+            WindowState.set(window, 'targetRestoredSize', target);
+            // Unlike the other bridges this one has no grow settle to clean it up; drop it on
+            // the same delay so a stale entry cannot suppress later preferredSize learning.
+            this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                WindowState.removeIfCurrent(window, 'targetRestoredSize', target);
+                return GLib.SOURCE_REMOVE;
+            }, 'windowHandler_returnedSize');
+        }
+
+        if (this.tilingManager.maximizedLayout.admit(window)) return true;
+
+        const resizeResult = this.tilingManager.tryFitWithResize(window, siblings, workArea, workspace, window);
+
+        if (resizeResult?.success) {
+            this._commitReturnedWindow(workspace, monitor, resizeResult);
+            return true;
+        }
+
+        Logger.log(`[RESTORE] ${window.get_id()} cannot yet rejoin normal layout; preserving workspace and last valid Mosaic layout`);
+        this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+        return true;
+    }
+
+    _returnContext(window) {
+        if (!isWindowAlive(window)) return null;
+        const workspace = window.get_workspace?.();
+        const monitor = window.get_monitor?.();
+        if (!workspace || monitor === null || monitor === undefined) return null;
+        if (!this._ext.isMosaicEnabledForWorkspace(workspace)) return null;
+
+        const siblings = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .filter(candidate => candidate !== window)
+            .filter(candidate => !this.edgeTilingManager.isEdgeTiled(candidate))
+            .filter(candidate => !this.windowingManager.isExcluded(candidate))
+            .filter(candidate => !this.windowingManager.isFullscreenLike(candidate));
+        return {
+            workspace,
+            monitor,
+            workArea: this.tilingManager.getUsableWorkArea(workspace, monitor),
+            siblings,
+        };
+    }
+
+    _commitReturnedWindow(workspace, monitor, resizeResult) {
+        this.tilingManager.withSmartResizeBlock(() => {
+            this.tilingManager.mergePendingMiniatures(resizeResult.pendingWindows);
+            this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+        });
+    }
+
     disconnectWindowSignals(window) {
         const ids = this._windowSignals.get(window);
         if (ids) {
@@ -232,85 +293,12 @@ export const WindowHandler = GObject.registerClass({
             Logger.log(`Disconnected signals for window ${window.get_id()}`);
         }
 
-        ComputedLayouts.delete(window);
+        MosaicModel.forget(window);
 
         WindowState.remove(window, 'previousExclusionState');
         WindowState.remove(window, 'previousWorkspace');
-    }
-
-    _isFrameMonitorSized(win) {
-        const ws = win.get_workspace();
-        const mon = win.get_monitor();
-        const wa = ws && mon !== null ? ws.get_work_area_for_monitor(mon) : null;
-        const frame = win.get_frame_rect();
-        return !!wa && frame.width >= wa.width && frame.height >= wa.height;
-    }
-
-    // The state flips before the client commits the size that goes with it, so the frame
-    // here can still be the maximized one. Tiling on it sends a configure the client's own
-    // late commit then overrides, so wait for that commit.
-    _settleBornSacredExit(win, label) {
-        if (!this._isFrameMonitorSized(win)) {
-            this._captureAndTile(win, label);
-            return;
-        }
-
-        let sizeId = null;
-        let unmanagedId = null;
-        const disconnect = () => {
-            if (sizeId) win.disconnect(sizeId);
-            if (unmanagedId) win.disconnect(unmanagedId);
-            sizeId = unmanagedId = null;
-        };
-
-        sizeId = win.connect('size-changed', () => {
-            disconnect();
-            this._captureAndTile(win, label);
-        });
-        unmanagedId = win.connect('unmanaged', disconnect);
-    }
-
-    _captureAndTile(win, label) {
-        if (!isWindowAlive(win)) return;
-
-        const ws = win.get_workspace();
-        const mon = win.get_monitor();
-        // Only capture if nothing's recorded yet, so a later manual resize or
-        // Smart Resize decision is never clobbered.
-        if (!WindowState.get(win, 'preferredSize')) {
-            const settled = win.get_frame_rect();
-            const wa = ws && mon !== null ? ws.get_work_area_for_monitor(mon) : null;
-            // A client that stays monitor-sized through the exit leaves a frame
-            // indistinguishable from maximized. Use 95% of the work area instead so it
-            // reads as "nearly full" rather than maximized.
-            const isMonitorSized = wa && settled.width >= wa.width && settled.height >= wa.height;
-            const size = isMonitorSized
-                ? { width: Math.floor(wa.width * 0.95), height: Math.floor(wa.height * 0.95) }
-                : { width: settled.width, height: settled.height };
-            WindowState.set(win, 'preferredSize', size);
-            Logger.log(`Captured preferredSize on ${label} for ${win.get_id()}: ${size.width}x${size.height}${isMonitorSized ? ' (95% fallback, no real shrink)' : ''}`);
-        }
-
-        if (ws) this.tilingManager.tileWorkspaceWindows(ws, win, mon);
-    }
-
-    onWindowUnmaximized(window) {
-        const workspace = window.get_workspace();
-        if (!workspace) return;
-
-        WindowState.remove(window, 'openedMaximized');
-
-        const monitor = window.get_monitor();
-        const workspaceWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
-
-        if (workspaceWindows.length > 1) {
-            // Restore preferred size if it was edge-constrained or smart-resized
-            if (WindowState.get(window, 'isConstrainedByMosaic')) {
-                this.tilingManager.restorePreferredSize(window);
-            }
-
-            this.tilingManager.tileWorkspaceWindows(workspace, window, monitor);
-        }
+        WindowState.remove(window, 'previousWorkspaceObject');
+        WindowState.remove(window, 'previousMonitor');
     }
 
     handleExclusionStateChange(window) {
@@ -328,6 +316,7 @@ export const WindowHandler = GObject.registerClass({
         }
 
         if (isNowExcluded) {
+            this.tilingManager.maximizedLayout.forget(window);
             Logger.log(`Window ${windowId} became excluded; retiling without it`);
 
             // Exclusion arriving after opacity=0 was set (e.g. always-on-top
@@ -374,6 +363,12 @@ export const WindowHandler = GObject.registerClass({
                 const existingWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
                     .filter(w => w.get_id() !== window.get_id() && !this.windowingManager.isExcluded(w));
 
+                if (this.tilingManager.maximizedLayout.admit(window)) {
+                    Logger.log('Re-include: admitted by active maximized layout in-place');
+                    WindowState.set(window, 'justReturnedFromExclusion', true);
+                    return GLib.SOURCE_REMOVE;
+                }
+
                 if (this.tilingManager.canFitWindow(window, workspace, monitor)) {
                     Logger.log('Re-included window fits without resize');
                     WindowState.set(window, 'justReturnedFromExclusion', true);
@@ -390,17 +385,18 @@ export const WindowHandler = GObject.registerClass({
                 if (resizeResult?.success) {
                     Logger.log('Re-include: Smart resize applied - tiling workspace');
                     WindowState.set(window, 'justReturnedFromExclusion', true);
-                    this.tilingManager._isSmartResizingBlocked = true;
-                    try {
-                        this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
+                    this.tilingManager.withSmartResizeBlock(() => {
+                        this.tilingManager.mergePendingMiniatures(resizeResult.pendingWindows);
                         this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                    } finally {
-                        this.tilingManager._isSmartResizingBlocked = false;
-                    }
+                    });
                 } else {
-                    Logger.log('Re-include: Smart resize not applicable - moving to overflow');
-                    this.windowingManager.moveOversizedWindow(window).catch(e =>
-                        Logger.error(`Re-include overflow failed: ${e}`));
+                    // Re-inclusion is a role change for an existing window, not a new-window
+                    // admission. It never owns workspace membership. Give the unified local
+                    // solver one final chance to sacrifice other candidates; if it still has no
+                    // legal composition, tileWorkspaceWindows preserves the last valid layout.
+                    Logger.log('Re-include: Smart resize not applicable - preserving workspace and resolving locally');
+                    WindowState.set(window, 'justReturnedFromExclusion', true);
+                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
                 }
 
                 return GLib.SOURCE_REMOVE;
@@ -454,6 +450,15 @@ export const WindowHandler = GObject.registerClass({
     onWindowEnteredMonitor(monitor, window) {
         if (!this._windowSignals.has(window)) return;
 
+        const workspace = window.get_workspace() ?? global.workspace_manager.get_active_workspace();
+        if (!workspace) return;
+
+        this.tilingManager.maximizedLayout.forget(window);
+        if (this.tilingManager.maximizedLayout.admit(window)) {
+            this.windowingManager.invalidateWindowsCache();
+            return;
+        }
+
         // A grab drag ends in stopDrag, which tiles the destination itself. Overview
         // drags, keyboard moves and monitor hotplug have no grab, so this is the only
         // place that gets the arriving window into the mosaic.
@@ -461,8 +466,7 @@ export const WindowHandler = GObject.registerClass({
 
         // An on-all-workspaces window reports no workspace of its own, but it does show
         // up in every workspace's list, so the active one is the right context to tile in.
-        const workspace = window.get_workspace() ?? global.workspace_manager.get_active_workspace();
-        if (!workspace || this.windowingManager.isExcluded(window)) return;
+        if (this.windowingManager.isExcluded(window)) return;
 
         Logger.log(`Window ${window.get_id()} entered monitor ${monitor}; evaluating for mosaic`);
 
@@ -476,6 +480,10 @@ export const WindowHandler = GObject.registerClass({
     _tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
         if (!this._ext.miniatureManager) return false;
 
+        if (this.tilingManager.maximizedLayout.hasWindows(workspace, monitor) &&
+            this.tilingManager.maximizedLayout.reconcile(workspace, monitor, {passive: true}))
+            return true;
+
         const mru  = this.windowingManager.getMRUOrder(workspace);
         const rank = w => mru.get(w.get_id()) ?? Number.MAX_SAFE_INTEGER;
 
@@ -483,6 +491,10 @@ export const WindowHandler = GObject.registerClass({
         // and that's the miniature to bring back first.
         const miniatureWindows = remainingWindows
             .filter(w => WindowState.get(w, IS_MINIATURE))
+            // Native-maximized miniatures belong to maximized history and fullscreen
+            // miniatures are presentation-paused. Neither may be resurrected as an ordinary
+            // normal window by the generic free-space recovery path.
+            .filter(w => !this.windowingManager.isMaximizedOrFullscreen(w))
             .sort((a, b) => rank(a) - rank(b));
 
         if (miniatureWindows.length === 0) return false;
@@ -492,7 +504,8 @@ export const WindowHandler = GObject.registerClass({
         // canRestoreMiniature only simulates, so falling through to the next candidate
         // costs nothing; the most recent may not fit while an older one still does.
         for (const candidate of miniatureWindows) {
-            if (!this._ext.tilingManager.canRestoreMiniature(candidate, remainingWindows, workArea)) {
+            if (!this._ext.tilingManager.canRestoreMiniature(
+                candidate, remainingWindows, workArea, { requireStableNormal: true })) {
                 Logger.log(`_tryAutoRestoreMiniature: keeping mini ${candidate.get_id()}, would overflow if restored`);
                 continue;
             }
@@ -617,6 +630,10 @@ export const WindowHandler = GObject.registerClass({
         // move_resize_frame above hasn't settled yet; retiling now would read
         // get_frame_rect() before the client acks the new size, hit the layout
         // cache with the stale dimensions, and redraw right back over the restore.
+        const restoreBridges = restorableWindows.map(window => ({
+            window,
+            target: WindowState.get(window, 'targetRestoredSize'),
+        }));
         this._ext._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
             if (opts.settleLogLabel) Logger.log(opts.settleLogLabel);
             for (const w of restorableWindows) {
@@ -625,9 +642,8 @@ export const WindowHandler = GObject.registerClass({
             this.animationsManager.setMembershipChangeBounce(true);
             this._ext.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
             this.animationsManager.setMembershipChangeBounce(false);
-            for (const w of restorableWindows) {
-                WindowState.remove(w, 'targetRestoredSize');
-            }
+            for (const {window, target} of restoreBridges)
+                WindowState.removeIfCurrent(window, 'targetRestoredSize', target);
             return GLib.SOURCE_REMOVE;
         }, opts.settleTimeoutName);
     }
@@ -644,7 +660,13 @@ export const WindowHandler = GObject.registerClass({
         const windowWorkspace = window.get_workspace();
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
+        // A first-placement transaction may still be waiting for actor allocation/buffer
+        // convergence. It owns an actor signal whose closure captures this MetaWindow, so
+        // destruction must explicitly end that transaction rather than relying on a later
+        // stale-animation poll to notice the disposed actor.
+        this.animationsManager.cancelPendingEntrance(window);
         this._ext.keyboardNavigator?.onWindowDestroyed(windowId);
+        this.tilingManager.maximizedLayout.forget(window);
 
         this.disconnectWindowSignals(window);
 
@@ -653,8 +675,6 @@ export const WindowHandler = GObject.registerClass({
         }
 
         this.edgeTilingManager.clearWindowState(window);
-
-        WindowState.remove(window, 'maximizedUndoInfo');
 
         if (this.windowingManager.isExcluded(window)) {
             Logger.log('Excluded window closed - no workspace navigation');
@@ -703,7 +723,7 @@ export const WindowHandler = GObject.registerClass({
             return;
 
         // Skip if overflow is in progress; window is being moved and will arrive soon
-        if (this._overflowInProgress) {
+        if (this._ext._overflowInProgress) {
             Logger.log('Workspace is empty but overflow in progress; skipping navigation');
             return;
         }
@@ -747,15 +767,11 @@ export const WindowHandler = GObject.registerClass({
         }
 
         this._isEvaluatingQueue = true;
-        // lastOverflowWorkspace cascades a batch's overflow; overflowedWorkspaces caps that
-        // cascade so it can't loop forever.
         const state = {
-            lastOverflowWorkspace: null,
             // Only a move from batch start counts as a user switch: a batch spanning
             // workspaces (monitor re-plug) has no expected workspace to compare against.
             batchActiveWorkspace: this.windowingManager.getWorkspace(),
         };
-        const overflowedWorkspaces = new Set();
 
         while (this._evaluationQueue.length > 0) {
             let { window, workspace, monitor } = this._evaluationQueue.shift();
@@ -774,10 +790,10 @@ export const WindowHandler = GObject.registerClass({
 
             const resolved = this._resolveQueueItemWorkspace(window, workspace);
             if (resolved.skip) continue;
-            workspace = this._applyQueueCascade(window, resolved.workspace, arrivedFromDnD, state, overflowedWorkspaces);
+            workspace = this._applyQueueWorkspace(window, resolved.workspace, arrivedFromDnD, state);
 
             Logger.log(`Evaluating queued window ${window.get_id()} on WS-${workspace.index()} (remaining: ${this._evaluationQueue.length})`);
-            await this._evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD, state, overflowedWorkspaces);
+            await this._evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD);
 
             WindowState.remove(window, 'arrivalPending');
             await this._queueSettleDelay();
@@ -801,74 +817,46 @@ export const WindowHandler = GObject.registerClass({
         return { skip: true };
     }
 
-    // Pick the workspace to evaluate on: follow a manual user switch (which wins over any
-    // in-flight cascade), else keep cascading this batch's overflow. Returns that workspace.
-    _applyQueueCascade(window, workspace, arrivedFromDnD, state, overflowedWorkspaces) {
+    // A manual workspace switch can intentionally redirect a still-pending launch. Overflow
+    // from another window in the same batch never can: every arrival earns its own fit/admission
+    // decision instead of being pre-moved to a previous window's overflow destination.
+    _applyQueueWorkspace(window, workspace, arrivedFromDnD, state) {
         const activeWorkspace = this.windowingManager.getWorkspace();
 
         // A drop is a destination the user chose, so "they navigated away" doesn't apply; without
         // this the overview drag lands the window and the cascade immediately drags it back.
-        const droppedByUser = arrivedFromDnD;
-
-        if (!droppedByUser && activeWorkspace && state.batchActiveWorkspace &&
+        if (!arrivedFromDnD && activeWorkspace && state.batchActiveWorkspace &&
             activeWorkspace.index() !== state.batchActiveWorkspace.index()) {
             Logger.log(`Evaluation queue: User switched to WS-${activeWorkspace.index()} during processing (batch started on WS-${state.batchActiveWorkspace.index()}) - following user`);
-            state.lastOverflowWorkspace = null;
-            overflowedWorkspaces.clear();
             window.change_workspace(activeWorkspace);
             return activeWorkspace;
-        }
-
-        if (state.lastOverflowWorkspace && state.lastOverflowWorkspace !== workspace) {
-            return this._cascadeToOverflow(window, workspace, state, overflowedWorkspaces);
         }
         return workspace;
     }
 
-    _cascadeToOverflow(window, workspace, state, overflowedWorkspaces) {
-        // Stop cascading once the overflow destination itself failed, or it loops.
-        if (overflowedWorkspaces.has(state.lastOverflowWorkspace.index())) {
-            Logger.log(`Evaluation queue: overflow destination WS-${state.lastOverflowWorkspace.index()} already failed - stopping cascade, window ${window.get_id()} stays on WS-${workspace.index()}`);
-            state.lastOverflowWorkspace = null;
-            return workspace;
-        }
-
-        const dest = state.lastOverflowWorkspace;
-        Logger.log(`Evaluation queue: cascading window ${window.get_id()} to overflow destination WS-${dest.index()}`);
-        if (window.get_workspace() !== dest) {
-            WindowState.set(window, 'movedByOverflow', true);
-            window.change_workspace(dest);
-        }
-        return dest;
-    }
-
-    async _evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD, state, overflowedWorkspaces) {
+    async _evaluateQueuedWindowFit(window, workspace, monitor, arrivedFromDnD) {
         try {
             const resultWorkspace = await this._ensureWindowFits(window, workspace, monitor, arrivedFromDnD);
-            if (resultWorkspace && resultWorkspace.index() !== workspace.index()) {
-                overflowedWorkspaces.add(workspace.index());
-                state.lastOverflowWorkspace = resultWorkspace;
-            }
+            const movedByOwnAdmission = resultWorkspace && resultWorkspace.index() !== workspace.index();
 
             const managedWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
                 .filter(w => !this.windowingManager.isExcluded(w) && !WindowState.get(w, 'pendingInQueue'));
 
             if (managedWindows.length === 0) {
-                this._renavigateIfTrulyEmpty(window, workspace, monitor, state);
+                this._renavigateIfTrulyEmpty(window, workspace, monitor, movedByOwnAdmission);
             }
         } catch (e) {
             Logger.error(`Error in evaluation queue for window ${window.get_id()}: ${e}`);
         }
     }
 
-    _renavigateIfTrulyEmpty(window, workspace, monitor, state) {
+    _renavigateIfTrulyEmpty(window, workspace, monitor, movedByOwnAdmission) {
         // Don't renavigate a workspace that's empty only because overflow is mid-transition.
-        const isEjectedByOverflow = state.lastOverflowWorkspace && state.lastOverflowWorkspace.index() !== workspace.index();
-        if (!isEjectedByOverflow) {
+        if (!movedByOwnAdmission) {
             Logger.log(`Queue: Window ${window.get_id()} moved and left WS-${workspace.index()} empty - renavigating`);
             this.windowingManager.renavigate(workspace, true, this._ext._lastVisitedWorkspace, monitor);
         } else {
-            Logger.log(`Queue: WS-${workspace.index()} empty due to overflow - skipping renavigate to stay on WS-${state.lastOverflowWorkspace.index()}`);
+            Logger.log(`Queue: WS-${workspace.index()} empty due to this window's own overflow admission - skipping renavigate`);
         }
     }
 
@@ -885,28 +873,30 @@ export const WindowHandler = GObject.registerClass({
 
     async _ensureWindowFits(window, workspace, monitor, arrivedFromDnD) {
         if (this._ensureFitsBlocked(window, workspace)) return workspace;
+        const earlyAdmission = this._tryEarlyFitAdmission(window, workspace, monitor, arrivedFromDnD);
+        if (earlyAdmission === 'handled') return workspace;
 
-        // Runs before constrained fast path: tiling refuses sacred workspaces and would
-        // strand a constrained arrival floating there.
-        const sacred = await this._ensureFitsSacred(window, workspace, monitor);
-        if (sacred.handled) return sacred.result;
-
-        // Already constrained, so sibling frames may not have settled yet; tile directly to avoid false overflow.
-        if (WindowState.get(window, 'isConstrainedByMosaic')) {
-            Logger.log(`ensureWindowFits: Window ${window.get_id()} already constrained by mosaic - tiling directly`);
-            this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-            return workspace;
+        // Native fullscreen owns the workspace presentation exclusively. It is not a normal
+        // tiling participant, but it still blocks admission: allowing canFit/Smart Resize to
+        // ignore it makes the answer depend on whether some unrelated normal sibling happens
+        // to exist beside it. Reject before any DnD restore/resize side effects so a failed
+        // cross-workspace drop remains a clean transaction.
+        if (earlyAdmission === 'fullscreen-blocked') {
+            this.tilingManager.savePreferredSize(window);
+            Logger.log(`[FULLSCREEN] WS-${workspace.index()} M${monitor} blocks normal admission for ${window.get_id()}; overflowing`);
+            return await this.windowingManager.moveOversizedWindow(window);
         }
 
-        // Save preferred size after sacred checks, to avoid capturing monitor-sized dimensions
         this.tilingManager.savePreferredSize(window);
 
-        if (arrivedFromDnD) {
-            this._handleDnDArrival(window, workspace, monitor);
-        }
+        if (this.tilingManager.maximizedLayout.admit(window)) return workspace;
 
-        // Use TARGET size for restoration flows to avoid transient overflow ejection.
-        const targetSize = WindowState.get(window, 'targetRestoredSize');
+        this._prepareDnDArrival(window, workspace, monitor, arrivedFromDnD);
+
+        // Use the newest pending target for restoration flows to avoid transient overflow
+        // ejection. A smart-resize target may supersede an older restore-settle bridge.
+        const targetSize = WindowState.get(window, 'targetSmartResizeSize')
+            || WindowState.get(window, 'targetRestoredSize');
         const canFit = this.tilingManager.canFitWindow(window, workspace, monitor, false, targetSize);
 
         if (canFit) {
@@ -916,6 +906,46 @@ export const WindowHandler = GObject.registerClass({
         }
 
         return await this._fitByResizeOrOverflow(window, workspace, monitor);
+    }
+
+    _tryEarlyFitAdmission(window, workspace, monitor, arrivedFromDnD) {
+        if (WindowState.get(window, MOSAIC_FULLSCREEN) || this._captureBornFullscreen(window)) {
+            Logger.log(`ensureWindowFits: Window ${window.get_id()} is fullscreen; keeping it on WS-${workspace.index()} outside Mosaic layout`);
+            this.revealPendingEntrance(window);
+            return 'handled';
+        }
+
+        if (this._hasFullscreenAdmissionBlocker(window, workspace, monitor))
+            return 'fullscreen-blocked';
+
+        if (window.is_maximized() && this.tilingManager.maximizedLayout.admit(window))
+            return 'handled';
+
+        return this._tryConstrainedFitAdmission(window, workspace, monitor, arrivedFromDnD);
+    }
+
+    _tryConstrainedFitAdmission(window, workspace, monitor, arrivedFromDnD) {
+        // A constrained flag survives workspace/monitor moves; it is not proof that the
+        // destination admits this window. Only reuse a local layout outside an explicit move.
+        // Preserve preferred sizes and the durable resize contract while replanning admission.
+        if (arrivedFromDnD || !WindowState.get(window, 'isConstrainedByMosaic') ||
+            !MosaicModel.normalSlotFor(window)) return null;
+        Logger.log(`ensureWindowFits: Window ${window.get_id()} already constrained by mosaic - tiling directly`);
+        const result = this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+        return result?.overflow ? null : 'handled';
+    }
+
+    _hasFullscreenAdmissionBlocker(window, workspace, monitor) {
+        return this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .some(candidate => candidate !== window &&
+                isWindowAlive(candidate) &&
+                (WindowState.get(candidate, MOSAIC_FULLSCREEN) ||
+                    this.windowingManager.isFullscreenLike(candidate)));
+    }
+
+    _prepareDnDArrival(window, workspace, monitor, arrivedFromDnD) {
+        if (arrivedFromDnD)
+            this._handleDnDArrival(window, workspace, monitor);
     }
 
     _ensureFitsBlocked(window, workspace) {
@@ -932,22 +962,6 @@ export const WindowHandler = GObject.registerClass({
             return true;
         }
         return false;
-    }
-
-    // A sacred (maximized/fullscreen) arrival, or a normal one landing where a sacred window
-    // already lives, gets its own workspace. {handled:true, result} when isolated.
-    async _ensureFitsSacred(window, workspace, monitor) {
-        const isIncomingSacred = this.windowingManager.isMaximizedOrFullscreen(window);
-        const hasExistingSacred = this.windowingManager.hasSacredWindow(workspace, monitor, window.get_id());
-        const workspaceWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !WindowState.get(w, 'pendingInQueue'));
-        const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
-
-        if (hasExistingSacred || (isIncomingSacred && otherWindows.length > 0)) {
-            Logger.log(`Sacred Isolation triggered (IncomingSacred: ${isIncomingSacred}, HasExistingSacred: ${hasExistingSacred}) - isolating`);
-            return { handled: true, result: await this.windowingManager.moveOversizedWindow(window) };
-        }
-        return { handled: false };
     }
 
     _handleDnDArrival(window, workspace, monitor) {
@@ -996,27 +1010,40 @@ export const WindowHandler = GObject.registerClass({
             .filter(w => w.get_id() !== window.get_id() && !this.edgeTilingManager.isEdgeTiled(w)
                 && !WindowState.get(w, 'pendingInQueue'));
 
-        // Include IS_MINIATURE windows so tryFitWithResize can account for the space they occupy.
-        // They are treated as non-resizable fixed participants inside tryFitWithResize.
-        const existingWindows = allExistingWindows.filter(w =>
+        // Both staged and committed miniatures belong to the unified rail. Their native
+        // maximize flag describes the backing window, not its occupied layout space;
+        // Smart Resize reserves their rail seats independently of resizable participants.
+        // Only windows without that presentation handoff can block normal coexistence.
+        const blockingWindows = allExistingWindows.filter(w =>
+            !WindowState.get(w, IS_MINIATURE) && !WindowState.get(w, PENDING_MINIATURE)
+        );
+
+        // Rail seats are collected from the workspace by tryFitWithResize; pass only
+        // normal peers as resize participants.
+        const existingWindows = blockingWindows.filter(w =>
             !this.windowingManager.isMaximizedOrFullscreen(w)
         );
 
-        if (existingWindows.length > 0) {
+        // Smart Resize can also admit a lone oversized normal window by shrinking the
+        // arriving window itself into Mosaic's usable area. This matters for clients that
+        // restore a normal (non-maximized) frame exactly equal to Mutter's work area: treating
+        // that as overflow would eject the only window to another dynamic workspace.
+        //
+        // Do not generalize "no resizable peers" to "solo", though. Maximized/fullscreen
+        // peers that have no rail handoff are intentionally filtered out of existingWindows
+        // and must keep blocking coexistence rather than being silently ignored by Smart Resize.
+        const canTrySmartResize = existingWindows.length > 0 || blockingWindows.length === 0;
+        if (canTrySmartResize) {
             // Pass the new window as focused override, since Mutter's focus_window
             // may still be the previously focused sibling at this point, which
             // would exclude it from miniaturization alongside newWindow.
             const resizeResult = this.tilingManager.tryFitWithResize(window, existingWindows, workArea, workspace, window);
             if (resizeResult?.success) {
                 Logger.log('Smart resize applied, tiling directly');
-                // Block overflow during tiling, since a null reference would otherwise let it expel something
-                this.tilingManager._isSmartResizingBlocked = true;
-                try {
-                    this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
+                this.tilingManager.withSmartResizeBlock(() => {
+                    this.tilingManager.mergePendingMiniatures(resizeResult.pendingWindows);
                     this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                } finally {
-                    this.tilingManager._isSmartResizingBlocked = false;
-                }
+                });
                 return workspace;
             }
         }
@@ -1067,13 +1094,7 @@ export const WindowHandler = GObject.registerClass({
             Logger.log(`Window ${window.get_id()} opened with Shift, set always-on-top`);
         }
 
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) {
-            WindowState.set(window, 'openedMaximized', true);
-            // Defense: clean up flags that onSizeChange may have set before window-created fired
-            WindowState.remove(window, 'maximizedUndoInfo');
-            WindowState.remove(window, 'isEnteringSacred');
-            Logger.log(`Window ${window.get_id()} opened maximized - marked for auto-tile check`);
-        }
+        this._sampleInitialWindowMode(window);
 
         const processWindowCallback = () => this._processCreatedWindow(window);
 
@@ -1094,12 +1115,12 @@ export const WindowHandler = GObject.registerClass({
                 // (and silently staying) at the default opacity of 255.
                 actor.opacity = 0;
 
-                // animateWindow may run (and defer, per Clutter skipping transitions on
-                // unmapped actors) before the actor is actually mapped. Once it is, give
-                // it the one nudge it needs to actually ease instead of sitting hidden.
+                // Mapping is one half of the entrance gate. animateWindow may also keep
+                // the actor hidden while a Wayland resize configure is still unacked; the
+                // resize handler retries the same gate when the live frame changes.
                 // One-shot: mapped flips on and off repeatedly later on (e.g. every time
-                // the Overview opens/closes), and runDeferredEntrance only has anything
-                // to do the first time anyway.
+                // the Overview opens/closes), and after the first placement commits there
+                // is no deferred entrance left to run.
                 if (actor.mapped) {
                     this._ext.animationsManager.runDeferredEntrance(window);
                 } else {
@@ -1160,7 +1181,7 @@ export const WindowHandler = GObject.registerClass({
     }
 
     // Runs once the window is ready enough to place. SOURCE_CONTINUE re-arms the readiness
-    // gate; SOURCE_REMOVE means placement is resolved (tiled, isolated, queued, or deferred).
+    // gate; SOURCE_REMOVE means placement is resolved (tiled, queued, or deferred).
     _processCreatedWindow(window) {
         const monitor = window.get_monitor();
         const workspace = window.get_workspace();
@@ -1179,11 +1200,11 @@ export const WindowHandler = GObject.registerClass({
             return GLib.SOURCE_REMOVE;
         }
 
+        // window-created can precede the client's initial maximize/fullscreen configure.
+        // Fullscreen wins over maximize semantics and is kept native/in-place; otherwise
+        // re-sample maximize intent before first admission.
+        this._sampleInitialWindowMode(window);
         this._captureOpeningSize(window, workspace, monitor);
-
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) {
-            return this._handleSacredCreated(window, workspace, monitor);
-        }
 
         const edgeResult = this._tryTileNewWithEdge(window, workspace, monitor);
         if (edgeResult !== null) return edgeResult;
@@ -1226,29 +1247,6 @@ export const WindowHandler = GObject.registerClass({
         } catch (e) {
             Logger.warn(`onWindowCreated: Failed to capture saved_rect: ${e.message}`);
         }
-    }
-
-    _handleSacredCreated(window, workspace, monitor) {
-        if (this._ext && !this._ext.isMosaicEnabledForWorkspace(workspace)) {
-            Logger.log('Sacred window in disabled mosaic workspace - skipping isolation');
-            return GLib.SOURCE_REMOVE;
-        }
-
-        this.windowingManager.invalidateWindowsCache();
-        const workspaceWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
-        const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
-
-        if (otherWindows.length > 0) {
-            // Isolating straight from here would race the queue's own sacred
-            // check and isolate twice, each pass creating its own workspace.
-            Logger.log('Opened sacred (Max/Full) in occupied workspace; queueing for isolation (SACRED)');
-            this.enqueueWindowForEvaluation(window, workspace, monitor);
-            return GLib.SOURCE_REMOVE;
-        }
-        Logger.log('Sacred window in empty workspace - keeping here');
-        WindowState.remove(window, 'arrivalPending');
-        this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
-        return GLib.SOURCE_REMOVE;
     }
 
     // Pairs a brand-new window with a lone edge-tiled sibling. Returns a GLib source
@@ -1295,12 +1293,20 @@ export const WindowHandler = GObject.registerClass({
         WindowState.set(window, 'addedTime', monotonicNow());
         WindowState.set(window, 'arrivalPending', true);
 
+        const firstWorkspaceAdmission = !WindowState.get(window, 'workspaceAdmissionSeen');
+        WindowState.set(window, 'workspaceAdmissionSeen', true);
+        const previousWorkspaceObject = WindowState.get(window, 'previousWorkspaceObject');
+        if (!firstWorkspaceAdmission && previousWorkspaceObject &&
+            previousWorkspaceObject !== window.get_workspace()) {
+            this.animationsManager.claimWindowForWorkspaceTransition(window);
+        }
+
         // Flag the first-ever tiling pass for this window so it slides in instead
         // of using the "no jump" continuity math meant for windows that already
         // have a real visual position. onWindowCreated separately asks Mutter to
         // skip its own open animation (skipNextEffect) and nudges animateWindow's
         // deferred entrance once the actor is actually mapped.
-        if (!this.shouldSkipSlideIn(window)) {
+        if (firstWorkspaceAdmission && !this.shouldSkipSlideIn(window)) {
             WindowState.set(window, 'pendingFirstPlacement', true);
             const actor = window.get_compositor_private();
             // onWindowCreated races independently and may have already started (or
@@ -1391,7 +1397,11 @@ export const WindowHandler = GObject.registerClass({
         // Mark as DnD arrival; triggers expansion after tiling
         WindowState.set(WINDOW, 'arrivedFromDnD', true);
 
+        this.tilingManager.maximizedLayout.forget(WINDOW);
+
         WindowState.remove(WINDOW, 'previousWorkspace');
+        WindowState.remove(WINDOW, 'previousWorkspaceObject');
+        WindowState.remove(WINDOW, 'previousMonitor');
         WindowState.remove(WINDOW, 'removedTimestamp');
         WindowState.remove(WINDOW, 'manualWorkspaceMove');
     }
@@ -1424,14 +1434,19 @@ export const WindowHandler = GObject.registerClass({
         const freedWidth = removedFrame ? removedFrame.width : 0;
         const freedHeight = removedFrame ? removedFrame.height : 0;
 
+        this._claimRemovedWindowPresentation(window, workspace);
+
         // Capture monitor at event time (window may move monitors during DnD)
         const removedMonitor = window.get_monitor();
+        WindowState.set(window, 'previousWorkspaceObject', workspace);
+        WindowState.set(window, 'previousMonitor', removedMonitor);
 
         const actor = window.get_compositor_private();
         if (!actor || actor.is_destroyed()) {
             this._ext.tilingManager.clearPreferredSize(window);
         } else {
             Logger.log('_windowRemoved: Window still exists (DnD move); keeping preferred size');
+            this.tilingManager.maximizedLayout.forget(window);
         }
 
         this._timeoutRegistry.add(constants.WINDOW_VALIDITY_CHECK_INTERVAL_MS, () => {
@@ -1487,12 +1502,18 @@ export const WindowHandler = GObject.registerClass({
                         this._ext.windowingManager.renavigate(WORKSPACE, global.workspace_manager.get_active_workspace() === WORKSPACE, this._ext._lastVisitedWorkspace, MONITOR);
                     }
 
-                    WindowState.remove(window, 'isRestoringSacred');
                 }
             }
 
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _claimRemovedWindowPresentation(window, sourceWorkspace) {
+        if (!isWindowAlive(window)) return;
+        const liveWorkspace = window.get_workspace();
+        if (!liveWorkspace || liveWorkspace === sourceWorkspace) return;
+        this.animationsManager.claimWindowForWorkspaceTransition(window);
     }
 
     waitForGeometry(WINDOW, WORKSPACE, MONITOR) {
@@ -1514,8 +1535,7 @@ export const WindowHandler = GObject.registerClass({
             Logger.log(`Window ${WINDOW.get_id()} ready: size=${rect.width}x${rect.height}, workArea=${wa.width}x${wa.height}`);
 
             if (WindowState.get(WINDOW, 'movedByOverflow')) {
-                Logger.log('Skipping early tile in waitForGeometry - window was moved by overflow (Flags cleared to prevent leakage)');
-                WindowState.remove(WINDOW, 'movedByOverflow');
+                Logger.log('Skipping early tile in waitForGeometry - overflow transition still owns placement');
                 WindowState.remove(WINDOW, 'arrivalPending');
                 return GLib.SOURCE_REMOVE;
             }
@@ -1544,7 +1564,7 @@ export const WindowHandler = GObject.registerClass({
                 Logger.log('Cross-workspace move: Waiting for workspace animation');
                 afterWorkspaceSwitch(performTiling, this._ext._timeoutRegistry);
             } else {
-                performTiling();
+                void performTiling();
             }
 
             return GLib.SOURCE_REMOVE;

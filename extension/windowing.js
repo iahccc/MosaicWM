@@ -58,6 +58,38 @@ export const WindowingManager = GObject.registerClass({
         this._overflowEndCallback = endCallback;
     }
 
+    _beginOverflowTransition(window) {
+        const generation = (WindowState.get(window, 'overflowGeneration') ?? 0) + 1;
+        WindowState.set(window, 'overflowGeneration', generation);
+        WindowState.set(window, 'movedByOverflow', true);
+
+        // Overflow supersedes the entrance animation that was created for the source
+        // workspace. Clear pendingFirstPlacement before change_workspace() emits remove/add
+        // notifications; otherwise those generic workspace-transition claims preserve the
+        // obsolete opacity=0 gate and a correctly moved window can remain invisible until
+        // Overview forces a new presentation.
+        this._animationsManager?.claimWindowForOverflowTransition?.(window);
+        this._overflowStartCallback?.();
+        return generation;
+    }
+
+    _ownsOverflowTransition(window, generation) {
+        return WindowState.get(window, 'overflowGeneration') === generation;
+    }
+
+    _finishOverflowTransition(window, generation) {
+        if (!this._ownsOverflowTransition(window, generation)) return false;
+        WindowState.remove(window, 'movedByOverflow');
+        WindowState.remove(window, 'overflowOriginWorkspace');
+        this._overflowEndCallback?.();
+        return true;
+    }
+
+    _overflowStillTargets(window, generation, workspace) {
+        return this._ownsOverflowTransition(window, generation) &&
+            isWindowAlive(window) && window.get_workspace() === workspace;
+    }
+
     getTimestamp() {
         return global.get_current_time();
     }
@@ -204,19 +236,13 @@ export const WindowingManager = GObject.registerClass({
         return new Promise(resolve => {
             const workspaceManager = global.workspace_manager;
             const monitor = window.get_monitor();
-
-            if (this._overflowStartCallback) {
-                this._overflowStartCallback();
-            }
-
-            WindowState.set(window, 'movedByOverflow', true);
+            const overflowGeneration = this._beginOverflowTransition(window);
 
             // Use current workspace as origin to prevent overflow target loops.
             const currentIndex = window.get_workspace().index();
 
             Logger.log(`moveOversizedWindow: origin=${currentIndex}`);
 
-            const isSacred = this.isMaximizedOrFullscreen(window);
             const nextIndex = currentIndex + 1;
             const totalWorkspaces = workspaceManager.get_n_workspaces();
             let target_workspace = null;
@@ -224,18 +250,13 @@ export const WindowingManager = GObject.registerClass({
             // GNOME's dynamic workspaces might not have a workspace at nextIndex yet
             const nextWorkspace = nextIndex < totalWorkspaces ? workspaceManager.get_workspace_by_index(nextIndex) : null;
 
-            if (isSacred) {
-                Logger.log(`[PLACEMENT] Sacred window detected - targeting strictly WS-${nextIndex} for isolation`);
-                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
+            Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
+            if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
+                Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
+                target_workspace = nextWorkspace;
             } else {
-                Logger.log(`[PLACEMENT] Overflow window detected - targeting strictly WS-${nextIndex}`);
-                if (nextWorkspace && this._tilingManager && this._tilingManager.canFitWindow(window, nextWorkspace, monitor)) {
-                    Logger.log(`[PLACEMENT] Window fits in existing adjacent WS-${nextIndex}`);
-                    target_workspace = nextWorkspace;
-                } else {
-                    Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
-                    target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
-                }
+                Logger.log(`[PLACEMENT] Adjacent WS-${nextIndex} is full or missing - creating new workspace`);
+                target_workspace = this.createOrReuseAdjacentWorkspace(workspaceManager.get_workspace_by_index(currentIndex));
             }
 
             const previous_workspace = window.get_workspace();
@@ -244,90 +265,113 @@ export const WindowingManager = GObject.registerClass({
             window.change_workspace(target_workspace);
 
             // Defer activation to next idle (no artificial delay)
-            this._timeoutRegistry.addIdle(() => {
-                const workspaceIndex = target_workspace.index();
-                if (workspaceIndex < 0 || workspaceIndex >= workspaceManager.get_n_workspaces()) {
-                    Logger.warn(`Workspace no longer valid: ${workspaceIndex}`);
-                    resolve(target_workspace);
-                    return GLib.SOURCE_REMOVE;
-                }
-
-                // Decide focus after any ongoing workspace switch completes,
-                // avoiding fights with user-initiated navigation.
-                afterWorkspaceSwitch(() => {
-                    const stillOnOrigin = global.workspace_manager.get_active_workspace() === previous_workspace;
-                    if (stillOnOrigin && switchFocusRequested) {
-                        target_workspace.activate(global.get_current_time());
-                        this.showWorkspaceSwitcher(target_workspace, monitor);
-                    }
-                }, this._timeoutRegistry);
-
-                if (this._tilingManager) {
-                    Logger.log('moveOversizedWindow: workspace switch done, retiling immediately and then waiting for animations');
-
-                    // First, repair any aborted smart-resize corruption in the origin workspace before the window was ejected
-                    if (previous_workspace.index() !== target_workspace.index()) {
-                        this._tilingManager.tileWorkspaceWindows(previous_workspace, null, monitor);
-                    }
-
-                    // Tile target workspace IMMEDIATELY to prevent "leap to 0,0"
-                    this._tilingManager.tileWorkspaceWindows(target_workspace, null, monitor);
-
-                    afterWorkspaceSwitch(() => {
-                        try {
-                            this._tilingManager.tileWorkspaceWindows(target_workspace, null, monitor);
-
-                            this._timeoutRegistry.addIdle(() => {
-                                try {
-                                    if (!isWindowAlive(window)) {
-                                        return;
-                                    }
-                                    const finalFrame = window.get_frame_rect();
-                                    const workArea = target_workspace.get_work_area_for_monitor(monitor);
-                                    const expectedX = Math.floor((workArea.width - finalFrame.width) / 2) + workArea.x;
-                                    const expectedY = Math.floor((workArea.height - finalFrame.height) / 2) + workArea.y;
-                                    const positionError = Math.abs(finalFrame.x - expectedX) + Math.abs(finalFrame.y - expectedY);
-
-                                    if (positionError > 10) {
-                                        Logger.log(`moveOversizedWindow: window mispositioned by ${positionError}px, retiling`);
-                                        this._tilingManager.tileWorkspaceWindows(target_workspace, null, monitor);
-                                    }
-                                } finally {
-                                    WindowState.remove(window, 'movedByOverflow');
-                                    WindowState.remove(window, 'overflowOriginWorkspace');
-
-                                    if (this._overflowEndCallback) {
-                                        this._overflowEndCallback();
-                                    }
-                                    resolve(target_workspace);
-                                }
-                                return GLib.SOURCE_REMOVE;
-                            }, 'windowing_positionCheck', GLib.PRIORITY_DEFAULT_IDLE);
-                        } catch (e) {
-                            Logger.error(`Error during moveOversizedWindow retiling: ${e}`);
-
-                            WindowState.remove(window, 'movedByOverflow');
-                            WindowState.remove(window, 'overflowOriginWorkspace');
-
-                            if (this._overflowEndCallback) {
-                                this._overflowEndCallback();
-                            }
-                            resolve(target_workspace);
-                        }
-                    }, this._timeoutRegistry);
-                } else {
-                    WindowState.remove(window, 'movedByOverflow');
-                    WindowState.remove(window, 'overflowOriginWorkspace');
-
-                    if (this._overflowEndCallback) {
-                        this._overflowEndCallback();
-                    }
-                    resolve(target_workspace);
-                }
-
-                return GLib.SOURCE_REMOVE;
-            });
+            const context = {
+                window,
+                monitor,
+                workspaceManager,
+                previousWorkspace: previous_workspace,
+                targetWorkspace: target_workspace,
+                switchFocusRequested,
+                overflowGeneration,
+                resolve,
+            };
+            this._timeoutRegistry.addIdle(() => this._continueOverflowMove(context));
         });
+    }
+
+    _continueOverflowMove(context) {
+        const {window, workspaceManager, targetWorkspace, overflowGeneration} = context;
+        if (!this._overflowStillTargets(window, overflowGeneration, targetWorkspace)) {
+            this._completeOverflowMove(context);
+            return GLib.SOURCE_REMOVE;
+        }
+
+        const workspaceIndex = targetWorkspace.index();
+        if (workspaceIndex < 0 || workspaceIndex >= workspaceManager.get_n_workspaces()) {
+            Logger.warn(`Workspace no longer valid: ${workspaceIndex}`);
+            this._completeOverflowMove(context, targetWorkspace);
+            return GLib.SOURCE_REMOVE;
+        }
+
+        this._scheduleOverflowFocus(context);
+        if (this._tilingManager)
+            this._retileOverflowMove(context);
+        else
+            this._completeOverflowMove(context);
+        return GLib.SOURCE_REMOVE;
+    }
+
+    _scheduleOverflowFocus(context) {
+        const {window, monitor, previousWorkspace, targetWorkspace,
+            switchFocusRequested, overflowGeneration} = context;
+        afterWorkspaceSwitch(() => {
+            if (!this._overflowStillTargets(window, overflowGeneration, targetWorkspace)) return;
+            const stillOnOrigin = global.workspace_manager.get_active_workspace() === previousWorkspace;
+            if (!stillOnOrigin || !switchFocusRequested) return;
+            targetWorkspace.activate(global.get_current_time());
+            this.showWorkspaceSwitcher(targetWorkspace, monitor);
+        }, this._timeoutRegistry);
+    }
+
+    _retileOverflowMove(context) {
+        const {monitor, previousWorkspace, targetWorkspace} = context;
+        Logger.log('moveOversizedWindow: workspace switch done, retiling immediately and then waiting for animations');
+        try {
+            if (previousWorkspace.index() !== targetWorkspace.index())
+                this._tilingManager.tileWorkspaceWindows(previousWorkspace, null, monitor);
+            this._tilingManager.tileWorkspaceWindows(targetWorkspace, null, monitor);
+        } catch (e) {
+            Logger.error(`Error during moveOversizedWindow retiling: ${e}`);
+            this._completeOverflowMove(context);
+            return;
+        }
+        afterWorkspaceSwitch(() => this._settleOverflowMove(context), this._timeoutRegistry);
+    }
+
+    _settleOverflowMove(context) {
+        const {window, monitor, targetWorkspace, overflowGeneration} = context;
+        if (!this._overflowStillTargets(window, overflowGeneration, targetWorkspace)) {
+            this._completeOverflowMove(context);
+            return;
+        }
+        try {
+            this._tilingManager.tileWorkspaceWindows(targetWorkspace, null, monitor);
+            this._timeoutRegistry.addIdle(
+                () => this._verifyOverflowPosition(context),
+                'windowing_positionCheck', GLib.PRIORITY_DEFAULT_IDLE);
+        } catch (e) {
+            Logger.error(`Error during moveOversizedWindow retiling: ${e}`);
+            this._completeOverflowMove(context);
+        }
+    }
+
+    _verifyOverflowPosition(context) {
+        const {window, monitor, targetWorkspace, overflowGeneration} = context;
+        try {
+            if (!this._overflowStillTargets(window, overflowGeneration, targetWorkspace))
+                return GLib.SOURCE_REMOVE;
+            const finalFrame = window.get_frame_rect();
+            const workArea = targetWorkspace.get_work_area_for_monitor(monitor);
+            const expectedX = Math.floor((workArea.width - finalFrame.width) / 2) + workArea.x;
+            const expectedY = Math.floor((workArea.height - finalFrame.height) / 2) + workArea.y;
+            const positionError = Math.abs(finalFrame.x - expectedX) + Math.abs(finalFrame.y - expectedY);
+            if (positionError > 10) {
+                Logger.log(`moveOversizedWindow: window mispositioned by ${positionError}px, retiling`);
+                this._tilingManager.tileWorkspaceWindows(targetWorkspace, null, monitor);
+            }
+            return GLib.SOURCE_REMOVE;
+        } finally {
+            this._completeOverflowMove(context);
+        }
+    }
+
+    _completeOverflowMove(context, fallbackWorkspace = null) {
+        const {window, targetWorkspace, overflowGeneration, resolve} = context;
+        const finished = this._finishOverflowTransition(window, overflowGeneration);
+        // The window may already be disposed here (that is one of the reasons the transition
+        // stops being current), and liveness.js warns against native calls on dead windows.
+        const currentWorkspace = isWindowAlive(window) ? window.get_workspace() : null;
+        resolve(finished ? targetWorkspace : (currentWorkspace ?? fallbackWorkspace ?? targetWorkspace));
     }
 
     // The exclusion reasons that already hold before the window has any geometry.
@@ -481,37 +525,12 @@ export const WindowingManager = GObject.registerClass({
     }
 
     isMaximizedOrFullscreen(window) {
-        return window.is_maximized() || window.is_fullscreen() || this._looksNativelyFullscreen(window);
+        return window.is_maximized() || this.isFullscreenLike(window);
     }
 
-    // Some game engines (Unity's borderless "Fullscreen Window" mode) resize to the monitor's
-    // resolution without setting the WM's real maximize/fullscreen state, so nothing marks
-    // them sacred and mosaic shrinks then miniaturizes them like any oversized window. Catch
-    // the shape instead: no preferred/opening size captured yet, and the frame already covers
-    // the whole physical monitor, which normal placement (even maximized) never reaches.
-    _looksNativelyFullscreen(window) {
-        if (WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize'))
-            return false;
-
-        const monitor = window.get_monitor();
-        if (monitor === null || monitor === undefined || monitor < 0) return false;
-
-        const geom = global.display.get_monitor_geometry(monitor);
-        if (!geom) return false;
-
-        const frame = window.get_frame_rect();
-        return frame.width >= geom.width && frame.height >= geom.height;
-    }
-
-    hasSacredWindow(workspace, monitor, excludeWindowId = null) {
-        if (!workspace || monitor === null || monitor === undefined)
-            return false;
-
-        const windows = this.getMonitorWorkspaceWindows(workspace, monitor);
-        return windows.some(w =>
-            (!excludeWindowId || w.get_id() !== excludeWindowId) &&
-            this.isMaximizedOrFullscreen(w)
-        );
+    isFullscreenLike(window) {
+        return !!window && (WindowState.get(window, WindowState.MOSAIC_FULLSCREEN) ||
+            window.is_fullscreen?.());
     }
 
     renavigate(workspace, condition, lastVisitedIndex = null, monitorIndex = -1) {
@@ -519,6 +538,11 @@ export const WindowingManager = GObject.registerClass({
 
         // Queue in idle with low priority to let GNOME settle its dynamic workspace states
         this._timeoutRegistry.addIdle(() => {
+            if (global.workspace_manager.get_active_workspace() !== workspace) {
+                Logger.log('[RENAVIGATE] Workspace is no longer active; dropping stale navigation request');
+                return GLib.SOURCE_REMOVE;
+            }
+
             const currentIndex = this._indexOfWorkspace(workspace);
             if (currentIndex < 0) return GLib.SOURCE_REMOVE;
 
