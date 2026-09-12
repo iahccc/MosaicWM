@@ -479,6 +479,11 @@ export const WindowingManager = GObject.registerClass({
         return null;
     }
 
+    isFullscreenLike(window) {
+        return window.is_fullscreen() || WindowState.get(window, WindowState.MOSAIC_FULLSCREEN) ||
+            this._looksNativelyFullscreen(window);
+    }
+
     isMaximizedOrFullscreen(window) {
         return window.is_maximized() || window.is_fullscreen() || this._looksNativelyFullscreen(window);
     }

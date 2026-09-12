@@ -118,6 +118,7 @@ export default class WindowMosaicExtension extends Extension {
 
     disableWorkspaceMosaic(workspace) {
         if (!workspace) return;
+        this.tilingManager.maximizedLayout.clearWorkspace(workspace);
 
         if (this.miniatureManager)
             this.miniatureManager.restoreWorkspaceMiniatures(workspace);
@@ -179,8 +180,10 @@ export default class WindowMosaicExtension extends Extension {
         const nMonitors = global.display.get_n_monitors();
         for (let i = 0; i < nWorkspaces; i++) {
             const workspace = this._workspaceManager.get_workspace_by_index(i);
-            for (let j = 0; j < nMonitors; j++)
+            for (let j = 0; j < nMonitors; j++) {
+                this.tilingManager.maximizedLayout.prepareWorkspace(workspace, j);
                 this.mosaicRenderer?.flushToWindows(workspace, j);
+            }
         }
     }
 
@@ -287,6 +290,7 @@ export default class WindowMosaicExtension extends Extension {
         this.miniatureManager.setTimeoutRegistry(this._timeoutRegistry);
         this.miniatureManager.setAnimationsManager(this.animationsManager);
         this.edgeTilingManager.setMiniatureManager(this.miniatureManager);
+        this.miniatureManager._maximizedLayout = this.tilingManager.maximizedLayout;
         this.keyboardNavigator = new KeyboardNavigatorManager(this);
         this._lastFocusedWindowId = null;
         this.keyboardNavigator.enable();
@@ -599,7 +603,7 @@ export default class WindowMosaicExtension extends Extension {
             (window) => {
                 this._dndPendingWindowId = null;
                 if (isWindowAlive(window) && WindowState.get(window, WindowState.IS_MINIATURE))
-                    this.miniatureManager?.restoreMiniature(window, null);
+                    this.miniatureManager?.restoreMiniature(window, null, {reason: 'dnd'});
             },
             constants.DND_MINIATURE_RESTORE_DELAY_MS,
             this._timeoutRegistry
@@ -726,6 +730,8 @@ export default class WindowMosaicExtension extends Extension {
         const prevFocusedId = this._lastFocusedWindowId;
         this._lastFocusedWindowId = window.get_id();
 
+        if (!this.keyboardNavigator?.isTransitionActive())
+            this.tilingManager.maximizedLayout.onFocusChanged(window);
         const isMiniature = WindowState.get(window, IS_MINIATURE);
         if (this._shouldSkipMiniatureFocusRestore(window, isMiniature)) return;
 
@@ -736,7 +742,10 @@ export default class WindowMosaicExtension extends Extension {
         this.tilingManager._isSmartResizingBlocked = true;
         WindowState.set(window, 'restoringFromMiniature', true);
 
-        this.miniatureManager.restoreMiniature(window, null);
+        if (!this.miniatureManager.restoreMiniature(window, null, {reason: 'focus'})) {
+            WindowState.remove(window, 'restoringFromMiniature');
+            this.tilingManager._isSmartResizingBlocked = false;
+        }
         // 'miniature-restored' signal fires synchronously → _onMiniatureRestored runs next
     }
 
@@ -772,12 +781,16 @@ export default class WindowMosaicExtension extends Extension {
         if (!workspace) return;
         if (!this.isMosaicEnabledForWorkspace(workspace)) return;
 
-        if (this._restoreRetileOwnedElsewhere()) return;
+        if (this.tilingManager.maximizedLayout.applying || this._restoreRetileOwnedElsewhere()) return;
 
         const monitor = window.get_monitor();
 
         const doTile = () => {
             if (!isWindowAlive(window)) return;
+            if (window.is_maximized()) {
+                this.tilingManager.maximizedLayout.queue(window);
+                return;
+            }
             // Capped as a window for its own pass, so the allocation shrinks everyone else first
             // and no eject site can pick the window the user just brought back.
             WindowState.set(window, 'restoringFromMiniature', true);
@@ -981,6 +994,8 @@ export default class WindowMosaicExtension extends Extension {
     // Phases run in the same order the old flat method did; teardown order is load-bearing
     // (e.g. the miniature listener comes off before restore, handlers destroy before refs null).
     disable() {
+        // unlock-dialog keeps miniature transforms alive across session locking; teardown
+        // restores actors and releases geometry ownership when the extension is disabled.
         Logger.log('Disabling extension');
 
         if (this._timeoutRegistry) {
@@ -1076,6 +1091,7 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _teardownMiniatures() {
+        this.tilingManager.maximizedLayout.destroy();
         if (this.miniatureManager) {
             // Disconnect listener first, otherwise restoreMiniature re-enters
             // _onMiniatureRestored, scheduling timeouts that fire after windowHandler is nulled.
@@ -1121,7 +1137,7 @@ export default class WindowMosaicExtension extends Extension {
             this._onOverviewHiddenId = 0;
         }
 
-        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
         allWindows.forEach(w => {
             if (this.windowHandler) this.windowHandler.disconnectWindowSignals(w);
         });

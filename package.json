@@ -4,7 +4,8 @@
   "scripts": {
     "lint": "eslint extension/",
     "lint:fix": "eslint extension/ --fix",
-    "shexli": "shexli \"$PWD/extension/\""
+    "shexli": "shexli \"$PWD/extension/\"",
+    "test:unit": "node scripts/test-unit.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

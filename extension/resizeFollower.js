@@ -12,6 +12,8 @@ const settled = (frame, target) =>
 // later, so easing the scale to 1 shows the old buffer at its old size the moment the ease
 // ends. Scaling to slot/frame instead keeps the slot filled, and each reallocation re-aims.
 export function followResize(window, actor, target, { duration, mode, registry }) {
+    let alive = true;
+    let destroyId = 0;
     let allocId = 0;
     let timeoutId = null;
     let last = window.get_frame_rect();
@@ -28,7 +30,7 @@ export function followResize(window, actor, target, { duration, mode, registry }
             duration: d,
             mode,
             onStopped: isFinished => {
-                if (!isFinished || actor.is_destroyed()) return;
+                if (!isFinished || !alive) return;
                 actor.set_scale(sx, sy);
             },
         });
@@ -36,16 +38,22 @@ export function followResize(window, actor, target, { duration, mode, registry }
     };
 
     const detach = () => {
-        if (allocId && !actor.is_destroyed()) actor.disconnect(allocId);
+        if (allocId && alive) actor.disconnect(allocId);
         allocId = 0;
         if (timeoutId !== null) registry?.remove(timeoutId);
         timeoutId = null;
     };
 
+    destroyId = actor.connect('destroy', () => {
+        alive = false;
+        destroyId = 0;
+        detach();
+    });
+
     // The actor resizes with the buffer in one frame, so the scale is rebased to keep what's on
     // screen still before easing on toward the slot.
     allocId = actor.connect('notify::allocation', () => {
-        if (actor.is_destroyed()) return;
+        if (!alive) return;
         const frame = window.get_frame_rect();
         if (frame.width <= 0 || frame.height <= 0) return;
         if (frame.width === last.width && frame.height === last.height) return;
@@ -58,7 +66,7 @@ export function followResize(window, actor, target, { duration, mode, registry }
     timeoutId = registry?.add(constants.RESIZE_CLAMP_MAX_WAIT_MS, () => {
         timeoutId = null;
         detach();
-        if (!actor.is_destroyed()) actor.set_scale(1, 1);
+        if (alive) actor.set_scale(1, 1);
         return false;
     }, 'resizeFollower_release') ?? null;
 
@@ -67,10 +75,14 @@ export function followResize(window, actor, target, { duration, mode, registry }
     // since nothing rebases it once the follower lets go.
     const cancel = ({ resetScale = false } = {}) => {
         detach();
-        if (!resetScale || actor.is_destroyed()) return;
-        actor.remove_transition('scale-x');
-        actor.remove_transition('scale-y');
-        actor.set_scale(1, 1);
+        if (alive && resetScale) {
+            actor.remove_transition('scale-x');
+            actor.remove_transition('scale-y');
+            actor.set_scale(1, 1);
+        }
+        if (destroyId && alive) actor.disconnect(destroyId);
+        destroyId = 0;
+        alive = false;
     };
     return { cancel };
 }

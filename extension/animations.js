@@ -163,6 +163,22 @@ export const AnimationsManager = GObject.registerClass({
         return { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset };
     }
 
+    claimWindowForRoleTransition(window) {
+        this.cancelPendingEntrance(window);
+        this.removeAnimatingWindow(window.get_id());
+        this._cancelResizeFollower(window.get_id());
+        if (WindowState.get(window, MINIATURE_ANIM_KIND) !== undefined) return;
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed()) return;
+        if (actor.__animationInfo) return;
+        actor.remove_all_transitions();
+        if (!WindowState.get(window, WindowState.IS_MINIATURE)) {
+            actor.set_pivot_point(0, 0);
+            actor.set_scale(1, 1);
+            actor.set_translation(0, 0, 0);
+        }
+    }
+
     animateWindow(window, targetRect, options = {}) {
         const { duration, mode, onComplete, draggedWindow, subtle, userOp, firstPlacement, slideInOffset } =
             this._animOptions(options);
@@ -179,6 +195,12 @@ export const AnimationsManager = GObject.registerClass({
         if (!windowActor) {
             this._cancelResizeFollower(window.get_id());
             this._applyNoActor(window, targetRect, { firstPlacement, onComplete });
+            return;
+        }
+
+        if (windowActor.__animationInfo && !firstPlacement) {
+            this._cancelResizeFollower(window.get_id());
+            this._applyWithoutAnimation(window, targetRect, {userOp, firstPlacement, onComplete});
             return;
         }
 
