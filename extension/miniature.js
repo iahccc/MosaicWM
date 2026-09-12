@@ -60,31 +60,59 @@ export function applyMiniatureActorState(actor, scale, targetX, targetY) {
     Logger.log(`[MINIATURE] applyMiniatureActorState: actor=( ${ax},${ay} ${actorW}x${actorH}) target=(${targetX},${targetY}) scale=${scale} tx=${tx} ty=${ty} FINAL_SIZE=${Math.round(actorW * scale)}x${Math.round(actorH * scale)}`);
 }
 
+const miniatureMotions = new WeakMap();
+
+function miniatureTransform(actor) {
+    const [width, height] = actor.get_size();
+    const [px, py] = actor.get_pivot_point();
+    return {
+        sx: actor.scale_x,
+        sy: actor.scale_y,
+        tx: actor.translation_x + px * width * (1 - actor.scale_x),
+        ty: actor.translation_y + py * height * (1 - actor.scale_y),
+    };
+}
+
 export function animateMiniatureToTarget(actor, window, scale, targetX, targetY, duration) {
     const kind = WindowState.get(window, MINIATURE_ANIM_KIND);
 
-    if (kind === 'create' || kind === 'restore') {
+    if (kind === 'restore') {
         WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
         return;
     }
 
+    const { tx: targetTx, ty: targetTy } = frameTranslation(actor, scale, targetX, targetY);
+    const previous = miniatureMotions.get(actor);
+    if (kind === 'move' && previous?.scale === scale &&
+        previous.x === targetX && previous.y === targetY &&
+        previous.tx === targetTx && previous.ty === targetTy) return;
+
+    // Cancelling a scale ease must not replace its painted size with the new allocator
+    // target. Preserve the live box, including a creation animation's non-zero pivot.
+    const live = miniatureTransform(actor);
+    const motion = {x: targetX, y: targetY, scale, tx: targetTx, ty: targetTy};
+    miniatureMotions.set(actor, motion);
     actor.remove_all_transitions();
 
     WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+    WindowState.set(window, MINIATURE_SCALE, scale);
     WindowState.set(window, ANIMATING_MINIATURE, true);
     WindowState.set(window, MINIATURE_ANIM_KIND, 'move');
 
     actor.set_pivot_point(0, 0);
-    actor.set_scale(scale, scale);
-
-    const { tx: targetTx, ty: targetTy } = frameTranslation(actor, scale, targetX, targetY);
+    actor.set_scale(live.sx, live.sy);
+    actor.set_translation(live.tx, live.ty, 0);
 
     actor.ease({
+        scale_x: scale,
+        scale_y: scale,
         translation_x: targetTx,
         translation_y: targetTy,
         duration,
         mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         onStopped: (isFinished) => {
+            if (miniatureMotions.get(actor) !== motion) return;
+            miniatureMotions.delete(actor);
             if (!isFinished) return;
             WindowState.remove(window, ANIMATING_MINIATURE);
             WindowState.remove(window, MINIATURE_ANIM_KIND);
@@ -113,7 +141,8 @@ const MiniatureEnforceEffect = GObject.registerClass({
             return;
         }
 
-        if (WindowState.get(this._window, MINIATURE_SCREENSHOT_PAUSE)) {
+        if (WindowState.get(this._window, MINIATURE_SCREENSHOT_PAUSE) ||
+            WindowState.get(this._window, WindowState.MINIATURE_FULLSCREEN_PAUSE)) {
             super.vfunc_paint(...args);
             return;
         }
@@ -217,7 +246,7 @@ const MiniatureClickOverlay = GObject.registerClass({
 
         const restore = () => {
             Logger.log(`[MINIATURE] Click overlay clicked for ${window.get_id()}`);
-            this._miniatureManager.restoreMiniature(window, null);
+            this._miniatureManager.restoreMiniature(window, null, {reason: 'click'});
         };
         this.connect('button-press-event', () => {
             restore();
@@ -271,7 +300,7 @@ const MiniatureClickOverlay = GObject.registerClass({
         if (WindowState.get(this._window, 'justMiniaturized')) return;
 
         Logger.log(`[MINIATURE] Hover focus restoring ${this._window.get_id()}`);
-        this._miniatureManager.restoreMiniature(this._window, null);
+        this._miniatureManager.restoreMiniature(this._window, null, {reason: 'hover'});
     }
 
     _cancelHoverRest() {
@@ -606,8 +635,8 @@ export const MiniatureManager = GObject.registerClass({
         if (this._overviewActive) overlay.setIconSuppressed('overview', true);
     }
 
-    // Shrinks an already-miniaturized window further in place: same actor, same overlay,
-    // just a smaller scale. No-op if the window isn't currently a miniature.
+    // Moves and resizes an existing miniature through the same ease as ordinary retiling.
+    // Repeated layout passes must continue that ease instead of replacing its live scale.
     reshrinkMiniature(window, region) {
         if (!WindowState.get(window, IS_MINIATURE)) return false;
 
@@ -619,41 +648,7 @@ export const MiniatureManager = GObject.registerClass({
         const scale = miniatureScaleToFit(window, region);
         const targetX = region.x;
         const targetY = region.y;
-        const { tx, ty } = frameTranslation(windowActor, scale, targetX, targetY);
-
-        // Removing transitions fires the create ease's onStopped synchronously, which snaps the
-        // actor to its final state; capture the live transform first so the ease resumes from it.
-        const [actorW, actorH] = windowActor.get_size();
-        const [px, py] = windowActor.get_pivot_point();
-        const liveScale = windowActor.scale_x;
-        const liveTx = windowActor.translation_x + px * actorW * (1 - liveScale);
-        const liveTy = windowActor.translation_y + py * actorH * (1 - liveScale);
-
-        windowActor.remove_all_transitions();
-        windowActor.set_pivot_point(0, 0);
-        windowActor.set_scale(liveScale, liveScale);
-        windowActor.set_translation(liveTx, liveTy, 0);
-        // Without the flag the enforce effect writes the final transform on the next paint, and
-        // that direct write drops this ease.
-        WindowState.set(window, ANIMATING_MINIATURE, true);
-        windowActor.ease({
-            scale_x: scale,
-            scale_y: scale,
-            translation_x: tx,
-            translation_y: ty,
-            duration: constants.MINIATURE_ANIM_MS,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onStopped: (isFinished) => {
-                if (!isFinished) return;
-                WindowState.remove(window, ANIMATING_MINIATURE);
-                const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
-                const sc = WindowState.get(window, MINIATURE_SCALE);
-                if (tgt && sc) applyMiniatureActorState(windowActor, sc, tgt.x, tgt.y);
-            },
-        });
-
-        WindowState.set(window, MINIATURE_SCALE, scale);
-        WindowState.set(window, MINIATURE_TARGET_POS, { x: targetX, y: targetY });
+        animateMiniatureToTarget(windowActor, window, scale, targetX, targetY, constants.MINIATURE_ANIM_MS);
 
         const size = getMiniatureSize(window);
         WindowState.get(window, MINIATURE_OVERLAY)?.set_size(size.width, size.height);
@@ -687,9 +682,71 @@ export const MiniatureManager = GObject.registerClass({
         return true;
     }
 
-    restoreMiniature(window, _newSlot, { activate = true } = {}) {
-        if (!WindowState.get(window, IS_MINIATURE)) return false;
+    canApplyMiniaturePresentation(window, slot) {
+        const actor = window?.get_compositor_private();
+        return !!slot && !!actor && !actor.is_destroyed() && !window.is_fullscreen();
+    }
 
+    updateMiniatureLayout(window, slot, {animate = true} = {}) {
+        if (!WindowState.get(window, IS_MINIATURE)) return false;
+        if (animate) return this.reshrinkMiniature(window, slot);
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed()) return false;
+        const scale = miniatureScaleToFit(window, slot);
+        WindowState.set(window, MINIATURE_SCALE, scale);
+        WindowState.set(window, MINIATURE_TARGET_POS, {x: slot.x, y: slot.y});
+        WindowState.remove(window, ANIMATING_MINIATURE);
+        applyMiniatureActorState(actor, scale, slot.x, slot.y);
+        WindowState.get(window, MINIATURE_OVERLAY)?.set_size(slot.width, slot.height);
+        return true;
+    }
+
+    pauseForFullscreen(window) {
+        if (!WindowState.get(window, IS_MINIATURE)) return false;
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed()) return false;
+        WindowState.set(window, WindowState.MINIATURE_FULLSCREEN_PAUSE, true);
+        WindowState.remove(window, ANIMATING_MINIATURE);
+        actor.remove_all_transitions();
+        actor.set_pivot_point(0, 0);
+        actor.set_scale(1, 1);
+        actor.set_translation(0, 0, 0);
+        WindowState.get(window, MINIATURE_OVERLAY)?.hide();
+        return true;
+    }
+
+    resumeFromFullscreen(window) {
+        if (!WindowState.get(window, WindowState.MINIATURE_FULLSCREEN_PAUSE)) return false;
+        WindowState.remove(window, WindowState.MINIATURE_FULLSCREEN_PAUSE);
+        this.refitToFrame(window);
+        const actor = window.get_compositor_private();
+        const scale = WindowState.get(window, MINIATURE_SCALE);
+        const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
+        if (actor && scale && tgt) applyMiniatureActorState(actor, scale, tgt.x, tgt.y);
+        WindowState.get(window, MINIATURE_OVERLAY)?.show();
+        return true;
+    }
+
+    restoreMiniature(window, _newSlot, {activate = true, reason = 'auto', layoutBypass = false, instant = false} = {}) {
+        if (!layoutBypass && this._fullscreenOwnsPresentation(window)) return false;
+        if (!WindowState.get(window, IS_MINIATURE)) return false;
+        if (this._shouldGateRestore(window, layoutBypass))
+            return this._maximizedLayout.restore(window, {activate, reason});
+
+        return this._restoreMiniatureUnchecked(window, activate, instant);
+    }
+
+    _fullscreenOwnsPresentation(window) {
+        return window.is_fullscreen() || WindowState.get(window, WindowState.MOSAIC_FULLSCREEN);
+    }
+
+    _shouldGateRestore(window, bypass) {
+        const layout = this._maximizedLayout;
+        return !bypass && layout && !layout.applying &&
+            layout.hasWindows(window.get_workspace(), window.get_monitor());
+    }
+
+    _restoreMiniatureUnchecked(window, activate, instant) {
         const windowActor = window.get_compositor_private();
         const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
         const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
@@ -701,18 +758,27 @@ export const MiniatureManager = GObject.registerClass({
 
         this._fadeMiniatureOverlay(window);
 
-        if (windowActor) {
-            this._animateRestore(window, windowActor, { sc, tgt, activate });
-        }
+        this._restorePresentationActor(window, windowActor, {sc, tgt, activate, instant});
 
         this._snapshotRestoreAnchor(window, tgt, sc);
         this._clearMiniatureState(window);
-
         this._miniatureWindows.delete(window.get_id());
         this.emit('miniature-restored', window);
-
-        Logger.log(`[MINIATURE] Restored miniature ${window.get_id()}`);
         return true;
+    }
+
+    _restorePresentationActor(window, windowActor, {sc, tgt, activate, instant}) {
+        if (windowActor && instant) {
+            this._removeEnforceEffect(windowActor);
+            windowActor.remove_all_transitions();
+            windowActor.set_pivot_point(0, 0);
+            windowActor.set_scale(1, 1);
+            windowActor.set_translation(0, 0, 0);
+            if (activate) window.activate(global.get_current_time());
+        } else if (windowActor) {
+            this._animateRestore(window, windowActor, { sc, tgt, activate });
+        }
+
     }
 
     // Drop from state first so tiling stops finding it during icon fade-out.
@@ -939,6 +1005,7 @@ export const MiniatureManager = GObject.registerClass({
 
     _clearMiniatureState(window) {
         WindowState.remove(window, ANIMATING_MINIATURE);
+        WindowState.remove(window, WindowState.MINIATURE_FULLSCREEN_PAUSE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
         WindowState.remove(window, MINIATURE_TARGET_POS);
@@ -959,6 +1026,7 @@ export const MiniatureManager = GObject.registerClass({
 
         WindowState.remove(window, IS_MINIATURE);
         WindowState.remove(window, ANIMATING_MINIATURE);
+        WindowState.remove(window, WindowState.MINIATURE_FULLSCREEN_PAUSE);
         WindowState.remove(window, MINIATURE_SCALE);
         WindowState.remove(window, PRE_MINIATURE_SIZE);
         WindowState.remove(window, MINIATURE_TARGET_POS);
@@ -1009,18 +1077,18 @@ export const MiniatureManager = GObject.registerClass({
     }
 
     restoreAllMiniatures() {
-        const windows = global.display.get_tab_list(Meta.TabList.NORMAL, null)
+        const windows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null)
             .filter(w => WindowState.get(w, IS_MINIATURE));
         for (const window of windows) {
-            this.restoreMiniature(window, null, { activate: false });
+            this.restoreMiniature(window, null, { activate: false, layoutBypass: true, instant: true });
         }
     }
 
     restoreWorkspaceMiniatures(workspace) {
-        const windows = global.display.get_tab_list(Meta.TabList.NORMAL, workspace)
+        const windows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
             .filter(w => WindowState.get(w, IS_MINIATURE));
         for (const window of windows) {
-            this.restoreMiniature(window, null, { activate: false });
+            this.restoreMiniature(window, null, { activate: false, layoutBypass: true, instant: true });
         }
     }
 

@@ -55,7 +55,7 @@ export function resolveMode(p, pos, { restoreMarginPx, allowRestore }) {
     if (p.capAtThreshold) return 'window';
     const { total, pLim } = axisOf(p);
     if (p.mode !== 'thumbnail') return pos > pLim ? 'thumbnail' : 'window';
-    if (!allowRestore) return 'thumbnail';
+    if (!allowRestore || p.allowRestore === false) return 'thumbnail';
     const restoreAt = Math.max(0, pLim - (total > 0 ? restoreMarginPx / total : 0));
     return pos <= restoreAt ? 'window' : 'thumbnail';
 }
@@ -96,7 +96,7 @@ function entriesAt(participants, rates, s, opts) {
 function holdRestoresToRecency(participants, entries) {
     const byId = new Map(entries.map(e => [e.id, e]));
     let blocked = false;
-    for (const p of participants.filter(q => q.mode === 'thumbnail' && !q.fixed && !q.capAtThreshold).sort(byRecency)) {
+    for (const p of participants.filter(q => q.mode === 'thumbnail' && !q.fixed && !q.capAtThreshold && q.allowRestore !== false).sort(byRecency)) {
         const e = byId.get(p.id);
         if (blocked && e.mode === 'window') {
             e.mode = 'thumbnail';
@@ -185,7 +185,7 @@ function holdHeadAtPreferred(participants, run, free) {
 function holdOneAsWindow(participants, run, free) {
     if ([...free.entries.values()].some(e => e.mode === 'window')) return free;
     if (participants.some(p => p.capAtThreshold || (p.fixed && p.mode === 'window'))) return free;
-    for (const held of participants.filter(p => !p.fixed).sort(byRecency)) {
+    for (const held of participants.filter(p => !p.fixed && p.allowRestore !== false).sort(byRecency)) {
         const r = run(participants.map(p => (p === held ? { ...p, capAtThreshold: true } : p)));
         if (r.fits) return r;
     }

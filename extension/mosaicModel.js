@@ -8,6 +8,7 @@ import { MosaicTileGroupStore } from './mosaicTileGroup.js';
 // extension already speaks. Keyed by window ID, not the GObject, to survive GI reference
 // churn (same reason windowState.js exists).
 const _store = new MosaicTileGroupStore();
+const _normalSlots = new Map();
 
 function idOf(window) {
     return window?.get_id?.();
@@ -15,6 +16,39 @@ function idOf(window) {
 
 export const MosaicModel = {
     store: _store,
+
+    commitNormalSlot(window, region, workspace, monitor) {
+        const id = idOf(window);
+        if (id === undefined) return;
+        _normalSlots.set(id, {region: {...region}, workspace, monitor});
+        this.setRegion(window, region, workspace, monitor);
+    },
+
+    setPresentationSlot(window, region, workspace, monitor) {
+        const group = _store.groupOfWindow(idOf(window));
+        this.setRegion(window, region,
+            workspace === undefined ? window.get_workspace?.() : workspace,
+            monitor === undefined ? group?.monitor : monitor);
+    },
+
+    presentationSlotFor(window) {
+        const group = _store.groupOfWindow(idOf(window));
+        if (!group || group.workspaceIndex !== window.get_workspace?.()?.index?.() ||
+            group.monitor !== window.get_monitor?.()) return null;
+        return group.regionOf(idOf(window));
+    },
+
+    normalSlotFor(window) {
+        const slot = _normalSlots.get(idOf(window));
+        if (!slot || slot.workspace !== window.get_workspace?.() ||
+            slot.monitor !== window.get_monitor?.()) return null;
+        return slot.region;
+    },
+
+    entriesFor(workspace, monitor) {
+        return (_store.groupFor(workspace.index(), monitor)?.members() ?? [])
+            .map(member => ({window: member.window, slot: member.region}));
+    },
 
     setRegion(window, region, workspace, monitor) {
         const id = idOf(window);
@@ -47,16 +81,22 @@ export const MosaicModel = {
         // Store's setMember also updates the reverse index, but this call never moves the
         // window to a different group, and there's no workspace/monitor to give it here anyway.
         group.setMember(id, { ...member, region: frame });
+        const normal = _normalSlots.get(id);
+        if (normal && normal.workspace === window.get_workspace?.() &&
+            normal.monitor === window.get_monitor?.()) normal.region = {...frame};
     },
 
     forget(window) {
         const id = idOf(window);
-        if (id !== undefined) _store.removeWindow(id);
+        if (id !== undefined) {
+            _store.removeWindow(id);
+            _normalSlots.delete(id);
+        }
     },
 
-    forgetById(id) { _store.removeWindow(id); },
+    forgetById(id) { _store.removeWindow(id); _normalSlots.delete(id); },
 
-    clear() { _store.clear(); },
+    clear() { _store.clear(); _normalSlots.clear(); },
 };
 
 // Existing call sites speak this shape; kept so moving the store is not also an API churn.

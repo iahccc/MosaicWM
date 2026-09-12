@@ -29,21 +29,41 @@ const MosaicRegionConstraint = GObject.registerClass({
     _init() {
         super._init();
         this.armed = null;
+        this.maximizedRegion = null;
+        this.maximizedMonitor = -1;
     }
 
     // The solver runs this on every pass for the window: user grabs and client resizes
-    // included, with nothing saying who initiated. Armed only around our own commits,
-    // so everyone else's geometry goes through untouched.
-    vfunc_constrain(_window, info) {
-        if (!this.armed) return false;
+    // included, with nothing saying who initiated. Ordinary regions are armed only around
+    // our own commits; a maximized region persists until its presentation is released.
+    vfunc_constrain(window, info) {
+        const region = this.armed ?? this._maximizedRegionFor(window, info);
+        if (!region) return false;
         info.set_rect(new Mtk.Rectangle({
-            x: this.armed.x,
-            y: this.armed.y,
-            width: this.armed.width,
-            height: this.armed.height,
+            x: region.x, y: region.y, width: region.width, height: region.height,
         }));
         return true;
     }
+    _maximizedRegionFor(window, info) {
+        if (!this.maximizedRegion || !window.is_maximized() || window.is_fullscreen()) return null;
+        if (this._targetsDifferentMonitor(info)) {
+            // Allow Mutter's native monitor migration before the destination layout is known.
+            // Keeping the source pin here would move the frame straight back to its old monitor.
+            this.maximizedRegion = null;
+            return null;
+        }
+        return this.maximizedRegion;
+    }
+
+    _targetsDifferentMonitor(info) {
+        if (this.maximizedMonitor < 0 || this.maximizedMonitor >= global.display.get_n_monitors()) return true;
+        const bounds = global.display.get_monitor_geometry(this.maximizedMonitor);
+        const rect = info.new_rect;
+        const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+        return cx < bounds.x || cx >= bounds.x + bounds.width ||
+            cy < bounds.y || cy >= bounds.y + bounds.height;
+    }
+
 });
 
 export class MosaicConstraintManager {
@@ -69,6 +89,23 @@ export class MosaicConstraintManager {
         } finally {
             constraint.armed = null;
         }
+    }
+
+    setMaximizedRegion(window, region) {
+        if (!constraintSupported()) return false;
+        const {constraint} = this._ensure(window);
+        constraint.maximizedMonitor = window.get_monitor();
+        constraint.maximizedRegion = {
+            x: Math.round(region.x), y: Math.round(region.y),
+            width: Math.max(1, Math.round(region.width)),
+            height: Math.max(1, Math.round(region.height)),
+        };
+        return true;
+    }
+
+    clearMaximizedRegion(window) {
+        const entry = this._entries.get(window.get_id());
+        if (entry) entry.constraint.maximizedRegion = null;
     }
 
     // Unarmed, Mutter clamps the move against the size the window still has, so near an edge the

@@ -28,10 +28,10 @@ export const TileZone = Object.freeze({
     TOP_RIGHT: 4,
     BOTTOM_LEFT: 5,
     BOTTOM_RIGHT: 6,
-    FULLSCREEN: 7
+    MAXIMIZE: 7
 });
 
-// Zones that have no side or half (NONE, FULLSCREEN) are absent on purpose; a
+// Zones that have no side or half (NONE, MAXIMIZE) are absent on purpose; a
 // lookup miss reads as undefined and never matches a real side.
 export const ZONE_SIDE = Object.freeze({
     [TileZone.LEFT_FULL]: 'left',
@@ -76,6 +76,7 @@ export const EDGE_TILING_THRESHOLD = 10;
 export const REFUSAL_SHAKE_MS = 300;
 
 export const POLL_INTERVAL_MS = 50;
+export const CONSTRAINED_RECONCILE_MAX_ATTEMPTS = 40; // 40 * 50ms = 2s; give up when a transaction stays busy
 export const DEBOUNCE_DELAY_MS = 500;
 export const RETILE_DELAY_MS = 100;
 export const GEOMETRY_CHECK_DELAY_MS = 10;
@@ -94,13 +95,11 @@ export const PIN_OVERFLOW_GRACE_MS = 300; // Overflow must survive this long bef
 export const ISRESIZING_FLAG_RESET_MS = 2;
 // Mutter can skip the size-changed confirmation on a fast maximize/unmaximize
 // toggle, so force the move after this long instead of leaving the window stuck.
-export const SACRED_RESTORE_SAFETY_TIMEOUT_MS = 1500;
 // New windows fire both window-created and window-added, which would otherwise
 // evaluate them twice. Skip a re-enqueue if we just evaluated this window.
 export const DUPLICATE_EVALUATION_WINDOW_MS = 300;
 // Wait this long after a maximize before isolating the window, so a quick
 // maximize/unmaximize toggle never even starts the move.
-export const SACRED_ENTER_DEBOUNCE_MS = 200;
 
 export const ANIMATION_DIFF_THRESHOLD = 10;
 
@@ -117,7 +116,7 @@ export const SLIDE_IN_DURATION_MS = 300;
 export const SLIDE_IN_FAILSAFE_MS = 1000;     // Re-check interval if a window's entrance never gets claimed
 export const QUEUE_PROCESS_DELAY_MS = 100;   // Delay between processing window opening queue items (Mutter settling)
 
-export const MINIATURE_TARGET_SIZE_PX = 256;  // Longest side of a miniaturized window
+export const MINIATURE_TARGET_SIZE_PX = 256 / 2;  // Longest side of a miniaturized window
 // With 2 the least recent window moves three times as fast along its axis as the most recent,
 // so it's the first to cross into a thumbnail.
 export const ALLOCATOR_MRU_RATE_SLOPE = 2;

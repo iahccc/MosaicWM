@@ -16,6 +16,7 @@ import { IS_MINIATURE } from './windowState.js';
 import { ComputedLayouts, MosaicModel } from './mosaicModel.js';
 import { MosaicConstraints } from './mosaicConstraint.js';
 import { isWindowAlive } from './liveness.js';
+import {TileLockLedger} from './tileLockLedger.js';
 import { afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow } from './timing.js';
 
 export const WindowHandler = GObject.registerClass({
@@ -24,7 +25,7 @@ export const WindowHandler = GObject.registerClass({
     _init(extension) {
         super._init();
         this._ext = extension;
-        this._workspaceLocks = new WeakMap();
+        this._locks = new TileLockLedger(extension._timeoutRegistry);
         this._driftChecksQueued = new Set();
 
         this._evaluationQueue = [];
@@ -33,9 +34,12 @@ export const WindowHandler = GObject.registerClass({
         this._overflowInProgress = false;
         this._windowSignals = new WeakMap(); // WeakMap so signal IDs are released when the window is GC'd
         this._readinessWaiters = new Set();
+        this._nativeReturns = new Map();
     }
 
     destroy() {
+        for (const window of this._nativeReturns.keys()) this._cancelNativeReturn(window);
+        this._locks.clear();
         for (const entry of this._evaluationQueue)
             WindowState.remove(entry.window, 'pendingInQueue');
         this._evaluationQueue = [];
@@ -97,28 +101,24 @@ export const WindowHandler = GObject.registerClass({
     // Reference-counted: overlapping tileWorkspaceWindows calls (e.g. drag-end
     // and resize-end firing close together) each hold their own depth, so the
     // workspace stays locked until every holder has unlocked.
-    lockWorkspace(workspace) {
-        if (!workspace) return;
-        const depth = (this._workspaceLocks.get(workspace) ?? 0) + 1;
-        this._workspaceLocks.set(workspace, depth);
-        Logger.log(`Workspace ${workspace.index()} LOCKED for tiling (depth=${depth})`);
+    lockWorkspace(workspace, fallbackDelayMs = 0) {
+        return this._locks.acquire(workspace, fallbackDelayMs);
     }
 
     unlockWorkspace(workspace) {
-        if (!workspace) return;
-        const depth = (this._workspaceLocks.get(workspace) ?? 0) - 1;
-        if (depth <= 0) {
-            this._workspaceLocks.delete(workspace);
-            Logger.log(`Workspace ${workspace.index()} UNLOCKED`);
-        } else {
-            this._workspaceLocks.set(workspace, depth);
-            Logger.log(`Workspace ${workspace.index()} unlock (depth=${depth}, still locked)`);
-        }
+        this._locks.releaseWorkspace(workspace);
     }
 
     isWorkspaceLocked(workspace) {
-        if (!workspace) return false;
-        return (this._workspaceLocks.get(workspace) ?? 0) > 0;
+        return this._locks.isLocked(workspace);
+    }
+
+    scheduleWorkspaceUnlock(token, delayMs, name) {
+        this._locks.defer(token, delayMs, name);
+    }
+
+    releaseTileLock(token) {
+        this._locks.release(token);
     }
 
     get isEvaluatingQueue() {
@@ -146,52 +146,22 @@ export const WindowHandler = GObject.registerClass({
         }));
 
         // Have two signals that fires when (un)maximize, so we coalesce it via idle.
-        let pendingMaximizeCheck = false;
-        ['notify::maximized-horizontally', 'notify::maximized-vertically'].forEach(signal => {
-            ids.push(window.connect(signal, (win) => {
-                if (pendingMaximizeCheck) return;
-                pendingMaximizeCheck = true;
-                this._timeoutRegistry.addIdle(() => {
-                    pendingMaximizeCheck = false;
-                    if (!isWindowAlive(win)) return GLib.SOURCE_REMOVE;
-
-                    // Entering/exiting sacred state is owned by resizeHandler, normally
-                    // driven by the WM size-change signal. This property notify is a
-                    // backup for apps where that signal doesn't fire reliably; calling
-                    // these twice for the same transition is safe (see resizeHandler.js).
-                    if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                        if (!WindowState.get(win, 'openedMaximized')) {
-                            this._ext.resizeHandler.tryEnterSacred(win);
-                        }
-                    } else if (WindowState.get(win, 'openedMaximized')) {
-                        Logger.log(`Window ${win.get_id()} born maximized - skipping sacred exit, treating as normal unmaximize`);
-                        WindowState.remove(win, 'openedMaximized');
-                        WindowState.remove(win, 'unmaximizing');
-                        WindowState.remove(win, 'isEnteringSacred');
-                        this._settleBornSacredExit(win, 'unmaximize');
-                    } else {
-                        this._ext.resizeHandler.tryExitSacred(win);
-                    }
-                    return GLib.SOURCE_REMOVE;
-                });
-            }));
-        });
-
-        // Detect Fullscreen changes, same backup pattern as maximize above.
-        ids.push(window.connect('notify::fullscreen', (win) => {
-            if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                if (!WindowState.get(win, 'openedMaximized')) {
-                    this._ext.resizeHandler.tryEnterSacred(win);
-                }
-            } else if (WindowState.get(win, 'openedMaximized')) {
-                Logger.log(`Window ${win.get_id()} born fullscreen - skipping sacred exit, treating as normal`);
-                WindowState.remove(win, 'openedMaximized');
-                WindowState.remove(win, 'unmaximizing');
-                WindowState.remove(win, 'isEnteringSacred');
-                this._settleBornSacredExit(win, 'unfullscreen');
-            } else {
-                this._ext.resizeHandler.tryExitSacred(win);
+        const nativeStateChanged = win => {
+            if (!isWindowAlive(win)) return;
+            if (win.is_maximized()) this._cancelNativeReturn(win);
+            this._ext.resizeHandler.revokeNormalResizeContract(win);
+            this.tilingManager.maximizedLayout.nativeStateChanged(win);
+        };
+        ids.push(window.connect('notify::maximized', nativeStateChanged));
+        ids.push(window.connect('notify::maximized-horizontally', nativeStateChanged));
+        ids.push(window.connect('notify::maximized-vertically', nativeStateChanged));
+        ids.push(window.connect('notify::fullscreen', win => {
+            this._ext.resizeHandler.revokeNormalResizeContract(win);
+            if (win.is_fullscreen()) {
+                this._cancelNativeReturn(win);
+                this._enterFullscreen(win, 'native', false);
             }
+            else this._leaveFullscreen(win);
         }));
 
         ids.push(window.connect('size-changed', (win) => {
@@ -212,6 +182,7 @@ export const WindowHandler = GObject.registerClass({
 
         this._windowSignals.set(window, ids);
 
+        if (window.is_fullscreen()) this._enterFullscreen(window, 'native', true);
         const currentExclusion = this.windowingManager.isExcluded(window);
         WindowState.set(window, 'previousExclusionState', currentExclusion);
 
@@ -221,7 +192,111 @@ export const WindowHandler = GObject.registerClass({
         }
     }
 
+    _enterFullscreen(window, source, born) {
+        if (!window || WindowState.get(window, WindowState.MOSAIC_FULLSCREEN)) return false;
+
+        const role = born ? 'born' : WindowState.get(window, IS_MINIATURE) ? 'miniature' : 'normal';
+
+        WindowState.set(window, WindowState.MOSAIC_FULLSCREEN, true);
+        WindowState.set(window, WindowState.MOSAIC_FULLSCREEN_KIND, { source, role });
+        this.tilingManager.maximizedLayout.forget(window);
+        this._ext.miniatureManager?.pauseForFullscreen(window);
+        this.revealPendingEntrance(window);
+        Logger.log(`[FULLSCREEN] ${window.get_id()} entered ${source} fullscreen from ${role}; workspace membership preserved`);
+        return true;
+    }
+    _leaveFullscreen(window) {
+        const state = WindowState.get(window, WindowState.MOSAIC_FULLSCREEN_KIND);
+        if (!WindowState.get(window, WindowState.MOSAIC_FULLSCREEN) || !state) return false;
+
+        WindowState.remove(window, WindowState.MOSAIC_FULLSCREEN);
+        WindowState.remove(window, WindowState.MOSAIC_FULLSCREEN_KIND);
+        this._ext.miniatureManager?.resumeFromFullscreen(window);
+
+        Logger.log(`[FULLSCREEN] ${window.get_id()} left ${state.source} fullscreen; restoring ${state.role} role in-place`);
+        this._restoreFullscreenRole(window, state.role);
+        return true;
+    }
+    _restoreFullscreenRole(window, role) {
+        if (window.is_maximized() || role === 'miniature') {
+            this.tilingManager.maximizedLayout.queue(window);
+            return;
+        }
+        this.settleReturnedWindow(window);
+    }
+
+    settleReturnedWindow(window, {admit = true} = {}) {
+        if (!isWindowAlive(window) || this.windowingManager.isExcluded(window)) return false;
+        const workspace = window.get_workspace();
+        const monitor = window.get_monitor();
+        if (!workspace || monitor < 0 || !this._ext.isMosaicEnabledForWorkspace(workspace)) return false;
+        if (this._nativeReturns.has(window)) return true;
+        if (window.get_compositor_private().__animationInfo) {
+            this._deferNativeReturn(window, workspace, monitor, admit);
+            return true;
+        }
+        this._settleReturnedWindow(window, workspace, monitor, admit);
+        return true;
+    }
+
+    // Native maximize notifications can precede both the client buffer and Shell's clone
+    // animation. Reserve the returning window's normal footprint so peers can transition
+    // immediately, while only this window's geometry and size learning wait for Shell.
+    _deferNativeReturn(window, workspace, monitor, admit) {
+        const size = WindowState.get(window, 'preferredSize') ??
+            WindowState.get(window, 'openingSize') ?? window.get_frame_rect();
+        const job = {id: null, size: {width: size.width, height: size.height}};
+        this._nativeReturns.set(window, job);
+        WindowState.set(window, WindowState.NATIVE_SIZE_RETURN, job);
+        job.id = this._timeoutRegistry.add(16, () => {
+            if (!isWindowAlive(window) || this.windowingManager.isExcluded(window)) {
+                this._finishNativeReturn(window, job);
+                return GLib.SOURCE_REMOVE;
+            }
+            if (window.is_maximized() || window.is_fullscreen()) {
+                this._finishNativeReturn(window, job);
+                this.tilingManager.maximizedLayout.queue(window);
+                return GLib.SOURCE_REMOVE;
+            }
+            if (window.get_compositor_private().__animationInfo) return GLib.SOURCE_CONTINUE;
+            this._finishNativeReturn(window, job);
+            // A newer focus/admission can have superseded the original restore request.
+            // Finish its geometry without taking ownership back from that window.
+            this.settleReturnedWindow(window, {admit: false});
+            return GLib.SOURCE_REMOVE;
+        }, 'windowHandler_nativeReturn');
+        this._settleReturnedWindow(window, workspace, monitor, admit);
+    }
+
+    _finishNativeReturn(window, job) {
+        if (this._nativeReturns.get(window) === job) this._nativeReturns.delete(window);
+        WindowState.removeIfCurrent(window, WindowState.NATIVE_SIZE_RETURN, job);
+    }
+
+    _cancelNativeReturn(window) {
+        const job = this._nativeReturns.get(window);
+        if (!job) return;
+        this._timeoutRegistry.remove(job.id);
+        this._finishNativeReturn(window, job);
+    }
+
+    _settleReturnedWindow(window, workspace, monitor, admit) {
+        const size = WindowState.get(window, 'preferredSize') ?? WindowState.get(window, 'openingSize');
+        if (size) {
+            const target = {...size};
+            WindowState.set(window, 'targetRestoredSize', target);
+            this._timeoutRegistry.add(constants.RESIZE_SETTLE_DELAY_MS, () => {
+                WindowState.removeIfCurrent(window, 'targetRestoredSize', target);
+                return GLib.SOURCE_REMOVE;
+            }, 'windowHandler_returnedSize');
+        }
+        if (admit) this.tilingManager.maximizedLayout.admit(window);
+        const reference = admit ? window : this.tilingManager.maximizedLayout.focusFor(workspace, monitor);
+        this.tilingManager.retileWithAllocation(workspace, monitor, reference, {keepOversized: true});
+    }
+
     disconnectWindowSignals(window) {
+        this._cancelNativeReturn(window);
         const ids = this._windowSignals.get(window);
         if (ids) {
             ids.forEach(id => window.disconnect(id));
@@ -229,7 +304,11 @@ export const WindowHandler = GObject.registerClass({
             Logger.log(`Disconnected signals for window ${window.get_id()}`);
         }
 
+        WindowState.remove(window, WindowState.MOSAIC_FULLSCREEN);
+        WindowState.remove(window, WindowState.MOSAIC_FULLSCREEN_KIND);
         ComputedLayouts.delete(window);
+        this.tilingManager.maximizedLayout.forget(window);
+        this.tilingManager.maximizedLayout.dropOrphan(window);
         MosaicConstraints.detach(window);
 
         // previousExclusionState stays: window-removed lands after this on destroy
@@ -256,7 +335,9 @@ export const WindowHandler = GObject.registerClass({
     // Miniatures are skipped since their frame is unscaled and would overwrite what the scale
     // is derived from.
     _learnFrame(win) {
-        if (WindowState.get(win, IS_MINIATURE)) return;
+        if (WindowState.get(win, IS_MINIATURE) || WindowState.get(win, WindowState.PENDING_MINIATURE) ||
+            WindowState.get(win, WindowState.NATIVE_SIZE_RETURN) ||
+            win.is_maximized() || this.windowingManager.isFullscreenLike(win)) return;
         const inFlight = MosaicConstraints.regionInFlight(win);
         if (inFlight) {
             MosaicModel.learn(win, { ...inFlight });
@@ -414,6 +495,7 @@ export const WindowHandler = GObject.registerClass({
         }
 
         if (isNowExcluded) {
+            this.tilingManager.maximizedLayout.forget(window);
             Logger.log(`Window ${windowId} became excluded; retiling without it`);
 
             // Exclusion arriving after opacity=0 was set (e.g. always-on-top
@@ -463,6 +545,7 @@ export const WindowHandler = GObject.registerClass({
         WindowState.set(window, 'leftMonitor', monitor);
         WindowState.set(window, 'leftMonitorAt', monotonicNow());
 
+        this.tilingManager.maximizedLayout.forget(window);
         this.windowingManager.invalidateWindowsCache();
 
         // Under a grab the drag passes own the layout; retiling here on top of them feeds
@@ -479,6 +562,7 @@ export const WindowHandler = GObject.registerClass({
 
     onWindowEnteredMonitor(monitor, window) {
         if (!this._windowSignals.has(window)) return;
+        this.tilingManager.maximizedLayout.forget(window);
 
         // A grab drag ends in stopDrag, which tiles the destination itself. Overview
         // drags, keyboard moves and monitor hotplug have no grab, so this is the only
@@ -811,18 +895,10 @@ export const WindowHandler = GObject.registerClass({
 
     // A sacred (maximized/fullscreen) arrival, or a normal one landing where a sacred window
     // already lives, gets its own workspace. {handled:true, result} when isolated.
-    async _ensureFitsSacred(window, workspace, monitor) {
-        const isIncomingSacred = this.windowingManager.isMaximizedOrFullscreen(window);
-        const hasExistingSacred = this.windowingManager.hasSacredWindow(workspace, monitor, window.get_id());
-        const workspaceWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !WindowState.get(w, 'pendingInQueue'));
-        const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
-
-        if (hasExistingSacred || (isIncomingSacred && otherWindows.length > 0)) {
-            Logger.log(`Sacred Isolation triggered (IncomingSacred: ${isIncomingSacred}, HasExistingSacred: ${hasExistingSacred}) - isolating`);
-            return { handled: true, result: await this.windowingManager.moveOversizedWindow(window) };
-        }
-        return { handled: false };
+    async _ensureFitsSacred(window, workspace, _monitor) {
+        if (this.windowingManager.isFullscreenLike(window)) return {handled: true, result: workspace};
+        if (this.tilingManager.maximizedLayout.admit(window)) return {handled: true, result: workspace};
+        return {handled: false};
     }
 
     _handleDnDArrival(window, workspace, monitor) {
@@ -1053,26 +1129,14 @@ export const WindowHandler = GObject.registerClass({
         }
     }
 
-    _handleSacredCreated(window, workspace, monitor) {
-        if (this._ext && !this._ext.isMosaicEnabledForWorkspace(workspace)) {
-            Logger.log('Sacred window in disabled mosaic workspace - skipping isolation');
-            return GLib.SOURCE_REMOVE;
-        }
-
-        this.windowingManager.invalidateWindowsCache();
-        const workspaceWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
-        const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
-
-        if (otherWindows.length > 0) {
-            // Isolating straight from here would race the queue's own sacred
-            // check and isolate twice, each pass creating its own workspace.
-            Logger.log('Opened sacred (Max/Full) in occupied workspace; queueing for isolation (SACRED)');
-            this.enqueueWindowForEvaluation(window, workspace, monitor);
-            return GLib.SOURCE_REMOVE;
-        }
-        Logger.log('Sacred window in empty workspace - keeping here');
+    _handleSacredCreated(window, workspace, _monitor) {
         WindowState.remove(window, 'arrivalPending');
-        this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
+        if (!this._ext.isMosaicEnabledForWorkspace(workspace)) return GLib.SOURCE_REMOVE;
+        if (window.is_fullscreen()) {
+            this._enterFullscreen(window, 'native', true);
+            return GLib.SOURCE_REMOVE;
+        }
+        this.tilingManager.maximizedLayout.admit(window);
         return GLib.SOURCE_REMOVE;
     }
 
