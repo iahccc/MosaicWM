@@ -606,6 +606,12 @@ export default class WindowMosaicExtension extends Extension {
                 // Exclusion can flip later (always-on-top toggled off, unstuck from all
                 // workspaces), and unmanaged has to fire regardless for cleanup either way,
                 // so an excluded window still needs to be wired up now.
+                //
+                // Sample the fullscreen role first: _captureBornFullscreen only runs from the
+                // created-window paths, so a window that was already fullscreen at enable time
+                // would have no role recorded and its later exit would hit _leaveFullscreen's
+                // guard, skipping the entire return-to-layout handoff.
+                this.windowHandler._sampleInitialWindowMode(window);
                 this.windowHandler.connectWindowSignals(window);
             }
         }
@@ -748,6 +754,12 @@ export default class WindowMosaicExtension extends Extension {
     }
 
     _onFocusWindowChanged() {
+        // MRU order *is* the focus history, so a focus change invalidates the cached one
+        // (getMRUOrder is versioned against this same cache). Before the early return below:
+        // losing focus is itself a change to that history, and leaving the old ordering cached
+        // makes getMRUOrder rank every window added since as coldest.
+        this.windowingManager.invalidateWindowsCache();
+
         const window = global.display.focus_window;
         if (!window) return;
 
@@ -1261,7 +1273,11 @@ export default class WindowMosaicExtension extends Extension {
             this._onOverviewHiddenId = 0;
         }
 
-        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+        // NORMAL_ALL, not NORMAL: connectWindowSignals wires up excluded windows too
+        // (skip-taskbar, always-on-top, transient), and those are exactly the ones NORMAL
+        // omits. Leaving them connected lets their handlers fire after the managers are
+        // nulled below, and skips MosaicModel.forget() for them.
+        const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null);
         allWindows.forEach(w => {
             if (this.windowHandler) this.windowHandler.disconnectWindowSignals(w);
         });

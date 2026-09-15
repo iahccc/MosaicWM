@@ -10,6 +10,10 @@ import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
 import Mosaic from '../extension/extension.js';
 import * as WindowState from '../extension/windowState.js';
 
+// Declared so test-headless.sh can skip this file rather than fail where firefox is not
+// installed (the CI image ships alacritty only).
+export const requiresBinary = 'firefox';
+
 const WAIT_MS = 15000;
 
 function assert(condition, message) {

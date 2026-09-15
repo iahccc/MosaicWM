@@ -37,17 +37,18 @@ jobs:
     container: fedora:44
     steps:
       - uses: actions/checkout@v4
-      - run: dnf install -y gcc pkgconf-pkg-config gobject-introspection-devel mutter-devel glib2-devel zip gnome-shell dbus-daemon mesa-dri-drivers alacritty
+      # firefox is here for test-firefox-miniature.js, which declares it as required: this job
+      # means to run every regression, so a missing binary must fail rather than be skipped.
+      - run: dnf install -y gcc pkgconf-pkg-config gobject-introspection-devel mutter-devel glib2-devel zip gnome-shell dbus-daemon mesa-dri-drivers alacritty firefox
       - run: bash scripts/build.sh -b
-      - run: bash scripts/test-headless.sh
+      # "all" enumerates scripts/test-*.js, so a new regression cannot be added without a
+      # runner. Naming three files here is what left test-constrained-model-slot,
+      # test-solo-monitor-sized-admission, test-firefox-miniature, test-reinclude-local and
+      # test-unmaximize-animation unreferenced.
+      #
+      # HEADLESS_REQUIRE_ALL turns a skipped regression into a failure: this job is the one
+      # place that is supposed to cover everything, and a silent skip is how coverage rots.
+      - run: bash scripts/test-headless.sh all
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-      - run: bash scripts/test-headless.sh test-miniature-restore.js
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-      - run: bash scripts/test-headless.sh test-maximized-admission-fit.js
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-      - run: bash scripts/test-headless.sh test-maximized-layout-queue.js
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
+          HEADLESS_REQUIRE_ALL: "1"

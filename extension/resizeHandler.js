@@ -35,6 +35,10 @@ export const ResizeHandler = GObject.registerClass({
         // intent. Keep one condition-driven reconcile per window instead of either dropping
         // the event or recursively invoking the solver inside the still-active transaction.
         this._constrainedReconciles = new Map();
+        // Per-window reconcile history, so the retry ceiling survives one queue entry.
+        this._constrainedReconcileBudgets = new Map();
+        // Reentrancy marker for the size-changed latch: only the outermost delivery may clear it.
+        this._inSizeChangedHandler = false;
     }
 
     get windowingManager() { return this._ext.windowingManager; }
@@ -319,6 +323,25 @@ export const ResizeHandler = GObject.registerClass({
     };
 
     onSizeChanged = (_, win) => {
+        // _sizeChanged is a global latch: onSizeChanged drops every event while it is set, and
+        // its helpers deliberately set it to swallow the configure echo their own animation
+        // provokes. Anything that throws between here and the helpers that clear it used to
+        // leave the latch stuck on, silently discarding the size events that drive every later
+        // retile. Reentrant deliveries are exempt: they are the echo, and the outer delivery
+        // owns the latch.
+        const reentrant = this._inSizeChangedHandler;
+        this._inSizeChangedHandler = true;
+        try {
+            this._handleSizeChangedEvent(win);
+        } catch (error) {
+            if (!reentrant) this._sizeChanged = false;
+            throw error;
+        } finally {
+            this._inSizeChangedHandler = reentrant;
+        }
+    };
+
+    _handleSizeChangedEvent(win) {
         const window = win.meta_window;
         // The latch is only false when no retile of ours is in flight; excluded windows never tile.
         if (this._sizeChanged || this.windowingManager.isExcluded(window)) return;
@@ -350,7 +373,7 @@ export const ResizeHandler = GObject.registerClass({
         if (this._shouldSkipRetileAfterResize(window, ctx)) return;
 
         this._retileAfterSizeChange(window);
-    };
+    }
 
     _consumeRoleOwnedSizeChange(window, roleOwnedAtEntry) {
         if (!roleOwnedAtEntry) return false;
@@ -435,9 +458,27 @@ export const ResizeHandler = GObject.registerClass({
         const id = window.get_id();
         if (this._constrainedReconciles.has(id)) return;
 
-        const pending = {window, timeoutId: null};
+        // The retry budget has to outlive one queue entry. The entry is deleted the moment a
+        // reconcile is actually issued, so a client that keeps publishing a frame away from the
+        // committed slot would otherwise start a fresh budget every cycle and never reach the
+        // give-up branch -- an endless ~4Hz stream of configure + ease re-assertions instead of
+        // the intended 2s ceiling. Carry the count across entries for the same window, and
+        // expire it once the window has stayed quiet for a whole budget.
+        //
+        // The count only ever grows in _scheduleConstrainedReconcileRetry, so that is where the
+        // budget is written; snapshotting it here would always read the zero this line stores.
+        const budget = this._constrainedReconcileBudgets.get(id);
+        const kept = this._budgetIsFresh(budget) ? budget.attempts : 0;
+
+        const pending = {window, timeoutId: null, attempts: kept};
+        this._constrainedReconcileBudgets.set(id, {attempts: kept, updatedAt: monotonicNow()});
         this._constrainedReconciles.set(id, pending);
         this._tryConstrainedReconcile(pending);
+    }
+
+    _budgetIsFresh(budget) {
+        return !!budget && monotonicNow() - budget.updatedAt <=
+            constants.CONSTRAINED_RECONCILE_MAX_ATTEMPTS * constants.POLL_INTERVAL_MS;
     }
 
     _tryConstrainedReconcile(pending) {
@@ -453,6 +494,8 @@ export const ResizeHandler = GObject.registerClass({
         const slot = MosaicModel.normalSlotFor(window);
         const frame = window.get_frame_rect();
         if (!slot || !this._sizeDiffers(frame, slot)) {
+            // Reconciled: the window held the committed slot, so the history is spent
+            // (_cancelConstrainedReconcile drops both the entry and its budget).
             this._cancelConstrainedReconcile(window);
             return;
         }
@@ -470,6 +513,8 @@ export const ResizeHandler = GObject.registerClass({
         Logger.log(`[MODEL RECONCILE] Reasserting committed slot for ${id}: live=${frame.width}x${frame.height} → ${slot.width}x${slot.height}`);
 
         // Suppress a synchronous configure echo from recursively entering this same handler.
+        // The latch must be restored however animateWindow ends: a throw would otherwise leave
+        // it set and onSizeChanged drops every later size event on the floor.
         this._sizeChanged = true;
         try {
             this.animationsManager.animateWindow(window, slot, {subtle: true});
@@ -513,9 +558,15 @@ export const ResizeHandler = GObject.registerClass({
         if (pending.timeoutId || !this._timeoutRegistry) return;
 
         pending.attempts = (pending.attempts ?? 0) + 1;
+        // Written where it grows, so the count survives the entry being retired and the next
+        // drift starts from where this one left off.
+        const id = pending.window?.get_id?.();
+        if (id !== undefined)
+            this._constrainedReconcileBudgets.set(id, {attempts: pending.attempts, updatedAt: monotonicNow()});
+
         if (pending.attempts > constants.CONSTRAINED_RECONCILE_MAX_ATTEMPTS) {
-            const id = isWindowAlive(pending.window) ? pending.window.get_id() : '?';
-            Logger.log(`[MODEL RECONCILE] Giving up on constrained reconcile for ${id} after ${pending.attempts} attempts`);
+            const label = isWindowAlive(pending.window) ? id : '?';
+            Logger.log(`[MODEL RECONCILE] Giving up on constrained reconcile for ${label} after ${pending.attempts} attempts`);
             this._cancelConstrainedReconcile(pending.window);
             return;
         }
@@ -527,9 +578,12 @@ export const ResizeHandler = GObject.registerClass({
         }, 'resizeHandler_constrainedModelReconcile');
     }
 
+    // Give-up and teardown path for one window: drops the queue entry and its retry history, so
+    // a closed or resolved window cannot leave a key behind for the session.
     _cancelConstrainedReconcile(window) {
         const id = window?.get_id?.();
         if (id === undefined) return;
+        this._constrainedReconcileBudgets?.delete(id);
         const pending = this._constrainedReconciles?.get(id);
         if (!pending) return;
         if (pending.timeoutId && this._timeoutRegistry)
@@ -825,6 +879,7 @@ export const ResizeHandler = GObject.registerClass({
                 this._timeoutRegistry.remove(pending.timeoutId);
         }
         this._constrainedReconciles?.clear();
+        this._constrainedReconcileBudgets?.clear();
         if (this._resizeDebounceTimeout) {
             this._timeoutRegistry.remove(this._resizeDebounceTimeout);
             this._resizeDebounceTimeout = null;

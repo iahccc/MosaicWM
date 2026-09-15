@@ -17,6 +17,13 @@ function copyRect(rect) {
     return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
 }
 
+// Scope follows the caller. An explicit workspace/monitor is authoritative *including when it is
+// null*: a caller that could not resolve one must not leave the entry pointing at wherever the
+// window used to be, because entryMatchesWindowScope demands an exact workspace and monitor
+// match, so a stale scope silently turns every later lookup into a miss (which is how a
+// constrained window stops being reconciled). Only an omitted argument (undefined) means "leave
+// the stored scope alone" -- the drag path in _applyDragLayoutMiniature relies on that, since it
+// has no workspace of its own to report.
 function entryFor(window, workspace, monitor) {
     const id = idOf(window);
     let entry = _entries.get(id);
@@ -26,10 +33,20 @@ function entryFor(window, workspace, monitor) {
     } else {
         entry.window = window;
     }
-    entry.workspace = workspace ?? entry.workspace ?? null;
-    entry.workspaceIndex = workspace?.index?.() ?? entry.workspaceIndex ?? null;
-    entry.monitor = monitor ?? entry.monitor ?? null;
+    applyScope(entry, workspace, monitor);
     return entry;
+}
+
+// undefined keeps what is stored, anything else (including null) replaces it. See entryFor.
+function applyScope(entry, workspace, monitor) {
+    if (workspace !== undefined) {
+        entry.workspace = workspace;
+        entry.workspaceIndex = workspace?.index?.() ?? null;
+    } else {
+        entry.workspace ??= null;
+        entry.workspaceIndex ??= null;
+    }
+    entry.monitor = monitor === undefined ? entry.monitor ?? null : monitor;
 }
 
 function entryWorkspaceMatches(entry, workspace) {
@@ -76,6 +93,11 @@ export const MosaicModel = {
         entryFor(window, workspace, monitor).presentationSlot = copyRect(slot);
     },
 
+    // Read-only view for the normal (layout intent) geometry. The returned object IS the
+    // stored slot, so a caller must not write to it: the tile pass mutates the sizes it is
+    // handed (see _updateMiniatureDescriptors and _resolveExistingDescriptorSizes), and the
+    // auto-restore probe simulates layouts, so both copy before writing and the model stays
+    // the durable intent they read from. Copy where a size may be written back.
     normalSlotFor(window) {
         const id = idOf(window);
         if (id === undefined) return null;
@@ -84,6 +106,9 @@ export const MosaicModel = {
         return entry.normalSlot ?? null;
     },
 
+    // Same contract as normalSlotFor: the returned object is the stored slot, not a copy.
+    // The fallback keeps a presentation-only consumer working for a window whose role has not
+    // produced a presentation slot yet.
     presentationSlotFor(window) {
         const id = idOf(window);
         if (id === undefined) return null;

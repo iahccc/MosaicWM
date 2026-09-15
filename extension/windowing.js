@@ -35,6 +35,10 @@ export const WindowingManager = GObject.registerClass({
         // Cache for getMonitorWorkspaceWindows; invalidated at start of each tiling operation
         // WeakMap<Workspace, Map<String, Window[]>>
         this._windowsCache = new WeakMap();
+        // Same versioned cache for getMRUOrder, keyed per workspace: WindowDescriptor ranking,
+        // MaximizedLayout._windows and the miniature/sacrifice rankers all ask for it, often
+        // several times inside one pass.
+        this._mruCache = new WeakMap();
     }
 
     setEdgeTilingManager(manager) {
@@ -133,10 +137,24 @@ export const WindowingManager = GObject.registerClass({
 
     // Always pass a workspace: the null path drops Mutter's real MRU list and
     // falls back to sorting by the coarser user_time.
+    //
+    // Cached against the same _cacheVersion as getMonitorWorkspaceWindows. A single tile pass
+    // used to reach this through MaximizedLayout._windows, the reconcile preflight and the
+    // miniature/sacrifice rankers often enough that the uncached get_tab_list round trip alone
+    // dominated the pass. invalidateWindowsCache() is already called at the top of every pass
+    // and on every focus/monitor change, so the version is the freshness contract.
     getMRUOrder(workspace) {
+        if (!workspace) return new Map();
+
+        const cached = this._mruCache.get(workspace);
+        if (cached && cached.version === this._cacheVersion) {
+            return cached.order;
+        }
+
         const order = new Map();
         global.display.get_tab_list(Meta.TabList.NORMAL, workspace)
             .forEach((w, i) => order.set(w.get_id(), i));
+        this._mruCache.set(workspace, {version: this._cacheVersion, order});
         return order;
     }
 
@@ -685,5 +703,6 @@ export const WindowingManager = GObject.registerClass({
         this._overflowStartCallback = null;
         this._overflowEndCallback = null;
         this._windowsCache = new WeakMap();
+        this._mruCache = new WeakMap();
     }
 });

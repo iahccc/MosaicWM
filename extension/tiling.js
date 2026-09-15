@@ -36,6 +36,12 @@ const GROUP_STABILITY_WEIGHT = 150;
 // measured miniature-between-two-columns scene flips at 0.25, so this keeps a margin over it.
 const HOLLOW_CENTER_WEIGHT = 0.3;
 
+// Backstop for a tile pass's workspace lock: the ledger entry is registered when the lock is
+// taken, and this is how long it may survive if the pass never reaches any release path at
+// all (an unguarded caller throwing, a signal handler dying mid-pass). Comfortably past the
+// deferred unlock (ANIMATION_DURATION_MS + 100) so it never races the normal release.
+const TILE_LOCK_FALLBACK_MS = constants.ANIMATION_DURATION_MS + 500;
+
 // Every ordered composition of n into 1..n groups (n=3 gives [3],[2,1],[1,2],[1,1,1]).
 // A lazy generator on purpose: the count is 2^(n-1), so callers iterate under a time
 // budget and stop early instead of materializing all of it for a huge window count.
@@ -135,6 +141,10 @@ export const TilingManager = GObject.registerClass({
         // Swap/reorder operations live per workspace, keyed by Meta.Workspace via WeakMap
         // to avoid monkey-patching native GObjects (same reason windowState.js exists).
         this._workspaceSwaps = new WeakMap();
+
+        // The workspace lock this pass owns, so every release path hands back the lock it
+        // actually took (nested per-monitor passes swap it around the recursion).
+        this._tileLockToken = null;
     }
 
     withSmartResizeBlock(callback) {
@@ -558,17 +568,28 @@ export const TilingManager = GObject.registerClass({
 
     _applyDragLayoutMiniature(window, pos) {
         const actor = window.get_compositor_private();
-        if (actor && !actor.is_destroyed()) {
-            const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
-            const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-            const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-            animateMiniatureToTarget(actor, window, sc, extL, extT, pos.x, pos.y,
-                constants.ANIMATION_DURATION_MS);
-            WindowState.get(window, MINIATURE_OVERLAY)?.animateToLayout(constants.ANIMATION_DURATION_MS);
-        }
-        // Dragging a miniature changes only its presentation; its normal restore geometry stays intact.
+        if (actor && !actor.is_destroyed())
+            this._animateDraggedMiniature(window, actor, pos);
+
+        // Dragging a miniature changes only its presentation; its normal restore geometry stays
+        // intact.
+        //
+        // Unknown scope must mean "leave what is stored": get_workspace() is null for the
+        // windows this codebase documents as workspace-less (on-all-workspaces, secondary
+        // monitor under workspaces-only-on-primary), and the model reads an explicit null as
+        // "replace the stored scope". Replacing it with null would make every later lookup miss,
+        // which is how a constrained window stops being reconciled. Hence `?? undefined`.
         MosaicModel.setPresentationSlot(window, {x: pos.x, y: pos.y, width: pos.width, height: pos.height},
-            window.get_workspace?.(), window.get_monitor?.());
+            window.get_workspace?.() ?? undefined, window.get_monitor?.() ?? undefined);
+    }
+
+    _animateDraggedMiniature(window, actor, pos) {
+        const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
+        const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+        const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+        animateMiniatureToTarget(actor, window, sc, extL, extT, pos.x, pos.y,
+            constants.ANIMATION_DURATION_MS);
+        WindowState.get(window, MINIATURE_OVERLAY)?.animateToLayout(constants.ANIMATION_DURATION_MS);
     }
 
     _applyDragLayoutWindow(window, pos) {
@@ -2489,11 +2510,15 @@ export const TilingManager = GObject.registerClass({
 
     // Release the workspace lock after move_resize's signals have likely fired (delay matches
     // the animation). No registry means the extension is disabling, so unlock immediately.
+    // Converts this pass's ledger entry; it never creates one, because lockWorkspace already
+    // registered it the moment the lock was taken.
     _scheduleWorkspaceUnlock(workspace) {
         if (!(this._extension && this._extension.windowHandler)) return;
 
+        const token = this._tileLockToken;
+        if (!token || token.workspace !== workspace) return;
         this._extension.windowHandler.scheduleWorkspaceUnlock(
-            workspace, constants.ANIMATION_DURATION_MS + 100, 'unlockWorkspace');
+            token, constants.ANIMATION_DURATION_MS + 100, 'unlockWorkspace');
     }
 
     cascadeWorkspaceWindows(workspace) {
@@ -2599,9 +2624,9 @@ export const TilingManager = GObject.registerClass({
     // Releases a lock acquired by tileWorkspaceWindows for paths that bail out
     // before reaching _animateTileLayout (which normally owns the deferred unlock).
     _unlockWorkspaceEarlyReturn(workspace) {
-        if (this._extension && this._extension.windowHandler) {
-            this._extension.windowHandler.unlockWorkspace(workspace);
-        }
+        const token = this._tileLockToken;
+        if (!token || token.workspace !== workspace) return;
+        this._extension?.windowHandler?.releaseTileLock(token);
     }
 
     // Tiling is deliberately workspace-local. A reference can tell the solver which window
@@ -2775,8 +2800,9 @@ export const TilingManager = GObject.registerClass({
         return { stop: true };
     }
 
-    // No monitor and no reference means "tile the whole workspace": recurse once per monitor,
-    // each handling its own lock, then release this workspace's lock after they settle.
+    // No monitor and no reference means "tile the whole workspace": recurse once per monitor.
+    // Each recursive pass takes its own lock and releases it in its own finally; this caller's
+    // lock is held by _runTileWorkspacePass for the whole dispatch.
     _tileEachMonitor(workspace, keep_oversized_windows, excludeFromTiling, dryRun) {
         const nMonitors = global.display.get_n_monitors();
         if (nMonitors > 1) {
@@ -2785,11 +2811,6 @@ export const TilingManager = GObject.registerClass({
         for (let m = 0; m < nMonitors; m++) {
             this.tileWorkspaceWindows(workspace, null, m, keep_oversized_windows, excludeFromTiling, dryRun, true);
         }
-
-        if (!(this._extension && this._extension.windowHandler)) return;
-        // No registry means the extension is likely disabling, so unlock immediately.
-        this._extension.windowHandler.scheduleWorkspaceUnlock(
-            workspace, constants.ANIMATION_DURATION_MS + 50, 'unlockWorkspaceRecursive');
     }
 
     tileWorkspaceWindows(workspace, reference_meta_window, _monitor, keep_oversized_windows = false, excludeFromTiling = false, dryRun = false, isRecursive = false) {
@@ -2830,18 +2851,43 @@ export const TilingManager = GObject.registerClass({
     }
 
     _runTileWorkspacePass(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling, dryRun, isRecursive) {
-
         Logger.log(`tileWorkspaceWindows: Starting for workspace ${workspace.index()} (isRecursive=${isRecursive})`);
 
-        const opened = this._openTilePass(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling, dryRun, isRecursive);
-        if (opened.done) return opened.result;
-        _monitor = opened.monitor;
+        // LOCK: Prevent spurious overflow detection during tiling shifts.
+        //
+        // Taken here, before anything else in the pass, and released in the finally below.
+        // lockWorkspace registers the ledger entry as it takes the lock, so the exception net
+        // has something to reclaim no matter how far the pass got: the previous arrangement
+        // only registered at the deferred unlock at the very end of positioning, so a throw
+        // anywhere between left the workspace locked at depth 1 forever and silently disabled
+        // constrained reconciliation for it.
+        //
+        // isRecursive (the per-monitor dispatch) still takes its own lock, so
+        // _unlockWorkspaceEarlyReturn's ownership check must see the innermost pass's token;
+        // save and restore it around the recursion.
+        const outerToken = this._tileLockToken;
+        const token = this._extension?.windowHandler?.lockWorkspace(
+            workspace, TILE_LOCK_FALLBACK_MS) ?? null;
+        this._tileLockToken = token;
 
-        const ctx = this._buildTileContext(workspace, reference_meta_window, _monitor, excludeFromTiling);
-        if (ctx.done) return ctx.result;
-        return this._executeTilePass(
-            workspace, reference_meta_window, keep_oversized_windows,
-            dryRun, isRecursive, ctx);
+        try {
+            const opened = this._openTilePass(
+                workspace, reference_meta_window, _monitor,
+                keep_oversized_windows, excludeFromTiling, dryRun, isRecursive);
+            if (opened.done) return opened.result;
+            _monitor = opened.monitor;
+
+            const ctx = this._buildTileContext(workspace, reference_meta_window, _monitor, excludeFromTiling);
+            if (ctx.done) return ctx.result;
+            return this._executeTilePass(
+                workspace, reference_meta_window, keep_oversized_windows,
+                dryRun, isRecursive, ctx);
+        } finally {
+            this._tileLockToken = outerToken;
+            // No-op when the pass already handed the lock to the deferred unlock, the early
+            // return, or the abort path; the ledger entry can only be released once.
+            this._extension?.windowHandler?.releaseTileLock(token);
+        }
     }
 
     _executeTilePass(workspace, referenceMetaWindow, keepOversizedWindows, dryRun, isRecursive, ctx) {
@@ -2935,20 +2981,17 @@ export const TilingManager = GObject.registerClass({
         return this._miniatureTargetSize(window.get_workspace?.(), window.get_monitor?.());
     }
 
-    // destroyMasks + lock, then resolve the target monitor (dispatching per-monitor when none given).
+    // destroyMasks, then resolve the target monitor (dispatching per-monitor when none given).
+    // The workspace lock is already held by _runTileWorkspacePass.
     // Returns {done, result} to short-circuit, else {done:false, monitor}.
     _openTilePass(workspace, reference_meta_window, _monitor, keep_oversized_windows, excludeFromTiling, dryRun, isRecursive) {
         if (!isRecursive && !dryRun) {
             this.destroyMasks();
         }
 
-        // LOCK: Prevent spurious overflow detection during tiling shifts
-        if (this._extension && this._extension.windowHandler) {
-            this._extension.windowHandler.lockWorkspace(workspace);
-        }
-
         if (_monitor === null || _monitor === undefined) {
             if (!reference_meta_window) {
+                // Each per-monitor pass takes its own lock; this one is released by our finally.
                 this._tileEachMonitor(workspace, keep_oversized_windows, excludeFromTiling, dryRun);
                 return { done: true, result: { overflow: false, layout: null } };
             }
@@ -3565,7 +3608,7 @@ export const TilingManager = GObject.registerClass({
         const preferredSim = buildSim(1.0);
         const result = this._tile(preferredSim, workArea, true);
         Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()}, sim=${preferredSim.map(s => `${s.id}:${s.width}x${s.height}`).join(', ')}, overflow=${result.overflow}`);
-        if (!result.overflow) return true;
+        if (this._restoreSimulationAccepts(result, workArea)) return true;
 
         // Mid-grab a shrink-assisted fit flaps: the next drag event overflows it
         // again and re-minis the window we just restored, so require a full-size fit
@@ -3574,7 +3617,7 @@ export const TilingManager = GObject.registerClass({
             return false;
         }
 
-        if (this._tile(buildSim(0.0), workArea, true).overflow) {
+        if (!this._restoreSimulationAccepts(this._tile(buildSim(0.0), workArea, true), workArea)) {
             Logger.log(`canRestoreMiniature: candidate=${candidateMini.get_id()} doesn't fit even at minimum sizes`);
             return !requireStableNormal && this._canRestoreByMiniaturizingSiblings(
                 candidateMini, descriptors, buildSim(0.0), workArea, resizingWindowId);
@@ -3591,29 +3634,37 @@ export const TilingManager = GObject.registerClass({
             candidateMini, descriptors, buildSim, sizeAt, workArea);
     }
 
-    // The tile pass refuses a layout whose computed rects overlap or leave the work area
-    // (_tileGeometryIsValid), but the integer solver's own overflow flag does not catch every
-    // such case. Auto-restore asked only the solver, so it could commit to bringing a window
-    // back that the very next pass threw away again — the restore/miniaturize ping-pong that
-    // used to overflow the stack. Probe with the same validity rule the pass applies.
+    // One rule for every restore probe and for the pass itself: the solver must not report
+    // overflow AND the rects must be legal. The solver's flag alone is not enough -- _layoutRect
+    // clamps each rect to the work area, so a shrunken layout can report a fit while two rects
+    // land on the same clamped position. The pass rejects that (see the gate on 'workspace
+    // tile'), so a probe that accepts it would approve a restore the next pass throws away:
+    // restore, reject, miniaturize, repeat.
+    _restoreSimulationAccepts(tile, workArea) {
+        return !tile.overflow && this._tileGeometryIsValid(tile, workArea, 'restore simulation');
+    }
+
+    // The solver's fit and the tile pass's geometry validation can disagree. A restore
+    // picked on the solver alone is undone by the very next pass, which is what fed the
+    // restore/miniaturize loop; only start a restore this pass can actually keep.
     canRestoreMiniatureAtPreferredFit(candidateMini, remainingWindows, workArea) {
         if (!candidateMini || !workArea || !remainingWindows?.length) return false;
 
-        const descriptors = remainingWindows.map(w => {
-            const current = this._restoreSimulationCurrentSize(w, candidateMini);
-            const fixed = w !== candidateMini &&
-                (WindowState.get(w, IS_MINIATURE) || WindowState.get(w, PENDING_MINIATURE));
-            return { window: w, current, resizable: !fixed };
-        });
+        // Sized through the same helper the other probe uses, so both simulate the same
+        // window set: a miniature's packed size comes from miniatureSizeForSource for the
+        // current focus profile, which is what the pass will pack, not from a stale slot.
+        const descriptors = remainingWindows.map(w => ({
+            window: w,
+            current: this._restoreSimulationCurrentSize(w, candidateMini),
+        }));
 
         const simulated = descriptors.map(d => ({
             id: d.window.get_id(),
             width: d.current.width,
             height: d.current.height,
         }));
-        const tile = this._tile(simulated, workArea, true);
-        if (tile.overflow) return false;
-        if (this._tileGeometryIsValid(tile, workArea, 'auto restore')) return true;
+        if (this._restoreSimulationAccepts(this._tile(simulated, workArea, true), workArea))
+            return true;
 
         Logger.log(`canRestoreMiniatureAtPreferredFit: candidate=${candidateMini.get_id()} solver accepted a layout the pass would reject; keeping it miniature`);
         return false;
@@ -3659,10 +3710,14 @@ export const TilingManager = GObject.registerClass({
             const miniatureSize = this._restoreSimulationMiniatureSize(window);
             if (miniatureSize) return miniatureSize;
         }
-        const preferred = WindowState.get(window, 'preferredSize') ?? WindowState.get(window, 'openingSize');
-        if (preferred) return {width: preferred.width, height: preferred.height};
-        const frame = window.get_frame_rect();
-        return {width: frame.width, height: frame.height};
+
+        // The probe must pack the size the pass will actually pack. A window that has ever
+        // answered a Mosaic resize is isConstrainedByMosaic with a committed model slot, and
+        // the pass sizes that window from the committed slot, not from preferredSize. Probing
+        // with the smaller preferred size would approve a restore the pass then rejects,
+        // re-miniaturizing the window it just brought back.
+        const current = window.get_frame_rect();
+        return descriptorNormalSize(window, current, MosaicModel.normalSlotFor(window));
     }
 
     _restoreSimulationMiniatureSize(window) {
@@ -3675,10 +3730,15 @@ export const TilingManager = GObject.registerClass({
     }
 
     _wouldStayMiniAtBestFit(candidateMini, descriptors, buildSim, sizeAt, workArea) {
+        // Same rule as every other probe: the best-fit scale must produce a layout the pass
+        // will accept, not merely one the solver does not flag as overflowing.
+        const accepts = simulated => this._restoreSimulationAccepts(
+            this._tile(simulated, workArea, true), workArea);
+
         let lo = 0.0, hi = 1.0;
         for (let i = 0; i < 15; i++) {
             const mid = (lo + hi) / 2;
-            if (!this._tile(buildSim(mid), workArea, true).overflow) lo = mid;
+            if (accepts(buildSim(mid))) lo = mid;
             else hi = mid;
         }
 
@@ -3858,6 +3918,12 @@ export const TilingManager = GObject.registerClass({
                 };
             });
 
+            // One predicate for the whole search, and it is the one the pass enforces: the
+            // solver's overflow flag AND the rect rule. Cheapening the search by dropping the
+            // rect rule and validating only the winner is not equivalent -- the search would
+            // then commit to a scale the pass rejects, and the sacrifice loop mutates
+            // windowData, so re-running it under a second predicate cannot reproduce the layout
+            // the first predicate measured.
             const solveSimulated = simulated => this._smartResizeRailSolution(
                 simulated, workArea);
             const fitsSimulated = simulated => !!solveSimulated(simulated);
@@ -3874,7 +3940,7 @@ export const TilingManager = GObject.registerClass({
                     workspace, focusedWindowOverride, resizingWindowId);
 
                 if (!fitsSimulated(buildSimulated(0.0))) {
-                    Logger.log('[SMART RESIZE] Still overflow after miniaturization, applying overflow logic');
+                    Logger.log('[SMART RESIZE] Still no valid layout after miniaturization (overflow or rect rule), applying overflow logic');
                     return { success: false, tileInfo: null, pendingWindows: [] };
                 }
             }
@@ -3884,12 +3950,31 @@ export const TilingManager = GObject.registerClass({
             lo = this._miniaturizeBelowThreshold(
                 allWindows, allResizable, windowData, buildSimulated, fitsSimulated,
                 resizeArea, workspace, focusedWindowOverride, resizingWindowId, lo);
+            // Bound once: the predicate already ran the geometry check and a full layout
+            // search on exactly these sizes, so re-deriving them would pay for both twice.
             const finalSizes = buildSimulated(lo);
             return this._finalizeSmartResizePlan(
-                finalSizes, windowData, solveSimulated(finalSizes));
+                finalSizes, windowData, solveSimulated(finalSizes), workArea);
         } finally {
             this._isSmartResizingBlocked = false;
         }
+    }
+
+    // The predicate is the pass's own rule: solver overflow AND rect geometry. Running
+    // _tileGeometryIsValid per probe costs an O(n^2) pairwise scan, but the alternative is a
+    // search that optimises against a weaker rule and then commits a layout the pass throws
+    // away, so the scan stays here.
+    _smartResizeRailSolution(simulated, workArea) {
+        const tile = this._tile(simulated, workArea, true);
+        if (tile.overflow || !this._tileGeometryIsValid(tile, workArea, 'smart resize'))
+            return null;
+        return {payload: tile};
+    }
+
+    // Re-checked on the committed plan, the only path that reaches _applyFitResults. The
+    // natural-fit early return above commits nothing, so an abort here leaves no dirty state.
+    _smartResizePlanIsValid(tile, workArea) {
+        return !!tile && this._tileGeometryIsValid(tile, workArea, 'smart resize');
     }
 
     _prepareSmartResizeContext(newWindow, windows, workArea, workspace, resizingWindowId) {
@@ -3907,9 +3992,16 @@ export const TilingManager = GObject.registerClass({
         return {resizeArea: workArea, ...participants};
     }
 
-    _finalizeSmartResizePlan(finalSizes, windowData, tileInfo) {
+    _finalizeSmartResizePlan(finalSizes, windowData, tileInfo, workArea) {
         if (!tileInfo) {
             Logger.log('[SMART RESIZE] Final geometry validation failed; discarding tentative miniature/resize plan');
+            return {success: false, tileInfo: null, pendingWindows: []};
+        }
+
+        // The probe enforces the rect rule, so this is a re-assertion rather than a new gate;
+        // it is kept because this is the only frame that mutates state.
+        if (!this._smartResizePlanIsValid(tileInfo.payload, workArea)) {
+            Logger.log('[SMART RESIZE] Winning layout failed rect validation; treating as no fit');
             return {success: false, tileInfo: null, pendingWindows: []};
         }
 
@@ -3917,13 +4009,6 @@ export const TilingManager = GObject.registerClass({
         this._scheduleGrowSettle(grownWindows);
         Logger.log(`[TRYFIT] Returning pendingWindows len=${pendingWindows.length}`);
         return {success: true, tileInfo, pendingWindows};
-    }
-
-    _smartResizeRailSolution(simulated, workArea) {
-        const tile = this._tile(simulated, workArea, true);
-        if (tile.overflow || !this._tileGeometryIsValid(tile, workArea, 'smart resize'))
-            return null;
-        return {payload: tile};
     }
 
     _isUninitializedForResize(w, newWindow) {
@@ -3936,14 +4021,14 @@ export const TilingManager = GObject.registerClass({
 
     // One participant's descriptor, or null to skip it. preferredSize is the ceiling for the
     // deterministic binary search.
-    _classifyResizeParticipant(w, newWindow, resizingWindowId) {
+    _classifyResizeParticipant(w, newWindow, resizingWindowId, miniatureTargetSize) {
         // get_frame_rect on a disposed MetaWindow segfaults libmutter.
         if (!isWindowAlive(w)) {
             Logger.log(`[SMART RESIZE] Skipping destroyed window ${w?.get_id?.() ?? '?'}`);
             return null;
         }
 
-        const fixedMini = this._fixedMiniatureParticipant(w);
+        const fixedMini = this._fixedMiniatureParticipant(w, miniatureTargetSize);
         if (fixedMini !== undefined) return fixedMini;
 
         if (this._isUninitializedForResize(w, newWindow)) {
@@ -3963,12 +4048,15 @@ export const TilingManager = GObject.registerClass({
     // will actually pack (the descriptor rewrite uses the same target size).
     // This must precede the uninitialized check, since minis never get isConstrainedByMosaic
     // and may lack preferredSize, so they'd be filtered out. undefined means "not a miniature".
-    _fixedMiniatureParticipant(w) {
+    // targetSize is resolved once per collection: asking per window lands in
+    // MaximizedLayout.targetSize -> focusFor, whose fallback re-queries and re-sorts the whole
+    // workspace whenever the cached view focus is stale.
+    _fixedMiniatureParticipant(w, targetSize) {
         const pending = WindowState.get(w, PENDING_MINIATURE) ? this._pendingMiniatureEntry(w) : null;
         if (!pending && !WindowState.get(w, IS_MINIATURE))
             return undefined;
         const source = this._miniatureSourceSize(w, pending);
-        const ms = miniatureSizeForSource(source, this._miniatureTargetSizeForWindow(w));
+        const ms = miniatureSizeForSource(source, targetSize);
         return { window: w, current: ms, min: ms, isResizable: false };
     }
 
@@ -3981,10 +4069,15 @@ export const TilingManager = GObject.registerClass({
         const allResizable = [];
         const allWindows = [];
         const windowData = new Map();
+        // One lookup for the whole collection: the miniature target depends on the focus
+        // profile, which cannot change mid-collection.
+        const workspace = newWindow?.get_workspace?.();
+        const monitor = newWindow?.get_monitor?.();
+        const miniatureTargetSize = this._miniatureTargetSize(workspace, monitor);
 
         for (const w of [...windows, newWindow]) {
             if (allWindows.some(aw => aw.get_id() === w.get_id())) continue;
-            const data = this._classifyResizeParticipant(w, newWindow, resizingWindowId);
+            const data = this._classifyResizeParticipant(w, newWindow, resizingWindowId, miniatureTargetSize);
             if (!data) continue;
 
             allWindows.push(w);
@@ -4386,6 +4479,50 @@ export const TilingManager = GObject.registerClass({
     }
 });
 
+// Single source of truth for the size the tile pass gives a normal (non-miniature) window.
+// WindowDescriptor and the auto-restore probe both go through here, so they cannot disagree
+// about whether a layout the probe approved is the layout the pass will actually build.
+function descriptorNormalSize(metaWindow, frame, committedSlot) {
+    // Use smart resize target dims if move_resize_frame hasn't completed yet.
+    const smartResizeSize = WindowState.get(metaWindow, 'targetSmartResizeSize');
+    if (smartResizeSize) {
+        Logger.log(`[SIZE RULE] ${metaWindow.get_id()}: targetSmartResizeSize ${smartResizeSize.width}x${smartResizeSize.height}`);
+        return smartResizeSize;
+    }
+
+    // Restore-settle is only a bridge over stale live geometry. Once Smart Resize computes a
+    // newer target (notably while restoring a miniature), that target owns the size so we do
+    // not recreate overflow from the stale restored size.
+    const targetSize = WindowState.get(metaWindow, 'targetRestoredSize');
+    if (targetSize) {
+        Logger.log(`[SIZE RULE] ${metaWindow.get_id()}: targetRestoredSize ${targetSize.width}x${targetSize.height}`);
+        return targetSize;
+    }
+
+    if (WindowState.get(metaWindow, 'isConstrainedByMosaic') &&
+        committedSlot?.width > 0 && committedSlot?.height > 0) {
+        // targetSmartResizeSize is a configure-in-flight bridge, not the lifetime of Mosaic's
+        // size ownership. A Wayland client can acknowledge the requested size and then publish
+        // another startup/session-restore size a frame later (Firefox does this on cold
+        // launch). Once the first ack clears the bridge, falling back to that transient live
+        // frame makes a constrained window become its own layout input and can overwrite a
+        // still-valid miniature rail.
+        //
+        // isConstrainedByMosaic is the durable ownership bit, and MosaicModel is the durable
+        // committed geometry. Keep using the committed slot until an explicit user resize
+        // clears the constraint and teaches the model a new intent. Copied, because callers
+        // write back into the size they receive (see _updateMiniatureDescriptors) and
+        // MosaicModel.normalSlotFor hands out the model's own object.
+        Logger.log(`[SIZE RULE] ${metaWindow.get_id()}: constrained model slot ${committedSlot.width}x${committedSlot.height} (live=${frame.width}x${frame.height})`);
+        return {width: committedSlot.width, height: committedSlot.height};
+    }
+
+    return {
+        width: frame.width > 0 ? frame.width : 1,
+        height: frame.height > 0 ? frame.height : 1,
+    };
+}
+
 class WindowDescriptor {
     constructor(meta_window, index) {
         const frame = meta_window.get_frame_rect();
@@ -4403,51 +4540,12 @@ class WindowDescriptor {
             this.height = miniSize.height;
             Logger.log(`WindowDescriptor: Using miniatureSize ${this.width}x${this.height} for ${meta_window.get_id()}`);
         } else {
-            const size = this._normalSize(meta_window, frame, committedSlot);
+            const size = descriptorNormalSize(meta_window, frame, committedSlot);
             this.width = size.width;
             this.height = size.height;
         }
 
         this.id = meta_window.get_id();
-    }
-
-    _normalSize(meta_window, frame, committedSlot) {
-        // Use smart resize target dims if move_resize_frame hasn't completed yet.
-        const smartResizeSize = WindowState.get(meta_window, 'targetSmartResizeSize');
-        if (smartResizeSize) {
-            Logger.log(`WindowDescriptor: Using targetSmartResizeSize ${smartResizeSize.width}x${smartResizeSize.height} for ${meta_window.get_id()}`);
-            return smartResizeSize;
-        }
-
-        // Restore-settle is only a bridge over stale live geometry. Once Smart Resize
-        // computes a newer target (notably while restoring a miniature), that target owns
-        // the descriptor so we do not recreate overflow from the stale restored size.
-        const targetSize = WindowState.get(meta_window, 'targetRestoredSize');
-        if (targetSize) {
-            Logger.log(`WindowDescriptor: Using targetRestoredSize ${targetSize.width}x${targetSize.height} for ${meta_window.get_id()}`);
-            return targetSize;
-        }
-
-        if (WindowState.get(meta_window, 'isConstrainedByMosaic') &&
-            committedSlot?.width > 0 && committedSlot?.height > 0) {
-            // targetSmartResizeSize is a configure-in-flight bridge, not the lifetime of
-            // Mosaic's size ownership. A Wayland client can acknowledge the requested size
-            // and then publish another startup/session-restore size a frame later (Firefox
-            // does this on cold launch). Once the first ack clears the bridge, falling back
-            // to that transient live frame makes a constrained window become its own layout
-            // input and can overwrite a still-valid miniature rail.
-            //
-            // isConstrainedByMosaic is the durable ownership bit, and MosaicModel is the
-            // durable committed geometry. Keep using the committed slot until an explicit
-            // user resize clears the constraint and teaches the model a new intent.
-            Logger.log(`WindowDescriptor: Using constrained model slot ${committedSlot.width}x${committedSlot.height} for ${meta_window.get_id()} (live=${frame.width}x${frame.height})`);
-            return committedSlot;
-        }
-
-        return {
-            width: frame.width > 0 ? frame.width : 1,
-            height: frame.height > 0 ? frame.height : 1,
-        };
     }
 
     draw(meta_windows, x, y, masks, isDragging, drawingManager, dryRun = false) {

@@ -11,6 +11,7 @@ import Shell from 'gi://Shell';
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import * as WindowState from './windowState.js';
+import { isWindowAlive } from './liveness.js';
 import { getSlowDownFactor } from './timing.js';
 import {
     IS_MINIATURE,
@@ -1133,7 +1134,11 @@ export const MiniatureManager = GObject.registerClass({
 
     pauseForFullscreen(window) {
         if (!window || !WindowState.get(window, IS_MINIATURE)) return false;
-        const actor = window.get_compositor_private();
+        // isWindowAlive, not just a null check: both callers run from the 'notify::fullscreen'
+        // signal, and get_compositor_private() can hand back a non-null actor that is already
+        // destroyed during signal delivery. Touching transitions/scale on it is the failure
+        // mode liveness.js exists for.
+        const actor = this._liveActor(window);
         if (!actor) return false;
 
         WindowState.set(window, MINIATURE_FULLSCREEN_PAUSE, true);
@@ -1148,19 +1153,33 @@ export const MiniatureManager = GObject.registerClass({
     }
 
     resumeFromFullscreen(window) {
+        if (!this._consumeFullscreenPause(window)) return false;
+        if (!WindowState.get(window, IS_MINIATURE)) return false;
+
+        const actor = this._liveActor(window);
+        const scale = WindowState.get(window, MINIATURE_SCALE);
+        const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
+        if (!actor || !scale || !tgt) return false;
+        const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+        const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+        applyMiniatureActorState(actor, scale, extL, extT, tgt.x, tgt.y);
+        return true;
+    }
+
+    // Clears the pause marker and hands the overlay back. Returns whether this window was
+    // actually paused, so resumeFromFullscreen only has to ask once.
+    _consumeFullscreenPause(window) {
         if (!window || !WindowState.get(window, MINIATURE_FULLSCREEN_PAUSE)) return false;
         WindowState.remove(window, MINIATURE_FULLSCREEN_PAUSE);
         this._resumeFullscreenOverlay(window);
-        if (!WindowState.get(window, IS_MINIATURE)) return false;
-
-        const actor = window.get_compositor_private();
-        const scale = WindowState.get(window, MINIATURE_SCALE);
-        const tgt = WindowState.get(window, MINIATURE_TARGET_POS);
-        const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-        const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-        if (!actor || !scale || !tgt) return false;
-        applyMiniatureActorState(actor, scale, extL, extT, tgt.x, tgt.y);
         return true;
+    }
+
+    // get_compositor_private() can return a non-null actor that is already destroyed during
+    // signal delivery, which is what liveness.js exists for; these run from 'notify::fullscreen'.
+    _liveActor(window) {
+        const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
+        return actor && !actor.is_destroyed() ? actor : null;
     }
 
     _resumeFullscreenOverlay(window) {

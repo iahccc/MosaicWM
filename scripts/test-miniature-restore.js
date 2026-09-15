@@ -351,7 +351,9 @@ export async function run() {
             const locked = ext.windowHandler.isWorkspaceLocked(workspace);
             assert(!locked,
                 'A window close must not leave its workspace locked');
-            assert(ext.windowHandler._pendingUnlocks.size === 0,
+            // The ledger holds one entry per live tile lock; an empty ledger means no pass is
+            // still waiting on the animation timer to hand its lock back.
+            assert(ext.windowHandler._locks.pendingCount === 0,
                 'A window close must not leave an unlock waiting on the animation timer');
             assert(survivor.get_workspace() === workspace,
                 'The surviving window must stay on its workspace');

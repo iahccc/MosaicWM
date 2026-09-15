@@ -5,6 +5,7 @@
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
@@ -12,8 +13,15 @@ import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import { TileZone } from './constants.js';
 import * as WindowState from './windowState.js';
-import { IS_MINIATURE, PENDING_MINIATURE, MOSAIC_FULLSCREEN, MOSAIC_FULLSCREEN_KIND } from './windowState.js';
+import {
+    IS_MINIATURE,
+    PENDING_MINIATURE,
+    MOSAIC_FULLSCREEN,
+    MOSAIC_FULLSCREEN_KIND,
+    MINIATURE_FULLSCREEN_PAUSE,
+} from './windowState.js';
 import { MosaicModel } from './mosaicModel.js';
+import { TileLockLedger } from './tileLockLedger.js';
 import { isWindowAlive } from './liveness.js';
 import { afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow } from './timing.js';
 
@@ -23,10 +31,11 @@ export const WindowHandler = GObject.registerClass({
     _init(extension) {
         super._init();
         this._ext = extension;
-        this._workspaceLocks = new WeakMap();
-        // Unlocks waiting on the animation timer, so an aborted tile pass can still
-        // release what it locked instead of leaking the workspace lock forever.
-        this._pendingUnlocks = new Set();
+        // Reference-counted tile locks, with the exception net and fallback release built in.
+        // The entry is registered when the lock is taken, so a pass that dies before it can
+        // schedule its deferred unlock still has something to reclaim.
+        this._locks = new TileLockLedger(extension?._timeoutRegistry ?? null,
+            (workspace, message) => Logger.log(`Workspace ${workspace?.index?.()} ${message}`));
 
         // One automatic-restore chain, tracked so it cannot re-restore a window it already
         // brought back. Every restore re-enters the tile pass synchronously, so an unstable
@@ -34,6 +43,9 @@ export const WindowHandler = GObject.registerClass({
         // stack blew up and left the workspace lock behind.
         this._cascadeRestoring = false;
         this._cascadeAttempted = new Set();
+        this._cascadeGuardReleaseId = 0;
+        // True while the set above is deliberately held across a settle window.
+        this._cascadeGuardHeld = false;
 
         this._evaluationQueue = [];
         this._isEvaluatingQueue = false;
@@ -43,12 +55,15 @@ export const WindowHandler = GObject.registerClass({
     }
 
     destroy() {
-        for (const entry of this._pendingUnlocks)
-            this._timeoutRegistry?.remove(entry.registryId);
-        this._pendingUnlocks.clear();
+        this._locks.clear();
         this._cascadeAttempted.clear();
         this._cascadeRestoring = false;
-        this._workspaceLocks = new WeakMap();
+        this._cascadeGuardHeld = false;
+        if (this._cascadeGuardReleaseId) {
+            this._timeoutRegistry?.remove(this._cascadeGuardReleaseId);
+            this._cascadeGuardReleaseId = 0;
+        }
+        this.releaseRoleState();
 
         for (const entry of this._evaluationQueue)
             WindowState.remove(entry.window, 'pendingInQueue');
@@ -58,6 +73,22 @@ export const WindowHandler = GObject.registerClass({
             for (const id of waiter.ids) waiter.window.disconnect(id);
         }
         this._readinessWaiters.clear();
+    }
+
+    // Role flags describe state *Mosaic* put a window in, and their only owner is the
+    // 'notify::fullscreen' handler that disable() just disconnected. A window that leaves
+    // fullscreen while the extension is off therefore never reaches _leaveFullscreen, and
+    // the surviving MOSAIC_FULLSCREEN flag keeps reporting it as fullscreen-like forever:
+    // _nativeStateBlocksLayout then aborts every tile pass for its workspace, so that
+    // workspace silently stops tiling (no layout, no miniature restore, no overflow
+    // handling) until the user happens to toggle fullscreen again. Hand the role back on
+    // the way out instead of leaving it to a signal that will never arrive.
+    releaseRoleState() {
+        for (const window of global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null)) {
+            WindowState.remove(window, MOSAIC_FULLSCREEN);
+            WindowState.remove(window, MOSAIC_FULLSCREEN_KIND);
+            WindowState.remove(window, MINIATURE_FULLSCREEN_PAUSE);
+        }
     }
 
     // Some windows aren't identifiable at map time (wm_class can arrive seconds
@@ -108,80 +139,79 @@ export const WindowHandler = GObject.registerClass({
     }
 
     // Lock a workspace to prevent recursive or conflicting tiling triggers.
-    // Reference-counted: overlapping tileWorkspaceWindows calls (e.g. drag-end
-    // and resize-end firing close together) each hold their own depth, so the
-    // workspace stays locked until every holder has unlocked.
-    lockWorkspace(workspace) {
-        if (!workspace) return;
-        const depth = (this._workspaceLocks.get(workspace) ?? 0) + 1;
-        this._workspaceLocks.set(workspace, depth);
-        Logger.log(`Workspace ${workspace.index()} LOCKED for tiling (depth=${depth})`);
+    // Reference-counted: overlapping tileWorkspaceWindows calls (e.g. drag-end and resize-end
+    // firing close together) each hold their own depth, so the workspace stays locked until
+    // every holder has unlocked. Returns the ledger token that owns this depth, or null when
+    // there is no workspace to lock.
+    lockWorkspace(workspace, fallbackDelayMs = 0) {
+        return this._locks.acquire(workspace, fallbackDelayMs);
     }
 
+    // A raw decrement, for a caller that holds a workspace rather than a token. Nothing in the
+    // tile-pass lifecycle uses it any more: a pass retires its ledger entry through
+    // releaseTileLock/scheduleWorkspaceUnlock so the entry and the depth move together. Kept
+    // because it is the handler's only way to drop a depth it has no token for.
     unlockWorkspace(workspace) {
-        if (!workspace) return;
-        const depth = (this._workspaceLocks.get(workspace) ?? 0) - 1;
-        if (depth <= 0) {
-            this._workspaceLocks.delete(workspace);
-            Logger.log(`Workspace ${workspace.index()} UNLOCKED`);
-        } else {
-            this._workspaceLocks.set(workspace, depth);
-            Logger.log(`Workspace ${workspace.index()} unlock (depth=${depth}, still locked)`);
-        }
+        this._locks.releaseWorkspace(workspace);
     }
 
-    // Registers a delayed unlock. A tile pass owns one lock and normally hands it back
-    // once move_resize's signals have settled; registering here is what lets releaseLocks
-    // reclaim it when the pass dies on an exception instead.
-    scheduleWorkspaceUnlock(workspace, delayMs, name) {
-        if (!workspace) return;
-        if (!this._timeoutRegistry) {
-            this.unlockWorkspace(workspace);
+    // Converts a pass's lock into a delayed unlock: the entry already exists, so this only
+    // decides *when* the lock comes back, never *whether* it does.
+    scheduleWorkspaceUnlock(token, delayMs, name) {
+        this._locks.defer(token, delayMs, name);
+    }
+
+    // Returns a lock synchronously, for paths that finish positioning without a deferred
+    // unlock (early bail, dry run, abort, synchronous draw). The ledger leaves a deferred
+    // token to its own timer.
+    releaseTileLock(token) {
+        this._locks.release(token);
+    }
+
+    // Scoped reclaim, for a caller that knows which pass it is retiring.
+    //
+    // The token is required on purpose. The ledger holds an entry for every lock that exists,
+    // in-flight passes included, so a blanket release would end other passes' settle delays and
+    // leave their own finally to decrement a depth that is already gone. A caller that cannot
+    // name the pass it is retiring has no business releasing anything: the pass's finally and
+    // the ledger's fallback timer already cover every way a pass can end.
+    releaseLocks(token) {
+        if (!token) {
+            Logger.error('releaseLocks called without a token; a pass releases its own lock in its finally');
             return;
         }
-
-        const entry = { workspace, registryId: null };
-        entry.registryId = this._timeoutRegistry.add(delayMs, () => {
-            this._pendingUnlocks.delete(entry);
-            this.unlockWorkspace(workspace);
-        }, name);
-        this._pendingUnlocks.add(entry);
-    }
-
-    // Exception net for tile passes: a throw between lockWorkspace and the deferred
-    // unlock used to strand the lock at depth 1 forever, which then read as "transaction
-    // busy" to every constrained resize and quietly disabled layout reconciliation for
-    // that workspace. Releasing here keeps the lock honest no matter how the pass ends.
-    releaseLocks() {
-        const pending = [...this._pendingUnlocks];
-        this._pendingUnlocks.clear();
-        for (const entry of pending) {
-            this._timeoutRegistry?.remove(entry.registryId);
-            this.unlockWorkspace(entry.workspace);
-        }
+        this._locks.releaseAll(token);
     }
 
     // Runs a tile-pass entry point with the exception net above.
+    //
+    // It deliberately does NOT release anything. The net used to call releaseLocks() here, but
+    // the ledger now registers locks at acquire time, so "release everything" would reach the
+    // in-flight locks of other passes and end their settle delays (and their own finally would
+    // then decrement a second time). A tile pass releases its own token in
+    // TilingManager._runTileWorkspacePass's finally, which runs while this error unwinds, and
+    // the ledger's fallback timer covers a caller that never gets there. All this wrapper has
+    // to do is make the failure visible.
     guardTilePass(fn) {
         try {
             return fn();
         } catch (error) {
-            Logger.error(`Tile pass failed, releasing workspace locks: ${error}`);
-            this.releaseLocks();
+            Logger.error(`Tile pass failed: ${error}`);
             throw error;
         }
     }
 
     // Every tile pass this handler starts goes through the net, so a throw inside the pass
-    // cannot strand the workspace lock it took.
+    // cannot strand the workspace lock it took. The pass owns its lock's lifecycle now
+    // (lockWorkspace registers the ledger entry), so the net only has to let the pass's own
+    // finally run.
     _tileWorkspace(workspace, referenceWindow, monitor, keepOversized) {
         return this.guardTilePass(() =>
             this.tilingManager.tileWorkspaceWindows(workspace, referenceWindow, monitor, keepOversized));
     }
 
     isWorkspaceLocked(workspace) {
-        if (!workspace) return false;
-        return (this._workspaceLocks.get(workspace) ?? 0) > 0;
+        return this._locks.isLocked(workspace);
     }
 
     get isEvaluatingQueue() {
@@ -192,7 +222,13 @@ export const WindowHandler = GObject.registerClass({
     get tilingManager() { return this._ext.tilingManager; }
     get edgeTilingManager() { return this._ext.edgeTilingManager; }
     get animationsManager() { return this._ext.animationsManager; }
-    get _timeoutRegistry() { return this._ext._timeoutRegistry; }
+    // Also keeps the ledger's fallback timers on the same registry everything else uses,
+    // including when the extension hands it over after construction.
+    get _timeoutRegistry() {
+        const registry = this._ext._timeoutRegistry;
+        this._locks.setTimeoutRegistry(registry);
+        return registry;
+    }
 
     connectWindowSignals(window) {
         if (!window || this._windowSignals.has(window)) return;
@@ -203,14 +239,21 @@ export const WindowHandler = GObject.registerClass({
         ids.push(window.connect('unmanaged', (win) => {
             Logger.log(`Window ${win.get_id()} (unmanaged) - cleaning up`);
             this.animationsManager.removeAnimatingWindow(win.get_id());
+            this.animationsManager.cancelPendingEntrance(win);
             this.forgetCascadeGuard(win);
             // The close path tiles and auto-restores synchronously; if any of it throws,
             // releaseLocks reclaims the workspace lock the aborted pass would have leaked.
-            this.guardTilePass(() => {
-                const ws = win.get_workspace();
-                if (ws) this.onWindowRemoved(ws, win);
-            });
-            this.disconnectWindowSignals(win);
+            // The teardown below runs in a finally: guardTilePass rethrows, and skipping it
+            // would strand this window in MosaicModel (a module-level Map that only forget()
+            // and clear() shrink) while its layout slots kept being handed to the overview.
+            try {
+                this.guardTilePass(() => {
+                    const ws = win.get_workspace();
+                    if (ws) this.onWindowRemoved(ws, win);
+                });
+            } finally {
+                this.disconnectWindowSignals(win);
+            }
         }));
 
         // Fullscreen transitions are not guaranteed to emit Mutter's size-change signal
@@ -229,6 +272,10 @@ export const WindowHandler = GObject.registerClass({
         ids.push(window.connect('notify::above', (win) => this.handleExclusionStateChange(win)));
         ids.push(window.connect('notify::on-all-workspaces', (win) => this.handleExclusionStateChange(win)));
         ids.push(window.connect('notify::minimized', (win) => this.handleExclusionStateChange(win)));
+        // skip-taskbar decides TabList.NORMAL membership, which is the MRU ranking every
+        // ranker reads, and it is also an exclusion reason. Without this the flip is invisible
+        // until some unrelated event invalidates the cache.
+        ids.push(window.connect('notify::skip-taskbar', (win) => this.handleExclusionStateChange(win)));
 
         this._windowSignals.set(window, ids);
 
@@ -333,20 +380,34 @@ export const WindowHandler = GObject.registerClass({
         if (!isWindowAlive(window)) return null;
         const workspace = window.get_workspace?.();
         const monitor = window.get_monitor?.();
-        if (!workspace || monitor === null || monitor === undefined) return null;
+        if (!workspace || monitor === null || monitor === undefined || monitor < 0) return null;
         if (!this._ext.isMosaicEnabledForWorkspace(workspace)) return null;
+        if (!this._canSettleReturn(window)) return null;
 
-        const siblings = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(candidate => candidate !== window)
-            .filter(candidate => !this.edgeTilingManager.isEdgeTiled(candidate))
-            .filter(candidate => !this.windowingManager.isExcluded(candidate))
-            .filter(candidate => !this.windowingManager.isFullscreenLike(candidate));
         return {
             workspace,
             monitor,
             workArea: this.tilingManager.getUsableWorkArea(workspace, monitor),
-            siblings,
+            siblings: this._returnSiblings(window, workspace, monitor),
         };
+    }
+
+    // The window being settled needs the same gate its siblings get below. Fullscreen is a
+    // role any window can hold, including an excluded one (always-on-top, a dialog), and this
+    // path settles a return by Smart Resizing normal mosaic windows to make room. An excluded
+    // window never owned Mosaic geometry, so it must not start that transaction: the role is
+    // still cleared by _leaveFullscreen, only the re-fit is skipped.
+    _canSettleReturn(window) {
+        return !this.windowingManager.isExcluded(window) &&
+            this.windowingManager.isRelated(window);
+    }
+
+    _returnSiblings(window, workspace, monitor) {
+        return this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor)
+            .filter(candidate => candidate !== window)
+            .filter(candidate => !this.edgeTilingManager.isEdgeTiled(candidate))
+            .filter(candidate => !this.windowingManager.isExcluded(candidate))
+            .filter(candidate => !this.windowingManager.isFullscreenLike(candidate));
     }
 
     _commitReturnedWindow(workspace, monitor, resizeResult) {
@@ -378,13 +439,17 @@ export const WindowHandler = GObject.registerClass({
         const monitor = window.get_monitor();
 
         const isNowExcluded = this.windowingManager.isExcluded(window);
-
         const wasExcluded = WindowState.get(window, 'previousExclusionState') || false;
         WindowState.set(window, 'previousExclusionState', isNowExcluded);
 
         if (wasExcluded === isNowExcluded) {
             return;
         }
+
+        // Mutter's tab list is the MRU ranking, and an exclusion flip changes it (skip-taskbar
+        // and focusability both gate membership). Every ranker reads a missing id as coldest,
+        // so a stale ranking picks the wrong window to restore and the wrong one to sacrifice.
+        this.windowingManager.invalidateWindowsCache();
 
         if (isNowExcluded) {
             this.tilingManager.maximizedLayout.forget(window);
@@ -524,6 +589,17 @@ export const WindowHandler = GObject.registerClass({
         const workspace = window.get_workspace() ?? global.workspace_manager.get_active_workspace();
         if (!workspace) return;
 
+        // An on-all-workspaces window reports no workspace of its own, but it does show
+        // up in every workspace's list, so the active one is the right context to tile in.
+        //
+        // Excluded first, before the layout calls below: an excluded window (always-on-top
+        // -- including this extension's own Shift-launch, skip-taskbar, a dialog) owns no
+        // layout transaction, yet admit() calls _yieldMaximizedForArrival -> miniaturize
+        // every native-maximized peer of the destination workspace, and caches the excluded
+        // window as that view's focus. A floating window crossing monitors would rail the
+        // whole workspace.
+        if (this.windowingManager.isExcluded(window)) return;
+
         this.tilingManager.maximizedLayout.forget(window);
         if (this.tilingManager.maximizedLayout.admit(window)) {
             this.windowingManager.invalidateWindowsCache();
@@ -534,10 +610,6 @@ export const WindowHandler = GObject.registerClass({
         // drags, keyboard moves and monitor hotplug have no grab, so this is the only
         // place that gets the arriving window into the mosaic.
         if (this._ext.dragHandler._draggedWindow) return;
-
-        // An on-all-workspaces window reports no workspace of its own, but it does show
-        // up in every workspace's list, so the active one is the right context to tile in.
-        if (this.windowingManager.isExcluded(window)) return;
 
         Logger.log(`Window ${window.get_id()} entered monitor ${monitor}; evaluating for mosaic`);
 
@@ -559,7 +631,11 @@ export const WindowHandler = GObject.registerClass({
         if (!this._ext.miniatureManager) return false;
 
         const isOutermost = !this._cascadeRestoring;
-        if (isOutermost)
+        // Only when nothing is holding the set. After a chain ends, _armCascadeGuardRelease
+        // keeps the set alive across the settle window; clearing here would discard exactly
+        // what that hold is protecting, because the settle path re-enters this method from a
+        // callback outside the original call (so it is "outermost" by this test).
+        if (isOutermost && !this._cascadeGuardHeld)
             this._cascadeAttempted.clear();
         this._cascadeRestoring = true;
 
@@ -568,23 +644,52 @@ export const WindowHandler = GObject.registerClass({
         } finally {
             if (isOutermost) {
                 this._cascadeRestoring = false;
-                // Deferred so the rest of this chain (and any restore it started) still
-                // counts as "this chain" while it unwinds.
-                this._clearCascadeGuardOnIdle();
+                // Held past the chain, not just to the next idle: the settle path
+                // (miniatureRestoreGrowSettle) retiles and re-cascades ~150ms later from a
+                // callback that is outside this call, so an idle-scoped guard would already be
+                // empty and would let the pass it just ran re-miniaturize and re-restore the
+                // same window. See _armCascadeGuardRelease.
+                this._armCascadeGuardRelease();
             }
         }
     }
 
-    _clearCascadeGuardOnIdle() {
-        const clear = () => {
-            if (this._cascadeRestoring) return GLib.SOURCE_REMOVE;
+    // Keeps the "already restored in this chain" set alive across the settle window that
+    // follows a restore, so the settle retile cannot restart the same restore. The hold is what
+    // stops the settle's own outermost call from clearing the set out from under it; the timer
+    // releases it, so the set only ever holds one chain's candidates.
+    _armCascadeGuardRelease() {
+        if (this._cascadeGuardReleaseId) {
+            this._timeoutRegistry?.remove(this._cascadeGuardReleaseId);
+            this._cascadeGuardReleaseId = 0;
+        }
+
+        // Don't zero the id before deciding: if the timer fires while a chain is on the stack
+        // it must stay armed, otherwise the hold would outlive its timer and nothing would
+        // ever release the set.
+        const release = () => {
+            if (this._cascadeRestoring) return GLib.SOURCE_CONTINUE;
+            this._cascadeGuardReleaseId = 0;
+            this._cascadeGuardHeld = false;
             this._cascadeAttempted.clear();
             return GLib.SOURCE_REMOVE;
         };
-        if (this._timeoutRegistry)
-            this._timeoutRegistry.addIdle(clear, 'windowHandler_cascadeGuardClear');
-        else
-            clear();
+
+        // Arm first, publish second: if add() throws, the hold must not be left set with no
+        // timer to clear it.
+        const id = this._timeoutRegistry
+            ? this._timeoutRegistry.add(
+                constants.RESIZE_SETTLE_DELAY_MS + constants.ANIMATION_DURATION_MS,
+                release, 'windowHandler_cascadeGuardRelease')
+            : 0;
+        if (!id) {
+            this._cascadeGuardHeld = false;
+            this._cascadeAttempted.clear();
+            return;
+        }
+
+        this._cascadeGuardReleaseId = id;
+        this._cascadeGuardHeld = true;
     }
 
     // A closed window must not stay pinned in the guard set.
@@ -618,7 +723,11 @@ export const WindowHandler = GObject.registerClass({
         // costs nothing; the most recent may not fit while an older one still does.
         for (const candidate of miniatureWindows) {
             if (this._cascadeAttempted.has(candidate)) {
-                Logger.log(`_tryAutoRestoreMiniature: ${candidate.get_id()} already restored in this chain, stopping the cascade`);
+                // continue, not break: the set already retires this candidate, and every
+                // candidate behind it is still worth probing. A member is usually MRU-first,
+                // so breaking would abandon the whole rest of the list whenever the member is
+                // a miniature again -- exactly the settle re-entry this guard exists for.
+                Logger.log(`_tryAutoRestoreMiniature: ${candidate.get_id()} already restored in this chain, skipping it`);
                 continue;
             }
 
@@ -637,13 +746,26 @@ export const WindowHandler = GObject.registerClass({
                 continue;
             }
 
-            this._cascadeAttempted.add(candidate);
             this._ext._miniatureCascadeIds?.delete(candidate.get_id());
-            this._ext.miniatureManager.restoreMiniature(candidate, null, { activate: false });
-            // 'miniature-restored' signal fires synchronously, _onMiniatureRestored already
-            // ran by the time restoreMiniature returns; calling it again here used to double
-            // the whole Smart Resize + retile pass for one restore.
-            return true;
+            // restoreMiniature refuses through the restore gate (MaximizedLayout owns the
+            // maximized/fullscreen roles) or on a fullscreen presentation. Both refusals are
+            // silent: no 'miniature-restored' signal, nothing restored. Reporting that as
+            // success makes the caller skip the retile it would have run instead, so a closed
+            // or moved window's space is never reclaimed -- the probe approved a candidate the
+            // gate then declined. Only a real restore may claim the caller's retile.
+            const restored = this._ext.miniatureManager.restoreMiniature(
+                candidate, null, { activate: false });
+            if (restored) {
+                // Recorded only on success. The loop head treats membership as "this chain
+                // already restored it" and stops; a refused candidate is still a miniature and
+                // its fit can change precisely because a later candidate got restored, so
+                // marking it here would retire it and everything after it for the whole chain
+                // on the strength of a refusal that never happened.
+                this._cascadeAttempted.add(candidate);
+                return true;
+            }
+
+            Logger.log(`_tryAutoRestoreMiniature: restore gate refused ${candidate.get_id()}, trying the next candidate`);
         }
 
         return false;
@@ -795,6 +917,14 @@ export const WindowHandler = GObject.registerClass({
         this.animationsManager.cancelPendingEntrance(window);
         this._ext.keyboardNavigator?.onWindowDestroyed(windowId);
         this.tilingManager.maximizedLayout.forget(window);
+        // Terminal: this window is out of Mutter's lists, so it can never be re-pinned and a
+        // parked constraint handle protects nothing. forget() has to keep that handle while
+        // the window might still come back; here it cannot, and the map is otherwise scanned
+        // on every reconcile.
+        this.tilingManager.maximizedLayout.dropOrphan(window);
+        // The 'unmanaged' handler does this too, but it is disconnected below, and on the
+        // actor-destroy path it may never run.
+        this.forgetCascadeGuard(window);
 
         this.disconnectWindowSignals(window);
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import GLib from 'gi://GLib';
+import * as Logger from './logger.js';
 import * as WindowState from './windowState.js';
 import {IS_MINIATURE, PENDING_MINIATURE, PRE_MINIATURE_SIZE, APPLYING_LAYOUT} from './windowState.js';
 import * as constants from './constants.js';
@@ -24,6 +25,7 @@ export class MaximizedLayout {
     constructor(extension) {
         this._ext = extension;
         this._constraints = new Map();
+        this._orphaned = new Map();
         this._views = new WeakMap();
         this._queued = new Map(); // Per-view idle IDs: one retile per workspace/monitor.
         this.applying = false;
@@ -86,7 +88,7 @@ export class MaximizedLayout {
         return (windows ?? this._windows(workspace, monitor)).some(w => w.is_maximized());
     }
 
-    _items(windows, preserveMaximizedSize = false) {
+    _items(windows) {
         return windows.map(window => {
             const frame = window.get_frame_rect();
             const preferred = WindowState.get(window, 'targetRestoredSize') ??
@@ -99,45 +101,38 @@ export class MaximizedLayout {
             return {id: window.get_id(), maximized: window.is_maximized(),
                 miniature: !!WindowState.get(window, IS_MINIATURE),
                 normalSize,
-                minimum: this._maximizedMinimum(window, minimum, normalSize, preserveMaximizedSize),
+                minimum: this._maximizedMinimum(window, minimum, normalSize),
                 sourceSize: WindowState.get(window, PRE_MINIATURE_SIZE) ?? frame};
         });
     }
 
-    _maximizedMinimum(window, minimum, normalSize, preserveMaximizedSize) {
-        const constrained = preserveMaximizedSize && window.is_maximized()
-            ? this._constraints.get(window)?.rect : null;
-        // Smart Resize learns actualMin* from configure clamping, but that observation can
-        // become stale across role transitions. A saved normal size is stronger evidence:
-        // the client has already rendered at that frame size successfully. Never let a stale
-        // learned minimum make a focused native-maximized window ineligible to be presented.
+    // Smart Resize learns actualMin* from configure clamping, but that observation can become
+    // stale across role transitions. A saved normal size is stronger evidence: the client has
+    // already rendered at that frame size successfully. Never let a stale learned minimum make
+    // a focused native-maximized window ineligible to be presented.
+    _maximizedMinimum(window, minimum, normalSize) {
         const width = Math.min(minimum.width, normalSize.width);
         const height = Math.min(minimum.height, normalSize.height);
         return {
-            width: Math.max(96, width, constrained?.width ?? 0),
-            height: Math.max(96, height, constrained?.height ?? 0),
+            width: Math.max(96, width),
+            height: Math.max(96, height),
         };
     }
 
     _plan(workspace, monitor, windows, {focus, restore = null, passive = false} = {}) {
         const selected = focus ?? this.focusFor(workspace, monitor, windows);
         const workArea = this._ext.tilingManager.getUsableWorkArea(workspace, monitor);
-        // A normal focus may reuse an existing constrained maximized region but must not
-        // squeeze it further. Focused-maximized priority is derived by the pure planner from
-        // the current sibling set (all peers miniature first), rather than from historical
-        // constraint geometry, so a newly-added rail can still consume its legitimate space.
-        const preserveMaximizedSize = this._shouldPreserveMaximizedSize(selected);
-        return planMaximizedLayout({items: this._items(windows, preserveMaximizedSize), focusId: selected?.get_id(),
+        // The maximized region is always re-derived from the current window set, never from the
+        // window's own last committed constraint rectangle: role feasibility is decided by the
+        // canonical rail solve in planMaximizedLayout, so folding historic geometry back in as a
+        // minimum would let a stale pin reject the very layout that supersedes it.
+        return planMaximizedLayout({items: this._items(windows), focusId: selected?.get_id(),
             restoreId: restore?.get_id(), workArea, passive,
             spacing: constants.WINDOW_SPACING,
             outerGap: this._outerGap(windows, workspace, monitor),
             standardSize: constants.MINIATURE_TARGET_SIZE_PX,
             targetSize: targetSizeForFocus(selected),
             previousSide: this._view(workspace, monitor).side});
-    }
-
-    _shouldPreserveMaximizedSize(selected) {
-        return !!selected && !selected.is_maximized();
     }
 
     _outerGap(windows, workspace, monitor) {
@@ -154,6 +149,7 @@ export class MaximizedLayout {
 
     reconcile(workspace, monitor, options = {}) {
         if (this.applying) return true;
+        this._drainOrphans();
         this._pruneConstraints();
         if (!workspace || !this._ext.isMosaicEnabledForWorkspace(workspace)) return false;
         const windows = options.windows ?? this._windows(workspace, monitor);
@@ -285,10 +281,28 @@ export class MaximizedLayout {
         this._ext.tilingManager.stagePendingMiniatures(pending, workspace, monitor);
     }
 
-    admit(window) {
-        if (!isWindowAlive(window)) return false;
+    // Every entry point needs the same scope gate. get_workspace() is NULL until Mutter places
+    // the window (and Mutter's own meta_window_get_workspace() returns it verbatim), while
+    // _view() keys a WeakMap -- so building a view from a null workspace throws
+    // "Invalid value used as weak map key" out of a signal handler, aborting the whole handler
+    // rather than declining the request. Monitor -1 is Mutter's unmapped value and reaches
+    // get_work_area_for_monitor(-1) further down.
+    _scopeOf(window) {
         const workspace = window.get_workspace();
         const monitor = window.get_monitor();
+        if (!workspace || monitor === null || monitor === undefined || monitor < 0) return null;
+        return {workspace, monitor};
+    }
+
+    admit(window) {
+        if (!isWindowAlive(window)) return false;
+        const scope = this._scopeOf(window);
+        if (!scope) return false;
+        const {workspace, monitor} = scope;
+        // A window Mosaic deliberately floats owns no layout transaction. The callers gate on
+        // this too, but admit() is the one that miniaturizes maximized peers, so it must not
+        // depend on every caller remembering.
+        if (this._ext.windowingManager.isExcluded(window)) return false;
         // Admission is a focus transaction even when Mutter has not published focus_window yet.
         // Cache it before planning so native-state idles that were queued for an older sibling
         // cannot replay the previous focus profile and briefly send the entrant to the rail.
@@ -313,8 +327,13 @@ export class MaximizedLayout {
     }
 
     restore(window, {activate = true, reason = 'auto'} = {}) {
-        const workspace = window.get_workspace();
-        const monitor = window.get_monitor();
+        // restore() is the miniature restore gate, reachable for any window that can still be
+        // a miniature, so it needs the same scope gate as admit() before it queries or plans.
+        // A refused gate must return false: reporting success would tell the caller its retile
+        // is unnecessary when nothing was actually restored.
+        const scope = this._scopeOf(window);
+        if (!scope) return false;
+        const {workspace, monitor} = scope;
         const passive = reason === 'auto' || reason === 'hover';
         const windows = this._windows(workspace, monitor);
         if (windows.some(w => w.is_maximized())) {
@@ -390,7 +409,7 @@ export class MaximizedLayout {
         if (!isWindowAlive(window)) return;
         const workspace = window.get_workspace();
         const monitor = window.get_monitor();
-        if (!workspace || monitor === null || monitor === undefined) return;
+        if (!workspace || monitor === null || monitor === undefined || monitor < 0) return;
         const view = this._view(workspace, monitor);
         if (this._queued.has(view)) return;
         const id = this._ext._timeoutRegistry.addIdle(() => {
@@ -448,7 +467,21 @@ export class MaximizedLayout {
     setRegion(window, rect) {
         let entry = this._constraints.get(window);
         if (!entry) {
-            entry = {constraint: new WindowRegionConstraint(), workspace: window.get_workspace(),
+            // An orphan can survive the drain when the window's actor is missing right now.
+            // Reuse that constraint instead of building a second one: two attached constraints
+            // on one window both write new_rect, Mutter iterates them in unspecified order, and
+            // the stale one (has_target with an old rectangle) can win. Reusing also keeps the
+            // handle reachable, so a later detach can still find it.
+            const orphan = this._orphaned.get(window);
+            if (orphan) {
+                this._drainOrphan(window);
+                if (this._orphaned.get(window) === orphan) {
+                    // Still not detachable: take ownership rather than leak it.
+                    this._orphaned.delete(window);
+                    Logger.warn(`Reusing an undetached window region constraint for ${window.get_id?.() ?? '?'}`);
+                }
+            }
+            entry = {constraint: orphan ?? new WindowRegionConstraint(), workspace: window.get_workspace(),
                 monitor: window.get_monitor(), rect: null};
             this._constraints.set(window, entry);
         }
@@ -459,11 +492,65 @@ export class MaximizedLayout {
         entry.constraint.attach(window);
     }
 
+    // Detaches an orphan and forgets it, but only when the detach actually happened: the whole
+    // point of _orphaned is that an undetached constraint stays reachable, so dropping the
+    // handle on a window whose actor is merely missing would recreate the duplicate-constraint
+    // hazard this map exists to prevent.
+    _drainOrphan(window) {
+        const constraint = this._orphaned.get(window);
+        if (!constraint) return;
+        // isWindowAlive is an actor-liveness proxy, so false means "cannot detach right now",
+        // not "the window is gone".
+        if (!isWindowAlive(window)) return;
+        try {
+            constraint.detach();
+        } catch (error) {
+            // The window can be finalized between the check above and the call. The handle
+            // stays in the map: dropping it would leave the native constraint attached and
+            // unreachable from JS, which is the duplicate-constraint hazard this map exists
+            // to prevent, and a future reconcile may still be able to detach it.
+            Logger.warn(`Could not detach a stale window region constraint yet: ${error}`);
+            return;
+        }
+        this._orphaned.delete(window);
+    }
+
+    // A window that has left Mutter's lists can never be re-pinned, so its orphan protects
+    // nothing and its entry would otherwise sit in the map (and be scanned on every reconcile)
+    // for the rest of the session. Only call this from a terminal path.
+    dropOrphan(window) {
+        this._orphaned.delete(window);
+    }
+
+    // isWindowAlive is an actor-liveness proxy (compositor private present and not destroyed),
+    // which is false both for a finalized MetaWindow and for a live one whose actor is simply
+    // missing right now. Only the first case may skip the detach, so an undetached constraint
+    // is kept in _orphaned instead of being dropped with the entry: deleting the entry would
+    // leave the native object attached to the window and unreachable from JS, and a later pin
+    // would attach a *second* constraint to the same window. Mutter iterates its external
+    // constraints in unspecified order and each one overwrites the same new_rect, so the
+    // orphaned one still holds has_target=TRUE with a stale rectangle and can win the constrain
+    // pass for as long as the window lives.
     forget(window) {
         const entry = this._constraints.get(window);
         if (!entry) return;
-        if (isWindowAlive(window)) entry.constraint.detach();
         this._constraints.delete(window);
+        if (isWindowAlive(window)) {
+            entry.constraint.detach();
+            this._orphaned.delete(window);
+        } else if (!this._orphaned.has(window)) {
+            // set(), not overwrite: a handle already parked for this window must stay
+            // reachable, and two attached constraints can never be told apart afterwards.
+            this._orphaned.set(window, entry.constraint);
+        }
+    }
+
+    // Retries the detaches forget() had to skip. Cheap when there is nothing orphaned, and it
+    // runs at the top of every reconcile - the same cadence as _pruneConstraints, which is
+    // where these orphans are created.
+    _drainOrphans() {
+        if (this._orphaned.size === 0) return;
+        for (const window of [...this._orphaned.keys()]) this._drainOrphan(window);
     }
 
     // Leaving the dominant presentation restores the pre-commit behavior: drop the region
@@ -517,6 +604,16 @@ export class MaximizedLayout {
 
     destroy() {
         for (const window of this._constraints.keys()) this.forget(window);
+        // A window whose actor was gone at forget() time may be alive again by teardown, and
+        // this is the last chance to hand its constraint back: after disable nothing else
+        // reaches the orphan map.
+        //
+        // _drainOrphan, not forget: an orphaned window has no _constraints entry any more, so
+        // forget() returns immediately for it and would silently do nothing. Survivors are
+        // kept deliberately -- each one is a native constraint Mutter may still be applying,
+        // and dropping the last JS handle to it is exactly what this map exists to prevent.
+        // Holding them costs one reference until this object is collected.
+        for (const window of [...this._orphaned.keys()]) this._drainOrphan(window);
         for (const id of this._queued.values()) this._ext._timeoutRegistry.remove(id);
         this._queued.clear();
         this._views = new WeakMap();
