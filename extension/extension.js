@@ -633,7 +633,7 @@ export default class WindowMosaicExtension extends Extension {
             (window) => {
                 this._dndPendingWindowId = null;
                 if (isWindowAlive(window) && WindowState.get(window, WindowState.IS_MINIATURE))
-                    this.miniatureManager?.restoreMiniature(window, null);
+                    this.miniatureManager?.restoreMiniature(window, null, {reason: 'dnd'});
             },
             constants.DND_MINIATURE_RESTORE_DELAY_MS,
             this._timeoutRegistry

@@ -226,19 +226,20 @@ export async function run() {
                 ['x', 'y', 'width', 'height'].every(key => normal.get_frame_rect()[key] === normalFrame[key]),
             'Admission probing must not change live miniature state or normal geometry');
 
-            assert(ext.miniatureManager.restoreMiniature(miniature, null, {reason: 'click'}),
-                'Click must restore a large-minimum miniature without bypassing the gate');
+            const explicitReason = attempt === 0 ? 'click' : 'dnd';
+            assert(ext.miniatureManager.restoreMiniature(miniature, null, {reason: explicitReason}),
+                `${explicitReason} must restore a large-minimum miniature without bypassing the gate`);
             assert(await waitFor(() =>
                 !WindowState.get(miniature, WindowState.IS_MINIATURE) &&
                 WindowState.get(normal, WindowState.IS_MINIATURE) &&
                 global.display.focus_window === miniature &&
                 !WindowState.get(miniature, WindowState.ANIMATING_MINIATURE)),
-            'Click must swap the large-minimum windows and focus the selected window');
+            `${explicitReason} must swap the large-minimum windows and focus the selected window`);
             assert(pair.every(window => window.get_workspace() === workspace &&
                 window.get_monitor() === monitor),
             'Large-minimum swaps must keep both windows on their original workspace and monitor');
         }
-        console.log('[MINIATURE RESTORE TEST] large-minimum click swaps are reversible; passive and impossible restores stay rejected');
+        console.log('[MINIATURE RESTORE TEST] large-minimum click/DnD swaps are reversible; passive and impossible restores stay rejected');
 
         // Move the normal window away and back, as with moving QQ beside WeChat. Its
         // durable constrained flag survives the move, but the destination needs fresh admission.
